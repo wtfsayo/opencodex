@@ -10,6 +10,7 @@ import { containerEnv, dashboardEnabled, isAnonymousHealthCheck, DASHBOARD_BOOTS
 import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
+import { handleWorkersAi, toChatCompletionStream, toWorkersAiRequest, workersAiModel } from "../../deploy/cloudflare/src/workers-ai";
 
 const SQLITE = "SQLite format 3\0";
 const created: string[] = [];
@@ -622,5 +623,61 @@ describe("cloudflare supervisor lifecycle", () => {
     } finally {
       state.stop();
     }
+  });
+});
+
+describe("cloudflare Workers AI shim", () => {
+  const sse = (lines: string[]) => new Response(lines.join("")).body!;
+  const readSse = async (stream: ReadableStream<Uint8Array>) =>
+    (await new Response(stream).text()).split("\n\n").filter(Boolean).map(event => event.replace(/^data: /, ""));
+
+  test("translates text chat and refuses what it would otherwise drop", () => {
+    expect(toWorkersAiRequest({
+      model: "meta/llama-3.1-8b-instruct",
+      messages: [{ role: "developer", content: "be brief" }, { role: "user", content: [{ type: "text", text: "hi" }] }],
+      stream: true, max_tokens: 16,
+    })).toEqual({
+      ok: true, model: "meta/llama-3.1-8b-instruct", stream: true,
+      input: { messages: [{ role: "system", content: "be brief" }, { role: "user", content: "hi" }], max_tokens: 16, stream: true },
+    });
+    expect(toWorkersAiRequest({ model: "m", messages: [], tools: [{ type: "function" }] })).toMatchObject({ ok: false, status: 400 });
+    expect(toWorkersAiRequest({ model: "m", messages: [{ role: "user", content: [{ type: "image_url" }] }] })).toMatchObject({ ok: false });
+    expect(toWorkersAiRequest({ model: "m", messages: [{ role: "tool", content: "x" }] })).toMatchObject({ ok: false });
+    expect(toWorkersAiRequest({ messages: [] })).toMatchObject({ ok: false });
+    expect(workersAiModel("meta/llama-3.1-8b-instruct")).toBe("@cf/meta/llama-3.1-8b-instruct");
+    expect(workersAiModel("@hf/some/model")).toBe("@hf/some/model");
+  });
+
+  test("streams Workers AI chunks as OpenAI chat completion chunks", async () => {
+    const events = await readSse(toChatCompletionStream(sse([
+      'data: {"response":"Hel"}\n\n', 'data: {"response":"lo"', '}\n\ndata: {"response":""}\n\n', "data: [DONE]\n\n",
+    ]), "m"));
+    expect(events.at(-1)).toBe("[DONE]");
+    const chunks = events.slice(0, -1).map(event => JSON.parse(event));
+    expect(chunks.map(c => c.choices[0].delta)).toEqual([{ role: "assistant", content: "Hel" }, { content: "lo" }, {}]);
+    expect(chunks.at(-1).choices[0].finish_reason).toBe("stop");
+    // Models that already stream OpenAI chunks pass through.
+    const passthrough = await readSse(toChatCompletionStream(sse(['data: {"choices":[{"index":0,"delta":{"content":"x"}}]}\n\n']), "m"));
+    expect(JSON.parse(passthrough[0]!).choices[0].delta).toEqual({ content: "x" });
+  });
+
+  test("the route answers the container, streaming or not, and fails closed without a binding", async () => {
+    const calls: [string, Record<string, unknown>][] = [];
+    const ai = {
+      run: async (model: string, input: Record<string, unknown>) => {
+        calls.push([model, input]);
+        return input.stream ? sse(['data: {"response":"ok"}\n\n', "data: [DONE]\n\n"]) : { response: "ok", usage: { total_tokens: 3 } };
+      },
+    };
+    const post = (body: unknown) => new Request("http://ai.ocx.internal/v1/chat/completions", { method: "POST", body: JSON.stringify(body) });
+    const plain = await (await handleWorkersAi(post({ model: "meta/m", messages: [{ role: "user", content: "hi" }] }), ai)).json() as Record<string, any>;
+    expect(plain.choices[0].message).toEqual({ role: "assistant", content: "ok" });
+    expect(plain.usage).toEqual({ total_tokens: 3 });
+    expect(calls[0]![0]).toBe("@cf/meta/m");
+    const streamed = await handleWorkersAi(post({ model: "meta/m", stream: true, messages: [{ role: "user", content: "hi" }] }), ai);
+    expect(streamed.headers.get("content-type")).toBe("text/event-stream");
+    expect((await streamed.text()).includes('"content":"ok"')).toBe(true);
+    expect((await handleWorkersAi(new Request("http://ai.ocx.internal/v1/models"), ai)).status).toBe(404);
+    expect((await handleWorkersAi(post({ model: "m", messages: [] }), undefined)).status).toBe(503);
   });
 });

@@ -20,7 +20,7 @@ This is the first stage of Cloudflare support. `ocx` still runs as a Linux proce
 container; it is not yet a Workers-native runtime. Clients call `/v1/*` with a key; the dashboard
 is available when you open it with your own admin token (see [Dashboard](#dashboard)). It has been
 exercised with `wrangler dev` and on a production Cloudflare account, including a real browser
-sign-in to the dashboard, without routing a request to a real model provider.
+sign-in to the dashboard and real model turns through [Workers AI](#workers-ai-no-api-key).
 :::
 
 ## Requirements
@@ -120,6 +120,31 @@ the configuration after that:
   npx wrangler secret put OCX_BOOTSTRAP_CONFIG_JSON < config.json
   openssl rand -hex 8 | npx wrangler secret put OCX_DISCARD_SAVED_STATE
   ```
+
+## Workers AI (no API key)
+
+The Worker has a Workers AI binding, so the hub can use Cloudflare's own models with no provider key;
+usage bills to the account that owns the deployment. Point an `openai-chat` provider at the Worker's
+internal address and name models without the `@cf/` prefix:
+
+```json
+{
+  "providers": {
+    "workers-ai": {
+      "adapter": "openai-chat",
+      "baseUrl": "http://ai.ocx.internal/v1",
+      "apiKey": "workers-ai-binding",
+      "models": ["meta/llama-3.1-8b-instruct-fp8"]
+    }
+  },
+  "defaultProvider": "workers-ai"
+}
+```
+
+`ai.ocx.internal` exists only inside the container; the Worker answers it through the binding. The
+`apiKey` value is not checked. The shim carries text chat, streamed or not, and refuses requests with
+tools or images rather than dropping them. Workers AI retires models over time; list current ones in
+the dashboard under **AI → Workers AI → Models**.
 
 ## Connect Codex
 

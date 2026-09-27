@@ -26,6 +26,9 @@
   "r2_buckets": [{ "binding": "STATE", "bucket_name": "opencodex-state" }],
   // Lets a Durable Object still on an older version notice it and reset; see isSupersededBy.
   "version_metadata": { "binding": "CF_VERSION" },
+  // Optional provider: ocx reaches Workers AI through the Worker at http://ai.ocx.internal/v1, with no
+  // API key; usage bills to this account. Unused unless a provider in the config points there.
+  "ai": { "binding": "AI" },
   // The dashboard, served by the Worker itself. The Worker runs first on every path so it can
   // route the hub's own paths to the container and add the bootstrap tags to index.html.
   "assets": {

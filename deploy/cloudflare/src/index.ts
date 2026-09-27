@@ -4,11 +4,14 @@ import {
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
 import { LeaseState } from "./lease";
+import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
 
 export interface Env extends EdgeEnv {
+  /** Workers AI binding; the container uses it as an OpenAI-chat provider at http://ai.ocx.internal/v1. */
+  AI?: AiRunner;
   /** gui/dist, served by the Worker when dashboardEnabled(); see wrangler.jsonc `assets`. */
   ASSETS?: Fetcher;
   /** version_metadata binding; lets a stale Durable Object notice a newer Worker version. */
@@ -176,7 +179,10 @@ async function handleState(req: Request, env: Env): Promise<Response> {
   }, namespace);
 }
 
-OpencodexHub.outboundByHost = { [STATE_HOST]: handleState };
+OpencodexHub.outboundByHost = {
+  [STATE_HOST]: handleState,
+  [WORKERS_AI_HOST]: (req: Request, env: Env) => handleWorkersAi(req, env.AI),
+};
 
 async function serveDashboard(req: Request, assets: Fetcher): Promise<Response> {
   const response = await assets.fetch(req);

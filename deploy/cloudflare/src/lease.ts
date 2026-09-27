@@ -36,9 +36,9 @@ const DOCUMENT_KEY_PREFIX = "ocx:document:";
  * Stores written through to the Durable Object on every commit instead of waiting for the next
  * snapshot. Each is one whole JSON document, restored over the snapshot's copy at boot.
  */
-export const DURABLE_DOCUMENTS = ["auth"] as const;
+export const DURABLE_DOCUMENTS = ["auth", "codex-accounts"] as const;
 export type DurableDocument = (typeof DURABLE_DOCUMENTS)[number];
-// SQLite-backed Durable Objects cap a stored value at 2 MiB; an auth store is a few KiB.
+// SQLite-backed Durable Objects cap a stored value at 2 MiB; these stores are a few KiB.
 export const MAX_DOCUMENT_BYTES = 1024 * 1024;
 export type StoredDocument = { body: string; seq: number };
 export type DocumentCommit = { kind: "committed" } | { kind: "lease-lost" } | { kind: "stale"; storedSeq: number };

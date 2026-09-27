@@ -4,9 +4,9 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decideLease, isHolder, LEASE_STALE_MS, LeaseState, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
+import { decideLease, DURABLE_DOCUMENTS, isHolder, LEASE_STALE_MS, LeaseState, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
 import { DOCUMENT_SEQUENCE_HEADER, handleStateRequest, snapshotPrefix, sweepOrphans, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
-import { DOCUMENT_SEQUENCE_HEADER as MIRROR_SEQUENCE_HEADER } from "../../src/oauth/durable-mirror";
+import { DOCUMENT_SEQUENCE_HEADER as MIRROR_SEQUENCE_HEADER, DURABLE_DOCUMENT_FILES } from "../../src/lib/durable-mirror";
 import { containerEnv, dashboardEnabled, isAnonymousHealthCheck, DASHBOARD_BOOTSTRAP_META, edgeDecision, envFingerprint, isSupersededBy, forwardableRequest, servedByHub } from "../../deploy/cloudflare/src/container-env";
 import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -499,7 +499,7 @@ function fakeStateServer(overrides: Record<string, (req: Request) => Response | 
       const override = overrides[key];
       if (override) return override(req);
       if (key === "GET /snapshot") return snapshot ? new Response(snapshot) : new Response("none", { status: 404 });
-      if (key === "GET /documents/auth") return new Response("none", { status: 404 });
+      if (key.startsWith("GET /documents/")) return new Response("none", { status: 404 });
       if (key === "PUT /snapshot") {
         uploading++;
         maxUploading = Math.max(maxUploading, uploading);
@@ -639,8 +639,9 @@ describe("cloudflare durable auth store", () => {
   const get = (bootId: string, name = "auth") => new Request(`http://state.ocx.internal/documents/${name}`, { headers: { "x-ocx-boot-id": bootId } });
   const send = async (hub: LeaseState, req: Request) => handleStateRequest(req, hub, memoryBucket(), "ns");
 
-  test("the Worker and ocx agree on the sequence header", () => {
+  test("the Worker and ocx agree on the sequence header and the documents", () => {
     expect(DOCUMENT_SEQUENCE_HEADER).toBe(MIRROR_SEQUENCE_HEADER);
+    expect([...DURABLE_DOCUMENTS]).toEqual(Object.keys(DURABLE_DOCUMENT_FILES));
   });
 
   test("only the lease holder writes or reads it, and a reset forgets it", async () => {
@@ -719,6 +720,27 @@ describe("cloudflare durable auth store", () => {
     expect(readFileSync(join(home, "auth.json"), "utf8")).toBe(saved);
     if (process.platform !== "win32") expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
     expect(JSON.parse(readFileSync(join(home, "auth.json.seq"), "utf8"))).toEqual({ seq: 5, mirrored: true });
+  });
+
+  test("the Codex account store is restored the same way", async () => {
+    const saved = "{\"acct\":{\"generation\":3}}";
+    const home = scratch();
+    writeFileSync(join(home, "codex-accounts.json"), "{\"acct\":{\"generation\":2}}");
+    const state = fakeStateServer({ "GET /documents/codex-accounts": () => new Response(saved, { headers: { [DOCUMENT_SEQUENCE_HEADER]: "7" } }) });
+    const seen = join(home, "started");
+    const { code, exit } = recordingExit();
+    const supervisor = new Supervisor({ roots: [{ prefix: "opencodex", dir: home }], intervalMs: 60_000, port: 0, stateOrigin: state.origin, exit, handleSignals: false });
+    void supervisor.main(["bun", "-e", `require("node:fs").writeFileSync(${JSON.stringify(seen)}, "1"); setInterval(() => {}, 1000)`]);
+    try {
+      await until(() => existsSync(seen));
+      expect(readFileSync(join(home, "codex-accounts.json"), "utf8")).toBe(saved);
+      expect(JSON.parse(readFileSync(join(home, "codex-accounts.json.seq"), "utf8"))).toEqual({ seq: 7, mirrored: true });
+      expect(state.events).toContain("GET /documents/auth");
+      void supervisor.shutdown("SIGTERM");
+      expect(await code).toBe(0);
+    } finally {
+      state.stop();
+    }
   });
 
   test("a snapshot holding a commit the Durable Object missed keeps its own copy", async () => {

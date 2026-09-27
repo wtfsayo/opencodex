@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { flushConfigDirHardeningForTests } from "../../src/config/paths";
-import { AUTH_STORE_SEQUENCE_FILE, DOCUMENT_SEQUENCE_HEADER, DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/oauth/durable-mirror";
+import { DOCUMENT_SEQUENCE_HEADER, sequenceFileFor, DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/lib/durable-mirror";
+import { saveCodexAccountCredential } from "../../src/codex/account-store";
 import { getAuthStorePath, getCredential, mutateStore, resetOAuthReauthReconcileStateForTests, saveCredential } from "../../src/oauth/store";
 import { resetHardenedStateForTests, setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -49,7 +50,7 @@ function recordingTransport(replies: Reply[]): Call[] {
   return calls;
 }
 
-const sequenceFile = () => JSON.parse(readFileSync(join(home, AUTH_STORE_SEQUENCE_FILE), "utf8"));
+const sequenceFile = () => JSON.parse(readFileSync(join(home, sequenceFileFor("auth")), "utf8"));
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 
 describe("auth store durable mirror", () => {
@@ -82,7 +83,7 @@ describe("auth store durable mirror", () => {
     const calls = recordingTransport([]);
     await saveCredential("xai", cred("one"));
     expect(calls).toEqual([]);
-    expect(existsSync(join(home, AUTH_STORE_SEQUENCE_FILE))).toBe(false);
+    expect(existsSync(join(home, sequenceFileFor("auth")))).toBe(false);
     expect(getCredential("xai")?.access).toBe("one");
   });
 
@@ -176,3 +177,87 @@ describe("auth store durable mirror", () => {
     expect(sequenceFile()).toEqual({ seq: 3, mirrored: true });
   });
 });
+
+describe("codex account store durable mirror", () => {
+  const codexFile = () => join(home, "codex-accounts.json");
+  const codexSequence = () => JSON.parse(readFileSync(join(home, sequenceFileFor("codex-accounts")), "utf8"));
+  const codexCred = (accessToken: string) => ({ accessToken, refreshToken: `refresh-${accessToken}`, expiresAt: Date.now() + 3600_000, chatgptAccountId: "acct-1" });
+
+  beforeEach(() => {
+    previousHome = process.env.OPENCODEX_HOME;
+    previousBootId = process.env[DURABLE_STATE_BOOT_ID_ENV];
+    home = mkdtempSync(join(tmpdir(), "ocx-codex-mirror-"));
+    process.env.OPENCODEX_HOME = home;
+    process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
+    resetHardenedStateForTests();
+    setIcaclsRunnerForTests(() => ICACLS_OK);
+    setAsyncIcaclsRunnerForTests(async () => ICACLS_OK);
+  });
+
+  afterEach(async () => {
+    setDurableMirrorTransportForTests(null);
+    await flushConfigDirHardeningForTests();
+    setIcaclsRunnerForTests(null);
+    setAsyncIcaclsRunnerForTests(null);
+    resetHardenedStateForTests();
+    if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+    else process.env.OPENCODEX_HOME = previousHome;
+    if (previousBootId === undefined) delete process.env[DURABLE_STATE_BOOT_ID_ENV];
+    else process.env[DURABLE_STATE_BOOT_ID_ENV] = previousBootId;
+    removeTreeWithRetry(home);
+  });
+
+  test("a synchronous write lands locally first, marked unmirrored until the Durable Object has it", async () => {
+    const calls = recordingTransport([]);
+    const sequences: unknown[] = [];
+    saveCodexAccountCredential("acct", codexCred("one"));
+    // Before the background mirror runs, a crash must leave the next boot preferring this file.
+    sequences.push(codexSequence());
+    expect(existsSync(codexFile())).toBe(true);
+    await flush();
+    expect(calls.map(call => [call.url, call.seq])).toEqual([["http://state.test/documents/codex-accounts", 1]]);
+    expect(calls[0]!.body).toBe(readFileSync(codexFile(), "utf8"));
+    expect(sequences).toEqual([{ seq: 1, mirrored: false }]);
+    expect(codexSequence()).toEqual({ seq: 1, mirrored: true });
+  });
+
+  test("a failed background mirror is retried, and a newer write takes its place", async () => {
+    const calls = recordingTransport(["network", 503]);
+    saveCodexAccountCredential("acct", codexCred("one"));
+    await flush();
+    expect(scheduled).toHaveLength(1);
+    expect(codexSequence()).toEqual({ seq: 1, mirrored: false });
+    saveCodexAccountCredential("acct", codexCred("two"));
+    expect(scheduled).toEqual([]);
+    await flush();
+    expect(calls.map(call => call.seq)).toEqual([1, 1, 2]);
+    expect(calls[2]!.body).toBe(readFileSync(codexFile(), "utf8"));
+    expect(codexSequence()).toEqual({ seq: 2, mirrored: true });
+  });
+
+  test("a late answer for a superseded write does not mark the newer one mirrored", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const seqs: number[] = [];
+    setDurableMirrorTransportForTests({
+      origin: "http://state.test",
+      sleep: async () => {},
+      schedule: () => ({ cancel() {} }),
+      fetch: async (_url, init) => {
+        const seq = Number(new Headers(init.headers).get(DOCUMENT_SEQUENCE_HEADER));
+        seqs.push(seq);
+        if (seq === 1) await gate;
+        return new Response(null, { status: seq === 1 ? 204 : 503 });
+      },
+    });
+    saveCodexAccountCredential("acct", codexCred("one"));
+    saveCodexAccountCredential("acct", codexCred("two"));
+    await flush();
+    release();
+    await flush();
+    await flush();
+    expect(seqs).toEqual([1, 2, 2]);
+    expect(codexSequence()).toEqual({ seq: 2, mirrored: false });
+  });
+});
+

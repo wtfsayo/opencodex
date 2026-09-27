@@ -34,7 +34,7 @@ import {
 } from "../lib/state-store-sweeper";
 import { validateCopilotApiBaseUrl } from "./github-copilot";
 import { validateDevinApiBaseUrl } from "./devin/api-base";
-import { AUTH_STORE_SEQUENCE_FILE, durableMirrorEnabled, mirrorAuthStore } from "./durable-mirror";
+import { durableMirrorEnabled, mirrorBeforeWrite, sequenceFileFor } from "../lib/durable-mirror";
 import type { OAuthAccountSelection, OAuthCredentialSource, OAuthCredentials, ProviderAccount, ProviderAccountSet } from "./types";
 
 export type AuthStore = Record<string, ProviderAccountSet>;
@@ -69,7 +69,7 @@ export function resetOAuthReauthReconcileStateForTests(): void {
 const SINGLE_SLOT_PROVIDERS = new Set(["chatgpt"]);
 
 function getAuthStoreSequencePath(): string {
-  return join(getConfigDir(), AUTH_STORE_SEQUENCE_FILE);
+  return join(getConfigDir(), sequenceFileFor("auth"));
 }
 export function getAuthStorePath(): string {
   return join(getConfigDir(), "auth.json");
@@ -827,7 +827,7 @@ export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValue
     // provisional value visible inside their callback. Finalization cannot await or mutate disk.
     options?.finalizeResult?.(result, store);
     const bytes = authStoreBytes(store);
-    const mirror = durableMirrorEnabled() ? await mirrorAuthStore(bytes, getAuthStoreSequencePath()) : null;
+    const mirror = durableMirrorEnabled() ? await mirrorBeforeWrite("auth", bytes, getAuthStoreSequencePath()) : null;
     if (mirror) {
       // The mirror awaited the network; a login superseded meanwhile must still not be written.
       try {
@@ -836,7 +836,7 @@ export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValue
         // The Durable Object may already hold the rejected store, and the next boot would restore
         // it. Commit the unchanged local store over it as the newer sequence.
         const path = getAuthStorePath();
-        const revert = await mirrorAuthStore(existsSync(path) ? readFileSync(path, "utf8") : "{}\n", getAuthStoreSequencePath());
+        const revert = await mirrorBeforeWrite("auth", existsSync(path) ? readFileSync(path, "utf8") : "{}\n", getAuthStoreSequencePath());
         revert?.settle();
         throw error;
       }

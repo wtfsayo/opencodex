@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { copyFile, cp, lstat, mkdir, mkdtemp, open, readdir, readlink, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { AUTH_STORE_SEQUENCE_FILE, DOCUMENT_SEQUENCE_HEADER, DURABLE_STATE_BOOT_ID_ENV, readSequenceState, writeSequenceState } from "../src/oauth/durable-mirror";
+import { DOCUMENT_SEQUENCE_HEADER, DURABLE_DOCUMENT_FILES, DURABLE_STATE_BOOT_ID_ENV, type DurableDocumentName, readSequenceState, sequenceFileFor, writeSequenceState } from "../src/lib/durable-mirror";
 
 // Intercepted by OpencodexHub.outboundByHost in deploy/cloudflare/src/index.ts; never reaches DNS.
 const STATE_ORIGIN = "http://state.ocx.internal";
@@ -268,26 +268,30 @@ export class Supervisor {
   }
 
   /**
-   * ocx writes its OAuth store to the Durable Object on every commit (src/oauth/durable-mirror.ts),
+   * ocx writes its credential stores to the Durable Object on every commit (src/lib/durable-mirror.ts),
    * so that copy is usually newer than the snapshot's and replaces it; otherwise a credential saved
    * or rotated after the last upload would come back as the older one. The snapshot's file wins only
-   * when its sequence is ahead, which means the Durable Object was unreachable for its last commit.
+   * when its sequence is ahead, which means the Durable Object never received its last commit.
    */
   async restoreDocuments(): Promise<void> {
-    const response = await this.state("/documents/auth");
+    for (const name of Object.keys(DURABLE_DOCUMENT_FILES) as DurableDocumentName[]) await this.restoreDocument(name);
+  }
+
+  private async restoreDocument(name: DurableDocumentName): Promise<void> {
+    const response = await this.state(`/documents/${name}`);
     if (response.status === 404) return;
-    if (!response.ok) throw new Error(`auth store download failed: ${response.status}`);
+    if (!response.ok) throw new Error(`${name} download failed: ${response.status}`);
     const seq = Number(response.headers.get(DOCUMENT_SEQUENCE_HEADER));
-    if (!Number.isSafeInteger(seq) || seq < 1) throw new Error("auth store has no sequence");
+    if (!Number.isSafeInteger(seq) || seq < 1) throw new Error(`${name} has no sequence`);
     const body = await response.text();
     const parsed: unknown = JSON.parse(body);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("auth store is not a JSON object");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${name} is not a JSON object`);
     const home = this.roots[0]!.dir;
-    const target = join(home, "auth.json");
-    const sequencePath = join(home, AUTH_STORE_SEQUENCE_FILE);
+    const target = join(home, DURABLE_DOCUMENT_FILES[name]);
+    const sequencePath = join(home, sequenceFileFor(name));
     const local = readSequenceState(sequencePath);
     if (existsSync(target) && !local.mirrored && local.seq > seq) {
-      console.log("Kept the snapshot's OAuth store: it holds a change the Durable Object never received.");
+      console.log(`Kept the snapshot's ${DURABLE_DOCUMENT_FILES[name]}: it holds a change the Durable Object never received.`);
       return;
     }
     mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -295,7 +299,7 @@ export class Supervisor {
     writeFileSync(temporary, body, { mode: 0o600 });
     renameSync(temporary, target);
     writeSequenceState(sequencePath, { seq, mirrored: true });
-    console.log(`Restored the OAuth store from the Durable Object (${body.length} bytes).`);
+    console.log(`Restored ${DURABLE_DOCUMENT_FILES[name]} from the Durable Object (${body.length} bytes).`);
   }
 
   private upload(): Promise<void> {

@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, unlinkSync } from "node:fs";
+import { lstatSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { atomicWriteFile, getConfigDir, getConfigPath, mutatePersistedConfig, readConfigDiagnostics, withConfigMutationLockSync } from "../config";
+import { getConfigDir, getConfigPath, mutatePersistedConfig, readConfigDiagnostics, withConfigMutationLockSync } from "../config";
 import { readAlivePid, readRuntimePort } from "../config/process-state";
 import { getCodexHome } from "./paths";
+import { writeCodexAccountsFile } from "./account-store";
 import { advanceCodexCredentialMutationEpoch } from "./credential-mutation-epoch";
 import { assertPlainLocalPath, ORCA_ACCOUNT_DIRECTORY, parseOrcaAuth, readBoundedLocalFile, readOrcaAuthSource, sameLocalPath } from "./orca-auth-source";
 
@@ -193,7 +194,7 @@ export function importOrcaAccounts(options: { sourceDir: string; registryPath: s
       if (optionalFile(getConfigPath()) !== state.configRaw || optionalFile(state.storePath) !== state.storeRaw) {
         throw new OrcaImportError("Target accounts changed during import; retry.");
       }
-      if (writesCredentials) atomicWriteFile(state.storePath, JSON.stringify(state.store, null, 2) + "\n");
+      if (writesCredentials) writeCodexAccountsFile(JSON.stringify(state.store, null, 2) + "\n");
       try {
         const outcome = mutatePersistedConfig(config => {
           if (optionalFile(getConfigPath()) !== state.configRaw) throw new OrcaImportError("Target configuration changed; retry.");
@@ -203,8 +204,7 @@ export function importOrcaAccounts(options: { sourceDir: string; registryPath: s
         if (outcome.status !== "committed") throw new OrcaImportError("Target configuration could not be committed.");
       } catch (error) {
         if (writesCredentials) {
-          if (state.storeRaw === undefined) unlinkSync(state.storePath);
-          else atomicWriteFile(state.storePath, state.storeRaw);
+          writeCodexAccountsFile(state.storeRaw ?? null);
         }
         throw error;
       }

@@ -1,6 +1,6 @@
 import { BOOT_ID_PATTERN, type DocumentCommit, DURABLE_DOCUMENTS, type DurableDocument, MAX_DOCUMENT_BYTES, type StoredDocument } from "./lease";
 
-// Mirrors DOCUMENT_SEQUENCE_HEADER in src/oauth/durable-mirror.ts, which the Worker bundle cannot import.
+// Mirrors DOCUMENT_SEQUENCE_HEADER in src/lib/durable-mirror.ts, which the Worker bundle cannot import.
 export const DOCUMENT_SEQUENCE_HEADER = "x-ocx-document-seq";
 
 // Kept free of Workers-only imports so tests/service/cloudflare-deploy.test.ts can drive it.

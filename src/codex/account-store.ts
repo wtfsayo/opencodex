@@ -11,6 +11,7 @@ import {
   hardenExistingSecret,
   withConfigMutationLockSync,
 } from "../config";
+import { beginLocalWrite, sequenceFileFor } from "../lib/durable-mirror";
 import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 import type { CodexAccountCredentialRecord, CodexAccountCredentials } from "../types";
 import { advanceCodexCredentialMutationEpoch } from "./credential-mutation-epoch";
@@ -130,10 +131,22 @@ function loadCodexAccountRecordStore(): CodexAccountStore {
 }
 
 function persist(store: CodexAccountStore): void {
+  writeCodexAccountsFile(JSON.stringify(store, null, 2) + "\n");
+}
+
+/**
+ * The only way `codex-accounts.json` is written. On a Cloudflare deployment each write is also
+ * mirrored to the Durable Object in the background (src/lib/durable-mirror.ts); callers here are
+ * synchronous and cannot wait for it. `null` removes the file.
+ */
+export function writeCodexAccountsFile(bytes: string | null): void {
   const dir = getConfigDir();
   assertNotRealHomeUnderTest(dir);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-  atomicWriteFile(codexAccountsPath(), JSON.stringify(store, null, 2) + "\n");
+  const pending = beginLocalWrite("codex-accounts", join(dir, sequenceFileFor("codex-accounts")));
+  if (bytes === null) unlinkSync(codexAccountsPath());
+  else atomicWriteFile(codexAccountsPath(), bytes);
+  pending?.written(bytes ?? "{}\n");
 }
 
 function persistCredentialMutation(store: CodexAccountStore): void {

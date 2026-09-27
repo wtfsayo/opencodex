@@ -183,7 +183,7 @@ provider had already rotated, which is worse than no mirror. The shipped rule is
 write always happens (except after a lost lease), and a sequence number decides which copy is newer.
 
 - `mutateStore` (`src/oauth/store.ts`) is the only writer of `auth.json`. With a boot id it awaits
-  `mirrorAuthStore` (`src/oauth/durable-mirror.ts`) before `persist`, re-runs `assertBeforePersist`
+  `mirrorBeforeWrite("auth", …)` (`src/lib/durable-mirror.ts`) before `persist`, re-runs `assertBeforePersist`
   after that await, then records `{seq, mirrored}` in `auth.json.seq`. Without a boot id nothing is
   awaited, so local installs keep their synchronous check-then-write.
 - Two attempts of 5 s each keep a commit under the 30 s mutation-queue wait and lock staleness. A
@@ -208,6 +208,15 @@ Known gaps, all narrower than the snapshot-only behavior they replace:
 - Writes from a separate `ocx` process in the container (for example `ocx login` over a shell)
   have no boot id and are not mirrored; the next boot restores the Durable Object copy over them.
 
-Still riding the snapshot: refresh intents (`auth.refresh.*.lock.json`, Nous intents), the
-`pre-multiauth` backup, and `codex-accounts.json`, whose writers are synchronous and belong to the
-Codex pool.
+`codex-accounts.json` followed (same day). Its writers are synchronous and run inside the SQLite
+config-mutation lock, so they cannot await the network. `writeCodexAccountsFile` in
+`src/codex/account-store.ts` is now its only writer (`orca-import.ts` included): it marks the next
+sequence `mirrored: false` before the local write, then mirrors in the background with the same
+retry and supersede rules. A crash anywhere before the Durable Object accepts the copy leaves the
+next boot preferring the local file; a crash before the local write lands loses only what the
+snapshot-only design lost. The mirror module moved to `src/lib/durable-mirror.ts` and names its
+documents in `DURABLE_DOCUMENT_FILES`, which a test holds equal to the Worker's allowlist.
+
+Still riding the snapshot: refresh intents (`auth.refresh.*.lock.json`, Codex refresh locks, Nous
+intents) and the `pre-multiauth` backup. Losing an intent in a crash is the same outcome as the
+crash itself today.

@@ -192,7 +192,7 @@ The container's entrypoint is `docker/cloudflare-supervisor.ts`. It:
 
 1. Takes a lease from the Durable Object, so only one container writes state at a time.
 2. Restores `~/.opencodex` and `~/.codex` from the latest snapshot in R2, then restores `auth.json`
-   from the Durable Object when that copy is newer (see below). If either read fails, it stops
+   and `codex-accounts.json` from the Durable Object when that copy is newer (see below). If either read fails, it stops
    rather than start `ocx` with an empty home or older credentials.
 3. Starts `ocx`, renews the lease every 30 seconds, and uploads a snapshot every 30 seconds if
    anything changed.
@@ -204,11 +204,13 @@ SQLite databases are copied with `VACUUM INTO`, so a snapshot never holds a half
 Lock databases and the generated management token are left out. Other files are copied as they
 are; the final snapshot is taken after `ocx` has exited, so it cannot catch a file mid-write.
 
-OAuth logins and refreshed tokens do not wait for a snapshot. Each change to `auth.json` is also
-written to the Durable Object, numbered, so a token rotated seconds before the container stops is
-not replaced by an older one on the next boot. If the Durable Object cannot be reached, the change
-is still saved locally and retried in the background; the snapshot then carries it, and the next
-boot keeps whichever copy is newer.
+OAuth logins, Codex pool accounts, and refreshed tokens do not wait for a snapshot. Each change
+to `auth.json` or `codex-accounts.json` is also written to the Durable Object, numbered, so a token
+rotated seconds before the container stops is not replaced by an older one on the next boot.
+`auth.json` changes wait for that write (up to about 10 seconds); Codex pool changes are written
+locally first and sent right after. If the Durable Object cannot be reached, the change is still
+saved locally and retried in the background; the snapshot then carries it, and the next boot keeps
+whichever copy is newer.
 
 If a container dies without `SIGTERM`, other changes since its last snapshot are lost, and the next
 container waits up to two minutes for the dead one's lease to expire. A container that loses its

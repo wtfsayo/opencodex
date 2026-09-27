@@ -1,4 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { beginLocalWrite, sequenceFileFor } from "../lib/durable-mirror";
 import { configReasoningPinsConfigError } from "./provider-validation";
 import type { OcxConfig } from "../types";
 import { withPreservedDiskOnlyProviders } from "../usage/user-cost-overlays";
@@ -92,8 +94,11 @@ export function persistConfigUnlocked(config: OcxConfig): boolean {
   let published = unchanged;
   try {
     if (!unchanged) {
+      // On a Cloudflare deployment this is also mirrored to the Durable Object (src/lib/durable-mirror.ts).
+      const pending = beginLocalWrite("config", join(dirname(configPath), sequenceFileFor("config")), bytes);
       atomicWriteFile(configPath, bytes, undefined, { afterRename: () => { published = true; } });
       published = true;
+      pending?.written();
     }
     // Publication, not successful cache refresh, is the rollback boundary. A
     // byte-identical save already has the requested state on disk as well.

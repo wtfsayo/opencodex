@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { flushConfigDirHardeningForTests } from "../../src/config/paths";
 import { DOCUMENT_SEQUENCE_HEADER, documentDigest, sequenceFileFor, DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/lib/durable-mirror";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
+import { loadConfig, saveConfig } from "../../src/config";
 import { getAuthStorePath, getCredential, mutateStore, resetOAuthReauthReconcileStateForTests, saveCredential } from "../../src/oauth/store";
 import { resetHardenedStateForTests, setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -269,6 +270,49 @@ describe("codex account store durable mirror", () => {
     await flush();
     expect(seqs).toEqual([1, 2, 2]);
     expect(codexSequence()).toMatchObject({ seq: 2, mirrored: false });
+  });
+});
+
+describe("config durable mirror", () => {
+  beforeEach(() => {
+    previousHome = process.env.OPENCODEX_HOME;
+    previousBootId = process.env[DURABLE_STATE_BOOT_ID_ENV];
+    home = mkdtempSync(join(tmpdir(), "ocx-config-mirror-"));
+    process.env.OPENCODEX_HOME = home;
+    process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
+    resetHardenedStateForTests();
+    setIcaclsRunnerForTests(() => ICACLS_OK);
+    setAsyncIcaclsRunnerForTests(async () => ICACLS_OK);
+  });
+
+  afterEach(async () => {
+    setDurableMirrorTransportForTests(null);
+    await flushConfigDirHardeningForTests();
+    setIcaclsRunnerForTests(null);
+    setAsyncIcaclsRunnerForTests(null);
+    resetHardenedStateForTests();
+    if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+    else process.env.OPENCODEX_HOME = previousHome;
+    if (previousBootId === undefined) delete process.env[DURABLE_STATE_BOOT_ID_ENV];
+    else process.env[DURABLE_STATE_BOOT_ID_ENV] = previousBootId;
+    removeTreeWithRetry(home);
+  });
+
+  test("a committed save is mirrored with the exact bytes on disk; an unchanged save sends nothing", async () => {
+    const calls = recordingTransport([]);
+    const config = loadConfig();
+    config.port = 10123;
+    saveConfig(config);
+    await flush();
+    const onDisk = readFileSync(join(home, "config.json"), "utf8");
+    expect(calls.map(call => [call.url, call.seq])).toEqual([["http://state.test/documents/config", 1]]);
+    expect(calls[0]!.body).toBe(onDisk);
+    expect(JSON.parse(readFileSync(join(home, sequenceFileFor("config")), "utf8"))).toEqual({ seq: 1, mirrored: true, digest: documentDigest(onDisk) });
+
+    saveConfig(config);
+    await flush();
+    expect(readFileSync(join(home, "config.json"), "utf8")).toBe(onDisk);
+    expect(calls).toHaveLength(1);
   });
 });
 

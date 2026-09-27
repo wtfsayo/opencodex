@@ -18,6 +18,7 @@ export const DOCUMENT_SEQUENCE_HEADER = "x-ocx-document-seq";
 export const DURABLE_DOCUMENT_FILES = {
   auth: "auth.json",
   "codex-accounts": "codex-accounts.json",
+  config: "config.json",
 } as const;
 export type DurableDocumentName = keyof typeof DURABLE_DOCUMENT_FILES;
 /** Sits next to the document's file: the sequence of its content, and whether the Durable Object has it. */

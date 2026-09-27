@@ -218,9 +218,8 @@ next boot preferring the local file; a crash before the local write lands loses 
 snapshot-only design lost. The mirror module moved to `src/lib/durable-mirror.ts` and names its
 documents in `DURABLE_DOCUMENT_FILES`, which a test holds equal to the Worker's allowlist.
 
-Coupling left open until 3c: pool account add/remove writes `config.json` (still snapshot-only)
-and `codex-accounts.json` together, so a death without `SIGTERM` inside one interval can restore
-them out of step. Token refresh, the case this step exists for, touches only `codex-accounts.json`.
+Coupling narrowed by 3c: pool account add/remove writes `config.json` and `codex-accounts.json`
+together, and both are now mirrored separately. Token refresh, the case this step exists for, touches only `codex-accounts.json`.
 A pool large enough to pass the 1 MiB document cap (about 200 accounts) stays snapshot-only with a
 size warning per write.
 
@@ -243,3 +242,14 @@ Losing up to one snapshot interval of usage rows is acceptable where losing a cr
 
 Not done: a delta upload (append-only rows keyed by boot id and offset) instead of re-sending the
 capped ledger each interval. Worth it only if snapshot bandwidth shows up in real use.
+
+## 3c (2026-09-28): `config.json` mirrored like the Codex pool
+
+Every committed rewrite goes through `persistConfigUnlocked` (`src/config/persist-unlocked.ts`),
+synchronously, under the config-mutation lock, so it takes the same `beginLocalWrite` hook as
+`writeCodexAccountsFile`. Byte-identical saves skip the write and the mirror. Not hooked, and not
+reached inside the container: first creation (`publishInitialConfigNoReplace`), `ocx uninstall`, and
+edits by another process. The digest rule makes restore keep any such unrecorded file, which also
+covers the supervisor's bootstrap seed. It narrows the 3a coupling: pool account add/remove mirrors
+both of its files, so they can only come back out of step if the container dies in the moment
+between the two writes.

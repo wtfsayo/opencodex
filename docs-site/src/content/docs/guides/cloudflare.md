@@ -182,8 +182,10 @@ When the Worker passes a request on, it logs why once per reason (for example
 
 It also answers `POST /v1/responses`, the API Codex uses, for the same providers when the turn is
 streamed, not stored (`"store": false`, as Codex sends it), sets no reasoning effort, and uses only
-`function` tools (no MCP namespaces, web search, code-mode `exec`, or multi-agent tools), with
-text-only messages and no `<skills_instructions>` block.
+`function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
+is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only
+messages; and no `<skills_instructions>` block. That covers what Codex CLI sends on an ordinary
+turn.
 
 If the provider returns an error status, the Worker sends the request to `ocx` instead, which
 retries and reports it as usual; the provider then sees that request twice. An answer with a 200

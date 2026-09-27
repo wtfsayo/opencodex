@@ -7,7 +7,7 @@
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
 import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, sendUpstream } from "./cloudflare-native-chat";
-import { isThreadSpawnRequest } from "./collab-surface";
+import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { buildToolBridgeMaps } from "./responses/tool-bridge-maps";
 import { createOpenAIChatAdapterWith, type OpenAIChatAdapterDeps } from "../adapters/openai-chat/adapter";
 import { renameRoutedIdentityInContext } from "../adapters/identity";
@@ -38,6 +38,10 @@ const COLLABORATION_TOOLS = new Set([
 ]);
 const SKILLS_BLOCK = "<skills_instructions>";
 
+function hasHostedWebSearch(body: Rec): boolean {
+  return Array.isArray(body.tools) && body.tools.some(tool => isRec(tool) && tool.type === "web_search");
+}
+
 function containsSkillsBlock(value: unknown): boolean {
   if (typeof value === "string") return value.includes(SKILLS_BLOCK);
   if (Array.isArray(value)) return value.some(containsSkillsBlock);
@@ -60,10 +64,19 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
   if (body.tools !== undefined) {
     if (!Array.isArray(body.tools)) return "tools-shape";
     for (const tool of body.tools) {
-      if (!isRec(tool) || tool.type !== "function" || typeof tool.name !== "string" || tool.namespace !== undefined) return "tool-type";
-      // Codex's code-mode `exec` is parsed with Bun's transpiler.
-      if (tool.name === "exec") return "code-mode-exec";
-      if (COLLABORATION_TOOLS.has(tool.name)) return "collaboration-turn";
+      if (!isRec(tool)) return "tool-type";
+      // Hosted web search is dropped from the upstream request unless ocx can run its search
+      // sidecar; serveNativeResponses checks that against the config.
+      if (tool.type === "web_search" && Object.keys(tool).length === 1) continue;
+      // Namespaced function groups (Codex's multi_agent_v1, MCP servers) flatten and restore purely.
+      const members = tool.type === "namespace" && typeof tool.name === "string" && Array.isArray(tool.tools) ? tool.tools : [tool];
+      for (const member of members) {
+        if (!isRec(member) || member.type !== "function" || typeof member.name !== "string" || member.namespace !== undefined) return "tool-type";
+        // Codex's code-mode `exec` is parsed with Bun's transpiler.
+        if (member.name === "exec") return "code-mode-exec";
+      }
+      // A bare collaboration tool: ocx's guidance and caps for it read process and catalog state.
+      if (tool.type === "function" && COLLABORATION_TOOLS.has(tool.name as string)) return "collaboration-turn";
     }
   }
   if (typeof body.input !== "string") {
@@ -111,8 +124,18 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   if (!route) return null;
   const config = loaded.config as Pick<OcxConfig, "stallTimeoutSec">;
 
+  // ocx's web-search sidecar resolves through a configured OpenAI provider's accounts.
+  const providers = (loaded.config as { providers: Record<string, unknown> }).providers;
+  const openai = providers.openai;
+  if (hasHostedWebSearch(body) && openai !== undefined && !(isRec(openai) && openai.disabled === true)) return no("web-search-sidecar");
+
   let parsed;
   try { parsed = parseRequest(body); } catch { return no("parse"); }
+  // A v2 collaboration surface gets guidance built from the catalog on disk when subagent models
+  // are configured (collaboration.ts); v1 gets guidance only with an effort, which is declined.
+  const surface = collabSurface(parsed);
+  const subagentModels = (loaded.config as { subagentModels?: unknown }).subagentModels;
+  if (surface === "v2" && Array.isArray(subagentModels) && subagentModels.length > 0) return no("collaboration-v2-guidance");
   // As core-normalize.ts: the upstream sees the routed id, and the identity sentence names it.
   if (parsed._rawBody && typeof parsed._rawBody === "object") (parsed._rawBody as { model?: string }).model = route.modelId;
   parsed.modelId = route.modelId;

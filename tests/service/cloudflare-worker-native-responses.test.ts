@@ -113,10 +113,15 @@ describe("Worker-native Responses", () => {
     expect(reason({ service_tier: "priority" })).toBe("body-fields:service_tier");
     expect(reason({ reasoning: { effort: "medium" } })).toBe("reasoning-effort");
     expect(reason({ reasoning: { summary: "auto" } })).toBeUndefined();
-    expect(reason({ tools: [{ type: "web_search" }] })).toBe("tool-type");
+    expect(reason({ tools: [{ type: "web_search" }] })).toBeUndefined();
+    expect(reason({ tools: [{ type: "web_search", search_context_size: "high" }] })).toBe("tool-type");
+    expect(reason({ tools: [{ type: "image_generation" }] })).toBe("tool-type");
+    expect(reason({ tools: [{ type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec" }] }] })).toBe("tool-type");
+    expect(reason({ tools: [{ type: "namespace", name: "functions", tools: [{ type: "function", name: "exec" }] }] })).toBe("code-mode-exec");
     expect(reason({ tools: [{ type: "function", name: "exec" }] })).toBe("code-mode-exec");
     expect(reason({ tools: [{ type: "function", name: "spawn_agent" }] })).toBe("collaboration-turn");
     expect(reason({ tools: [{ type: "function", name: "x", namespace: "mcp" }] })).toBe("tool-type");
+    expect(reason({ tools: [{ type: "namespace", name: "multi_agent_v1", tools: [{ type: "function", name: "spawn_agent" }] }] })).toBeUndefined();
     expect(reason({ input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:," }] }] })).toBe("message-parts");
     expect(reason({ input: [{ type: "compaction", encrypted_content: "x" }] })).toBe("input-item");
     expect(reason({ input: [{ type: "function_call_output", call_id: "", output: "x" }] })).toBe("tool-call-id");
@@ -141,6 +146,52 @@ describe("proxy wiring the Worker path depends on", () => {
     await import("../../src/bridge");
     const { thoughtSignatureStoreRegistered } = await import("../../src/responses/thought-signature-slot");
     expect(thoughtSignatureStoreRegistered()).toBe(true);
+  });
+});
+
+// The tools Codex CLI 0.157.1 declared on every turn (captured 2026-09-28), with schemas trimmed.
+const fn = (name: string) => ({ type: "function", name, description: name, parameters: { type: "object", properties: {} } });
+const codexCliTools = [
+  fn("exec_command"), fn("write_stdin"), fn("request_user_input"), fn("view_image"),
+  { type: "namespace", name: "multi_agent_v1", description: "agents", tools: [fn("spawn_agent"), fn("send_input"), fn("wait_agent"), fn("close_agent")] },
+  fn("get_goal"), fn("create_goal"), fn("update_goal"),
+  { type: "web_search" },
+];
+
+describe("Worker-native Responses with Codex CLI's real tool list", () => {
+  test("flattens the namespace upstream, drops hosted web search, and restores namespaced calls", async () => {
+    let upstreamTools: string[] = [];
+    const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1", { tools: codexCliTools, client_metadata: { "x-codex-turn-metadata": "{}" }, reasoning: { summary: "auto" } })), new Headers({ "session-id": "s", "thread-id": "t" }), new AbortController().signal, {
+      readConfig: async () => externalConfig,
+      fetch: async request => {
+        const sent = await request.json() as { tools: { function: { name: string } }[] };
+        upstreamTools = sent.tools.map(tool => tool.function.name);
+        return sse([
+          "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"multi_agent_v1__spawn_agent\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+          "data: [DONE]\n\n",
+        ]);
+      },
+    });
+    expect(response).not.toBeNull();
+    const completed = events(await response!.text()).at(-1)!.data.response as { output: { type: string; name?: string; namespace?: string }[] };
+    expect(upstreamTools).toContain("multi_agent_v1__spawn_agent");
+    expect(upstreamTools).toContain("exec_command");
+    expect(upstreamTools).not.toContain("web_search");
+    const call = completed.output.find(item => item.type === "function_call")!;
+    expect([call.name, call.namespace]).toEqual(["spawn_agent", "multi_agent_v1"]);
+  });
+
+  test("with an OpenAI provider configured, hosted web search is left to ocx's sidecar", async () => {
+    const withOpenAi = JSON.stringify({ providers: { p: provider, openai: { adapter: "openai-responses", authMode: "forward" } } });
+    const reasons: string[] = [];
+    const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1", { tools: codexCliTools })), new Headers(), new AbortController().signal, {
+      readConfig: async () => withOpenAi,
+      fetch: async () => { throw new Error("unexpected upstream call"); },
+      onDecline: reason => reasons.push(reason),
+    });
+    expect(response).toBeNull();
+    expect(reasons).toEqual(["responses:web-search-sidecar"]);
   });
 });
 

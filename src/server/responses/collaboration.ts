@@ -8,7 +8,8 @@ import {
 } from "../../config";
 import { parseRequest } from "../../responses/parser";
 import { buildToolBridgeMaps } from "./tool-bridge-maps";
-export { buildToolBridgeMaps };
+import { collabSurface } from "../collab-surface";
+export { buildToolBridgeMaps, collabSurface };
 import { externalTaskInputContent } from "../../responses/task-input";
 import { MULTI_AGENT_MODE_HINT_RECOMMENDATION } from "../../codex/multi-agent-mode-policy";
 import { buildCompactV1Output, COMPACT_PROMPT, decodeCompactionSummary, extractCompactUserMessages } from "../../responses/compaction";
@@ -118,28 +119,6 @@ export function isV1CollabSurface(parsed: OcxParsedRequest): boolean {
 
 
 
-export function collabSurface(parsed: OcxParsedRequest): "v1" | "v2" | null {
-  let namespacedSpawn = false;
-  let flatSpawn = false;
-  let v1Only = false;
-  let v2Only = false;
-  for (const t of parsed.context.tools ?? []) {
-    if (t.name === "spawn_agent") {
-      if (t.namespace) namespacedSpawn = true;
-      else flatSpawn = true;
-    } else if (t.name === "send_input" || t.name === "resume_agent" || t.name === "close_agent") {
-      v1Only = true;
-    } else if (t.name === "send_message" || t.name === "followup_task" || t.name === "interrupt_agent" || t.name === "list_agents") {
-      v2Only = true;
-    }
-  }
-  if (!namespacedSpawn && !flatSpawn) return null; // no spawn_agent -> no collab surface
-  if (namespacedSpawn && flatSpawn) return null;   // contradictory spawn shapes
-  if (v1Only && v2Only) return null;               // contradictory companions
-  if (v1Only) return "v1";
-  if (v2Only) return "v2";
-  return namespacedSpawn ? "v1" : "v2"; // companionless fallbacks (legacy defaults)
-}
 
 
 

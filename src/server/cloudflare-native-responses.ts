@@ -133,6 +133,7 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   let usage: OcxUsage | undefined;
   let firstOutputAt: number | undefined;
   let errorStatus: number | undefined;
+  let completed = false;
   let recorded = false;
   const record = (status: number) => {
     if (recorded) return;
@@ -168,7 +169,7 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
         yield { type: "error", message: "Upstream response body stalled before completing", status: 504, errorType: "upstream_error" };
         return;
       }
-      errorStatus ??= 502;
+      errorStatus ??= signal.aborted ? 499 : 502;
       throw error;
     }
   })();
@@ -186,10 +187,15 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
       toolParameterSchemas: maps.toolParameterSchemas,
       onFirstOutput: () => { firstOutputAt ??= Date.now(); },
       onUsage: reported => { usage = reported; },
-      onCompletedResponse: () => record(errorStatus ?? 200),
+      // Called before onUsage for the same final event, so it only marks the outcome; the row is
+      // written when the stream ends, by which time usage has arrived.
+      onCompletedResponse: () => { completed = true; },
     },
   );
-  return new Response(recordAtEnd(sse, end => record(end === "cancel" ? 499 : errorStatus ?? (end === "error" ? 502 : 200))), {
+  // A stream that ends without response.completed failed (response.failed, a translator limit).
+  return new Response(recordAtEnd(sse, end => record(
+    end === "cancel" || signal.aborted ? 499 : completed && errorStatus === undefined ? 200 : errorStatus ?? 502,
+  )), {
     headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" },
   });
 };

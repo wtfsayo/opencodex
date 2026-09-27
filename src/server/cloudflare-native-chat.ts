@@ -194,10 +194,12 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
       onFirstOutput: () => { firstOutputAt ??= Date.now(); },
       onUsage: reported => { usage = reported; },
       onTerminal: status => { terminalStatus = status; },
+      // The relay closes normally when the client goes away, so the cancel is only visible here.
+      onCancel: () => { terminalStatus ??= 499; },
     });
     // As chat-native.ts answers; Connection is hop-by-hop and the Workers runtime owns it.
     if (requestedStream) {
-      return new Response(recordAtEnd(stream, end => record(end === "cancel" ? 499 : end === "error" ? terminalStatus ?? 502 : terminalStatus ?? 200)), { headers: SSE_HEADERS });
+      return new Response(recordAtEnd(stream, end => record(end === "cancel" || signal.aborted ? 499 : end === "error" ? terminalStatus ?? 502 : terminalStatus ?? 200)), { headers: SSE_HEADERS });
     }
     try {
       const completion = await collectChatCompletion(stream, route.requestedModel, translatorBudget);

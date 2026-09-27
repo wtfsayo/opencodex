@@ -55,6 +55,22 @@ describe("Worker-native Responses", () => {
     expect(rows[0]).toMatchObject({ inboundProtocol: "responses", provider: "workers-ai", status: 200 });
   });
 
+  test("the usage row carries the tokens the upstream reported", async () => {
+    const rows: { usageStatus: string; totalTokens?: number; status: number }[] = [];
+    const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1", { tools: [], tool_choice: "none" })), new Headers(), new AbortController().signal, {
+      readConfig: async () => externalConfig,
+      fetch: async () => sse([
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14}}\n\n",
+        "data: [DONE]\n\n",
+      ]),
+      recordUsage: row => rows.push(row as never),
+    });
+    await response!.text();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: 200, usageStatus: "reported", totalTokens: 14 });
+  });
+
   test("a tool call from a chat upstream comes back as a Responses function_call", async () => {
     let sentBody: Record<string, unknown> = {};
     const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1")), new Headers(), new AbortController().signal, {

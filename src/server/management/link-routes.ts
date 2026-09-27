@@ -115,6 +115,8 @@ function adminLoopback(ctx: ManagementContext): boolean {
 
 function auth(ctx: ManagementContext, kind: "dashboard" | "admin" | "either"): Response | null {
   if (ctx.guiSessionIssuance === "tailscale-identity") return fail("tailscale_session_refused", "Tailscale identity sessions cannot use link routes.", 403);
+  // Same rule for the other identity-proxy session: SSH to other machines needs a paired session.
+  if (ctx.guiSessionIssuance === "cloudflare-access") return fail("cloudflare_access_session_refused", "Cloudflare Access sessions cannot use link routes.", 403);
   const allowed = kind === "dashboard" ? dashboardSession(ctx)
     : kind === "admin" ? adminLoopback(ctx)
       : dashboardSession(ctx) || adminLoopback(ctx);
@@ -548,6 +550,8 @@ export async function handleLinkRoutes(ctx: ManagementContext, suppliedState?: L
   const path = url.pathname;
   if (!isLinkPath(path)) return null;
   if (ctx.guiSessionIssuance === "tailscale-identity") return fail("tailscale_session_refused", "Tailscale identity sessions cannot use link routes.", 403);
+  // Same rule for the other identity-proxy session: SSH to other machines needs a paired session.
+  if (ctx.guiSessionIssuance === "cloudflare-access") return fail("cloudflare_access_session_refused", "Cloudflare Access sessions cannot use link routes.", 403);
   if (url.pathname === "/api/link/join" && req.method === "POST") {
     // The same dashboard admission as the Home side. Every refusal below runs before link state
     // is read and before any SSH.

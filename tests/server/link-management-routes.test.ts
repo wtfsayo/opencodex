@@ -240,6 +240,21 @@ describe("link management routes", () => {
     }, state, tailscaleConfig, deps, true);
     expect(refused?.status).toBe(403);
     expect(await refused!.json()).toMatchObject({ error: { code: "tailscale_session_refused" } });
+
+    // The session is only honored while its email stays allowlisted, so the config must carry it.
+    const accessConfig = {
+      ...tailscaleConfig,
+      remoteGui: { cloudflareAccess: { teamDomain: "acme.cloudflareaccess.com", audience: "a".repeat(64), allowedEmails: ["alice@example.test"] } },
+    } as OcxConfig;
+    const access = issueGuiSession(new Request("https://hub.example.test/", {
+      headers: { host: "hub.example.test", origin: "https://dashboard.example.test" },
+    }), accessConfig, state, { trustedTailscaleIngress: false, cloudflareAccess: { email: "alice@example.test", expiresAt: Date.now() + 3_600_000 } });
+    expect(access?.issuance).toBe("cloudflare-access");
+    const accessRefused = await sessionCall("https://hub.example.test/api/link/candidates", {
+      host: "hub.example.test", authorization: `Bearer ${access!.token}`, "x-opencodex-gui-origin": access!.browserOrigin,
+    }, state, accessConfig, deps, true);
+    expect(accessRefused?.status).toBe(403);
+    expect(await accessRefused!.json()).toMatchObject({ error: { code: "cloudflare_access_session_refused" } });
   });
 
   test("status tells a dashboard session whether it may join and keeps the admin-token DTO exact", async () => {

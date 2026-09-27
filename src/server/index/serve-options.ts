@@ -183,6 +183,7 @@ import {
   consumeGuiPairingGrant,
   createGuiPairingGrant,
 } from "../gui-session";
+import { guiSessionRequestContext } from "../cloudflare-access";
 import { recordCursorSeen } from "../../integrations/cursor-seen";
 import { detectCursorInstalls } from "../../integrations/cursor-detect";
 import { loadCursorEffortTable } from "../../integrations/cursor-effort-table";
@@ -1848,9 +1849,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
 
       if (url.pathname === "/opencodex-session") {
         if (req.method === "GET") {
-          const session = issueGuiSession(req, config, managementAuth, {
-            trustedTailscaleIngress: ingress === "hub-management",
-          });
+          const session = issueGuiSession(req, config, managementAuth, await guiSessionRequestContext(req, config, ingress));
           return session
             ? withManagementCors(serveSessionBootstrap(session), req, config)
             : withManagementCors(new Response(null, { status: 401, headers: { "Cache-Control": "no-store" } }), req, config);
@@ -1907,9 +1906,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         return withCors(formatErrorResponse(404, "not_found", `Unknown endpoint: ${req.method} ${url.pathname}`), req, policy);
       }
       const guiSessionCandidate = req.method === "GET" && (url.pathname === "/" || !url.pathname.includes("."))
-        ? issueGuiSession(req, config, managementAuth, {
-          trustedTailscaleIngress: ingress === "hub-management",
-        })
+        ? issueGuiSession(req, config, managementAuth, await guiSessionRequestContext(req, config, ingress))
         : null;
       const guiFile = serveGuiFile(
         url.pathname,

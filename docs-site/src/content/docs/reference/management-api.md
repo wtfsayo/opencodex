@@ -47,8 +47,9 @@ match that origin. Unsafe methods also require the browser `Origin` and the sess
 
 When data-plane authentication is required, which includes remote binds, the loopback bootstrap
 does not mint a session. A remote dashboard gets a 12-hour session only through a trusted Tailscale
-identity (`remoteGui.allowedTailscaleUsers` on the Tailscale management ingress) or a one-use
-pairing grant; each authorized request extends it. Otherwise a remote operator authenticates with
+identity (`remoteGui.allowedTailscaleUsers` on the Tailscale management ingress), a verified
+Cloudflare Access token (`remoteGui.cloudflareAccess`; the session also ends when the token
+expires), or a one-use pairing grant; each authorized request extends it. Otherwise a remote operator authenticates with
 the raw admin token, and the dashboard asks for it again after a reload because the session lives
 only in page memory. See [Remote hub](/guides/remote-hub/).
 

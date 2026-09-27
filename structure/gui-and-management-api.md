@@ -143,6 +143,24 @@ cannot establish that identity and uses the existing single-use, digest-only, or
 exchange. Pairing accepts no admin/data credential substitute and consumes a grant only after the
 full origin predicate succeeds.
 
+Cloudflare Access sessions come from a verified signature rather than a transport claim.
+`src/server/cloudflare-access.ts` verifies the `Cf-Access-Jwt-Assertion` token before issuance: RS256
+only with an RSA key of at least 2048 bits and exponent 65537 from
+`https://<remoteGui.cloudflareAccess.teamDomain>/cdn-cgi/access/certs`, issuer `https://<teamDomain>`,
+the configured `audience`, `exp`/`nbf` within a 60-second skew, and an ASCII `email` in
+`allowedEmails`. Key fetches are at least a minute apart per team and shared by concurrent callers, so
+forged tokens cannot amplify them even with a cold or failing endpoint; a cached set is refreshed in
+the background after an hour and stops being trusted after 24 hours without a successful refresh.
+Tokens count only on the `hub-management` ingress unless `cloudflareAccess.anyListener` is set, for a
+deployment where Access fronts every listener. `issueGuiSession` receives only the verified identity
+(`GuiSessionRequestContext.cloudflareAccess`), never the raw header, and still applies the hub-role,
+HTTPS, and origin rules. The resulting `cloudflare-access` session records the email as `identity`
+and the token's `exp` as `notAfter`: activity renews it only up to that ceiling, and every request
+rechecks the email against the current `allowedEmails`, so removing it revokes the session. A request
+carrying `Cf-Access-Jwt-Assertion`, `Cf-Ray`, or `Cf-Connecting-Ip` came through Cloudflare, so its
+`Tailscale-User-Login` is not trusted even on the management ingress. Like `tailscale-identity`, the
+session is not a paired session, so link routes and Remote Workspace mutations refuse it.
+
 The server issues a local in-memory session for five minutes or a remote session for twelve hours,
 with 128 live sessions maximum. Every session is bound to the exact server and browser origins;
 state-changing requests additionally require the session CSRF token. A raw admin token remains

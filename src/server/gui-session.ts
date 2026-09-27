@@ -12,6 +12,7 @@ import {
 export type GuiSessionIssuance =
   | "loopback"
   | "tailscale-identity"
+  | "cloudflare-access"
   | "pairing";
 
 export interface GuiSessionRecord {
@@ -20,6 +21,10 @@ export interface GuiSessionRecord {
   csrfToken: string;
   expiresAt: number;
   issuance: GuiSessionIssuance;
+  /** Hard ceiling from the identity that minted it; activity never extends a session past this. */
+  notAfter?: number;
+  /** The Access email that minted a cloudflare-access session; rechecked against config on every use. */
+  identity?: string;
 }
 
 export interface GuiSessionBootstrap extends GuiSessionRecord {
@@ -52,12 +57,14 @@ export interface GuiSessionState {
 
 export interface GuiSessionRequestContext {
   trustedTailscaleIngress: boolean;
+  /** Already verified by verifyCloudflareAccessIdentity; never derived from a raw header here. */
+  cloudflareAccess?: { email: string; expiresAt: number } | null;
   now?: number;
 }
 
 export type GuiSessionAdmission =
   | { ok: true; principal: "gui-session"; session: GuiSessionRecord }
-  | { ok: false; reason: "missing" | "expired" | "server-origin" | "browser-origin" | "csrf" };
+  | { ok: false; reason: "missing" | "expired" | "revoked" | "server-origin" | "browser-origin" | "csrf" };
 
 export const LOOPBACK_GUI_SESSION_TTL_MS = 5 * 60_000;
 export const REMOTE_GUI_SESSION_TTL_MS = 12 * 60 * 60_000;
@@ -131,6 +138,8 @@ function mintSession(
   issuance: GuiSessionIssuance,
   state: GuiSessionState,
   now: number,
+  notAfter?: number,
+  identity?: string,
 ): GuiSessionBootstrap {
   pruneExpired(state, now);
   evictOldestSession(state);
@@ -142,8 +151,10 @@ function mintSession(
     serverOrigin,
     browserOrigin,
     csrfToken: randomBytes(32).toString("base64url"),
-    expiresAt: now + (issuance === "loopback" ? LOOPBACK_GUI_SESSION_TTL_MS : REMOTE_GUI_SESSION_TTL_MS),
+    expiresAt: Math.min(now + (issuance === "loopback" ? LOOPBACK_GUI_SESSION_TTL_MS : REMOTE_GUI_SESSION_TTL_MS), notAfter ?? Infinity),
     issuance,
+    ...(notAfter === undefined ? {} : { notAfter }),
+    ...(identity === undefined ? {} : { identity }),
   };
   state.sessions.set(token, session);
   return {
@@ -152,6 +163,8 @@ function mintSession(
     browserOrigin: session.browserOrigin,
     csrfToken: session.csrfToken,
     issuance: session.issuance,
+    ...(session.notAfter === undefined ? {} : { notAfter: session.notAfter }),
+    ...(session.identity === undefined ? {} : { identity: session.identity }),
     get expiresAt() { return session.expiresAt; },
     set expiresAt(value) { session.expiresAt = value; },
   };
@@ -180,17 +193,21 @@ export function issueGuiSession(
     return origin ? mintSession(origin, origin, "loopback", state, now) : null;
   }
 
+  // A verified Access token is a signature check, not a transport claim, so unlike the Tailscale
+  // header it needs no trusted ingress. Everything else a remote session requires still applies.
+  const access = context.cloudflareAccess && context.cloudflareAccess.expiresAt > now ? context.cloudflareAccess : null;
   if (
     config.runtimeRole !== "hub"
-    || !context.trustedTailscaleIngress
-    || !tailscaleLoginAllowed(req, config)
+    || !(access || (context.trustedTailscaleIngress && tailscaleLoginAllowed(req, config)))
     || !isAllowedManagementOrigin(req, config)
   ) return null;
   const serverOrigin = managementRequestOrigin(req, config);
   if (!serverOrigin || new URL(serverOrigin).protocol !== "https:") return null;
   const browserOrigin = canonicalGuiBrowserOrigin(req.headers.get("Origin") ?? serverOrigin);
   if (!browserOrigin || !isRemoteGuiBrowserOriginAllowed(browserOrigin, config)) return null;
-  return mintSession(serverOrigin, browserOrigin, "tailscale-identity", state, now);
+  return access
+    ? mintSession(serverOrigin, browserOrigin, "cloudflare-access", state, now, access.expiresAt, access.email)
+    : mintSession(serverOrigin, browserOrigin, "tailscale-identity", state, now);
 }
 
 function pairingGrantDigest(grant: string): string {
@@ -416,9 +433,16 @@ export function authorizeGuiSessionRequest(
   const found = findSession(credential, state);
   if (!found) return { ok: false, reason: "missing" };
   const [token, session] = found;
-  if (session.expiresAt <= now) {
+  if (session.expiresAt <= now || (session.notAfter !== undefined && session.notAfter <= now)) {
     state.sessions.delete(token);
     return { ok: false, reason: "expired" };
+  }
+  // Removing an email from allowedEmails, or the whole block, ends that identity's sessions now
+  // rather than when their Access token expires.
+  if (session.issuance === "cloudflare-access"
+    && !(session.identity && config.remoteGui?.cloudflareAccess?.allowedEmails.includes(session.identity))) {
+    state.sessions.delete(token);
+    return { ok: false, reason: "revoked" };
   }
   if (managementRequestOrigin(req, config) !== session.serverOrigin) {
     return { ok: false, reason: "server-origin" };
@@ -435,6 +459,6 @@ export function authorizeGuiSessionRequest(
     const csrf = req.headers.get("x-opencodex-csrf-token")?.trim();
     if (!csrf || !equalSecret(csrf, session.csrfToken)) return { ok: false, reason: "csrf" };
   }
-  if (session.issuance !== "loopback") session.expiresAt = now + REMOTE_GUI_SESSION_TTL_MS;
+  if (session.issuance !== "loopback") session.expiresAt = Math.min(now + REMOTE_GUI_SESSION_TTL_MS, session.notAfter ?? Infinity);
   return { ok: true, principal: "gui-session", session };
 }

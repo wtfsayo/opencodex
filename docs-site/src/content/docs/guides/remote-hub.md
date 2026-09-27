@@ -35,6 +35,10 @@ With management ingress enabled, the local dashboard command opens `http://127.0
 - `Tailscale-User-Login` is trusted only on the separately bound management ingress. The same header
   on the public listener is ignored. `remoteGui.allowedTailscaleUsers` controls session issuance; it
   does not create a new general-purpose principal.
+- A Cloudflare Access token (`Cf-Access-Jwt-Assertion`) is verified, not trusted: the hub checks its
+  signature against your Access team's keys, the application's AUD tag, its expiry, and
+  `remoteGui.cloudflareAccess.allowedEmails`, by default only on the management ingress. See
+  [Cloudflare Access](#cloudflare-access).
 
 ## Roles and direct data flow
 
@@ -415,6 +419,55 @@ Protect the private key, renew it through Tailscale's supported mechanism, and p
 `127.0.0.1:10101`. A generic TLS proxy does not supply trustworthy Tailscale identity. Do not
 fabricate `Tailscale-User-*` headers; use the single-use, origin-bound pairing flow instead.
 
+## Cloudflare Access
+
+Cloudflare Access can stand in front of the dashboard instead of Tailscale Serve: a named Cloudflare
+Tunnel carries a hostname on your own zone to the loopback-only management ingress, and an Access
+application protects that hostname. Enable the management ingress first, as in
+[Linux systemd or macOS launchd](#linux-systemd-or-macos-launchd).
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create ocx-hub
+cloudflared tunnel route dns ocx-hub dashboard.example.com
+cloudflared tunnel run --url http://127.0.0.1:10101 ocx-hub
+```
+
+A quick tunnel (`cloudflared tunnel --url …` with no name) gets a random `trycloudflare.com`
+hostname outside your zone, which no Access application can protect; do not use one here.
+
+In Zero Trust, create a self-hosted Access application for `dashboard.example.com`, then copy its
+**Application Audience (AUD) Tag** and your team domain (`<team>.cloudflareaccess.com`) into the hub:
+
+```bash
+# Create each parent object first if the hub does not have it yet.
+ocx config set hub '{}'
+ocx config set remoteGui '{}'
+ocx config set hub.managementPublicOrigin '"https://dashboard.example.com"'
+ocx config set remoteGui.cloudflareAccess '{"teamDomain":"acme.cloudflareaccess.com","audience":"<64-character AUD tag>","allowedEmails":["operator@example.com"]}'
+```
+
+Access adds a signed `Cf-Access-Jwt-Assertion` header to every request it lets through. The hub
+verifies it itself (the header alone proves nothing, and a request that skipped Access has none),
+then issues a dashboard session that ends no later than the Access token does. `allowedEmails` is
+checked in addition to your Access policy, so keep the two in step; removing an email, or the whole
+block, ends that person's sessions on their next request. The hub fetches Access's public keys from
+`https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`, so it needs outbound HTTPS to that host;
+if keys cannot be fetched, no session is issued.
+
+By default the hub accepts Access tokens only on the management ingress. A token that leaked could
+otherwise be replayed straight at another listener of the hub, skipping Access's own checks such as
+device posture and revocation. Set `remoteGui.cloudflareAccess.anyListener` to `true` only when
+Access fronts every route into the process, for example a Cloudflare Worker that is the only way
+into a Cloudflare Container running the hub.
+
+Do not combine Cloudflare Access and `remoteGui.allowedTailscaleUsers` on the same management
+ingress unless Tailscale Serve is the only other way in. The hub ignores `Tailscale-User-Login` on
+any request that came through Cloudflare, but anything else that can reach the ingress could still
+supply that header.
+
+Sessions issued this way cannot use link routes or Remote Workspace pairing, the same as Tailscale
+identity sessions. Use pairing for those.
 ## Inviting another machine
 
 Run this on the hub rather than writing an `ocx connect` line by hand:

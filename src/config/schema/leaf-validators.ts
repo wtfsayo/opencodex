@@ -851,6 +851,17 @@ export const remoteGuiConfigSchema = z.object({
       seen.add(user);
     }
   }).optional(),
+  cloudflareAccess: z.object({
+    teamDomain: z.string().trim().toLowerCase().regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$/, {
+      message: "must be <team>.cloudflareaccess.com with no scheme or path",
+    }),
+    audience: z.string().trim().toLowerCase().regex(/^[0-9a-f]{64}$/, { message: "must be the Access application's 64-character AUD tag" }),
+    // ASCII only, matching the runtime comparison, so an entry can never match through Unicode case folding.
+    allowedEmails: z.array(z.string().trim().regex(/^[\x21-\x7e]+$/, { message: "must be ASCII" }).toLowerCase().email().max(320)).min(1).max(64).superRefine((emails, ctx) => {
+      if (new Set(emails).size !== emails.length) ctx.addIssue({ code: "custom", message: "must contain unique emails" });
+    }),
+    anyListener: z.boolean().optional(),
+  }).strict().optional(),
   // Retired (see OcxRemoteGuiConfig): accepted so an existing file still loads, ignored by
   // the pairing path. Removing it from a strict schema would reject the whole config.
   allowInsecureHttp: z.boolean().optional(),

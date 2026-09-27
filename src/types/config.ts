@@ -408,6 +408,25 @@ export interface OcxRemoteGuiConfig {
   /** Exact Tailscale login identities permitted to receive an automatic remote GUI session. */
   allowedTailscaleUsers?: string[];
   /**
+   * Cloudflare Access in front of the hub: a request carrying a `Cf-Access-Jwt-Assertion` token
+   * signed by `teamDomain`, issued for the Access application `audience`, and naming one of
+   * `allowedEmails` receives a remote GUI session (see src/server/cloudflare-access.ts).
+   */
+  cloudflareAccess?: {
+    /** `<team>.cloudflareaccess.com`, with no scheme. */
+    teamDomain: string;
+    /** The Access application's AUD tag (64 hex characters). */
+    audience: string;
+    /** Lowercase ASCII emails; compared exactly against the token's `email` claim, lowercased. */
+    allowedEmails: string[];
+    /**
+     * Accept Access tokens on every listener, not only the management ingress. Only for deployments
+     * where Access fronts every route into the process (a Worker in front of a container); otherwise
+     * a leaked token could skip Access by going straight to another listener.
+     */
+    anyListener?: boolean;
+  };
+  /**
    * Retired. Once permitted a one-time pairing exchange over non-loopback plaintext HTTP.
    *
    * Still parsed so an existing config file keeps loading, but it grants nothing: a pairing

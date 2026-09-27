@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decideLease, isHolder, LEASE_STALE_MS, LeaseState, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
 import { handleStateRequest, snapshotPrefix, sweepOrphans, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
-import { containerEnv, edgeDecision, envFingerprint, forwardableRequest } from "../../deploy/cloudflare/src/container-env";
+import { containerEnv, edgeDecision, envFingerprint, isSupersededBy, forwardableRequest } from "../../deploy/cloudflare/src/container-env";
 import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
@@ -272,6 +272,18 @@ describe("cloudflare worker edge", () => {
     } finally {
       console.warn = warn;
     }
+  });
+
+  test("a Durable Object is superseded only by a strictly newer Worker version", () => {
+    const older = "2026-09-27T10:00:00.000Z";
+    const newer = "2026-09-27T10:05:00.000Z";
+    expect(isSupersededBy(newer, older)).toBe(true);
+    expect(isSupersededBy(older, newer)).toBe(false);
+    expect(isSupersededBy(older, older)).toBe(false);
+    // Missing or garbled metadata (wrangler dev, an older deployment) never resets anything.
+    expect(isSupersededBy(undefined, older)).toBe(false);
+    expect(isSupersededBy(newer, undefined)).toBe(false);
+    expect(isSupersededBy("not a date", older)).toBe(false);
   });
 
   test("the fingerprint changes when a secret rotates and ignores key order", async () => {

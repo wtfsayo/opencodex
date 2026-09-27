@@ -23,5 +23,7 @@
     "bindings": [{ "name": "HUB", "class_name": "OpencodexHub" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["OpencodexHub"] }],
-  "r2_buckets": [{ "binding": "STATE", "bucket_name": "opencodex-state" }]
+  "r2_buckets": [{ "binding": "STATE", "bucket_name": "opencodex-state" }],
+  // Lets a Durable Object still on an older version notice it and reset; see isSupersededBy.
+  "version_metadata": { "binding": "CF_VERSION" }
 }

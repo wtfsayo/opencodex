@@ -1,11 +1,13 @@
 import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
-import { containerEnv, edgeDecision, envFingerprint, forwardableRequest, type EdgeEnv } from "./container-env";
+import { containerEnv, edgeDecision, envFingerprint, forwardableRequest, isSupersededBy, type EdgeEnv } from "./container-env";
 import { LeaseState } from "./lease";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
 
 export interface Env extends EdgeEnv {
+  /** version_metadata binding; lets a stale Durable Object notice a newer Worker version. */
+  CF_VERSION?: WorkerVersionMetadata;
   HUB: DurableObjectNamespace<OpencodexHub>;
   STATE: R2Bucket;
   OCX_SLEEP_AFTER?: string;
@@ -126,6 +128,13 @@ export class OpencodexHub extends Container<Env> {
     }
   }
 
+  /** Resets this object when the calling Worker is newer, so the next instance sees current secrets. */
+  assertCurrentVersion(workerVersionTimestamp: string | undefined): void {
+    if (isSupersededBy(workerVersionTimestamp, this.env.CF_VERSION?.timestamp)) {
+      this.ctx.abort("superseded by a newer Worker version");
+    }
+  }
+
   acquireLease(bootId: string) { return this.leases.acquireLease(bootId); }
   renewLease(bootId: string) { return this.leases.renewLease(bootId); }
   holdsLease(bootId: string) { return this.leases.holdsLease(bootId); }
@@ -163,6 +172,27 @@ export default {
       if (decision.status === 204) return new Response(null, { status: 204 });
       return Response.json({ error: { message: decision.message, type: "invalid_request_error" } }, { status: decision.status });
     }
-    return getContainer(env.HUB, HUB_NAME).fetch(forwardableRequest(req));
+    // Only this body-free call is retried: an aborted stale object rejects it until the fresh
+    // instance is up. The request itself is sent once, so a body is never replayed.
+    let current = false;
+    for (let attempt = 0; attempt < 5 && !current; attempt++) {
+      try {
+        await getContainer(env.HUB, HUB_NAME).assertCurrentVersion(env.CF_VERSION?.timestamp);
+        current = true;
+      } catch {
+        await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
+      }
+    }
+    try {
+      if (!current) throw new Error("hub object did not come back after a version reset");
+      return await getContainer(env.HUB, HUB_NAME).fetch(forwardableRequest(req));
+    } catch (error) {
+      // A reset or restart racing this request: an answer the client can retry, not a bare 1101.
+      console.error(`Hub request failed: ${error instanceof Error ? error.message : String(error)}`);
+      return Response.json(
+        { error: { message: "opencodex is restarting; retry shortly.", type: "server_error" } },
+        { status: 503, headers: { "retry-after": "5" } },
+      );
+    }
   },
 } satisfies ExportedHandler<Env>;

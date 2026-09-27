@@ -124,6 +124,19 @@ export async function edgeDecision(req: Request, env: EdgeEnv): Promise<EdgeDeci
   return unauthorized;
 }
 
+/**
+ * True when the Worker calling a Durable Object runs a newer version than the object itself.
+ * A busy object can keep serving on the version, and so the secrets, it started with long after a
+ * `wrangler secret put` published a new one (observed: from 44 s to over 7 minutes), which delays
+ * restartIfEnvChanged and with it the revocation of a rotated token. The stateless Worker picks up
+ * new versions promptly, so it can tell the object to reset. Unparseable input is never superseded.
+ */
+export function isSupersededBy(workerVersionTimestamp: string | undefined, ownVersionTimestamp: string | undefined): boolean {
+  const worker = Date.parse(workerVersionTimestamp ?? "");
+  const own = Date.parse(ownVersionTimestamp ?? "");
+  return Number.isFinite(worker) && Number.isFinite(own) && worker > own;
+}
+
 /** The request as the container should see it: the client never chooses which container port it reaches. */
 export function forwardableRequest(req: Request): Request {
   const forwarded = new Request(req);

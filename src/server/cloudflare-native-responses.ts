@@ -14,7 +14,8 @@ import { reasoningReplayConversationIdFromResponsesRequest, sessionIdHeaderFromR
 import { createOpenAIChatAdapterWith, type OpenAIChatAdapterDeps } from "../adapters/openai-chat/adapter";
 import { renameRoutedIdentityInContext } from "../adapters/identity";
 import { bridgeToResponsesSSE } from "../bridge/sse";
-import { parseRequest } from "../responses/parser";
+import { hasValidatedActiveReasoningEffort, parseRequest } from "../responses/parser";
+import { mapReasoningEffortWith, NO_REASONING_METADATA } from "../reasoning-effort-core";
 import { readResponseStreamWithInactivity, ResponseBodyInactivityError } from "../lib/response-body-inactivity";
 import { createTranslatorBudget } from "../lib/translator-budget";
 import { resolveStallTimeoutMs } from "../stall-timeout";
@@ -98,8 +99,6 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
   if (body.store !== false) return "stored-response";
   if (body.reasoning !== undefined) {
     if (!isRec(body.reasoning)) return "reasoning-shape";
-    // Effort ladders include what ocx learned about the model and keeps on disk.
-    if (body.reasoning.effort !== undefined && body.reasoning.effort !== null) return "reasoning-effort";
   }
   if (body.tools !== undefined) {
     if (!Array.isArray(body.tools)) return "tools-shape";
@@ -141,12 +140,10 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
   return undefined;
 }
 
-// Effort-bearing and image-bearing turns are declined above, so these are never reached.
+// Effort is mapped as ocx maps it for a destination without models.dev metadata (the only kind
+// resolveNativeChatRoute admits). Image-bearing turns are declined above, so those two are never reached.
 const WORKER_ADAPTER_DEPS: OpenAIChatAdapterDeps = {
-  mapReasoningEffort: (_provider, _modelId, requested) => {
-    if (requested !== undefined) throw new Error("reasoning effort is not mapped in the Worker");
-    return undefined;
-  },
+  mapReasoningEffort: (provider, modelId, requested) => mapReasoningEffortWith(provider, modelId, requested, NO_REASONING_METADATA),
   hasShrinkableOpenAIChatImages: () => false,
   normalizeOpenAIChatImages: async () => {},
 };
@@ -182,12 +179,15 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   const surface = collabSurface(parsed);
   const subagentModels = (loaded.config as { subagentModels?: unknown }).subagentModels;
   if (surface === "v2" && Array.isArray(subagentModels) && subagentModels.length > 0) return no("collaboration-v2-guidance");
+  // collaboration.ts injects <multi_agent_mode> guidance on a v1 surface at max (ultra arrives as max).
+  if (surface === "v1" && parsed.options.reasoning === "max") return no("collaboration-v1-guidance");
   // As core-normalize.ts: the upstream sees the routed id, and the identity sentence names it.
   if (parsed._rawBody && typeof parsed._rawBody === "object") (parsed._rawBody as { model?: string }).model = route.modelId;
   parsed.modelId = route.modelId;
   parsed.context = renameRoutedIdentityInContext(parsed.context, route.modelId);
+  // core-normalize.ts; the provider's showThinkingSummary is outside the fields this path admits.
   const summary = isRec(body.reasoning) ? body.reasoning.summary : undefined;
-  parsed.options.hideThinkingSummary = summary === "none" || !summary;
+  parsed.options.hideThinkingSummary = summary === "none" || (!summary && !hasValidatedActiveReasoningEffort(parsed.options));
 
   const translatorBudget = createTranslatorBudget();
   const adapter = createOpenAIChatAdapterWith(route.provider, WORKER_ADAPTER_DEPS);

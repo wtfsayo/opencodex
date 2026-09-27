@@ -3,6 +3,7 @@ import { nativeResponsesDeclineReason, serveNativeResponses } from "../../src/se
 import { createOpenAIChatAdapter, createOpenAIChatAdapterWith } from "../../src/adapters/openai-chat";
 import { parseRequest } from "../../src/responses/parser";
 import { createTranslatorBudget } from "../../src/lib/translator-budget";
+import { mapReasoningEffortWith, NO_REASONING_METADATA } from "../../src/reasoning-effort-core";
 import { handleWorkersAi, WORKERS_AI_HOST } from "../../deploy/cloudflare/src/workers-ai";
 import { LeaseState, MAX_SKILLS_BLOCK_BYTES, MAX_SKILLS_SESSIONS, SKILLS_SNAPSHOT_TTL_MS, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
 
@@ -93,7 +94,21 @@ describe("Worker-native Responses", () => {
     expect((sentBody.tools as { function: { name: string } }[])[0]!.function.name).toBe("shell");
   });
 
-  test("the Worker's adapter builds the same upstream request as the proxy's", async () => {
+  test("the Worker's adapter builds the same upstream request as the proxy's, at every effort", async () => {
+    for (const effort of [undefined, "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
+      const body = codexTurn("m-1", effort ? { reasoning: { effort, summary: "auto" } } : {});
+      const build = async (adapter: ReturnType<typeof createOpenAIChatAdapter>) =>
+        adapter.buildRequest(parseRequest(structuredClone(body)), { headers: new Headers(), translatorBudget: createTranslatorBudget() });
+      const proxy = await build(createOpenAIChatAdapter(provider as never));
+      const worker = await build(createOpenAIChatAdapterWith(provider as never, {
+        mapReasoningEffort: (p, m, e) => mapReasoningEffortWith(p, m, e, NO_REASONING_METADATA),
+        hasShrinkableOpenAIChatImages: () => false, normalizeOpenAIChatImages: async () => {},
+      }));
+      expect([effort, worker.body]).toEqual([effort, proxy.body]);
+    }
+  });
+
+  test("the adapter-level parity holds for the headers and url too", async () => {
     const body = codexTurn("m-1");
     const build = async (adapter: ReturnType<typeof createOpenAIChatAdapter>) =>
       adapter.buildRequest(parseRequest(structuredClone(body)), { headers: new Headers(), translatorBudget: createTranslatorBudget() });
@@ -112,7 +127,7 @@ describe("Worker-native Responses", () => {
     expect(reason({ stream: false })).toBe("not-streamed");
     expect(reason({ previous_response_id: "r" })).toBe("body-fields:previous_response_id");
     expect(reason({ service_tier: "priority" })).toBe("body-fields:service_tier");
-    expect(reason({ reasoning: { effort: "medium" } })).toBe("reasoning-effort");
+    expect(reason({ reasoning: { effort: "medium" } })).toBeUndefined();
     expect(reason({ reasoning: { summary: "auto" } })).toBeUndefined();
     expect(reason({ tools: [{ type: "web_search" }] })).toBeUndefined();
     expect(reason({ tools: [{ type: "web_search", search_context_size: "high" }] })).toBe("tool-type");
@@ -130,6 +145,23 @@ describe("Worker-native Responses", () => {
     expect(reason({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "<skills_instructions>y</skills_instructions>" }] }] })).toBe("skills-instructions");
     expect(reason({}, new Headers({ "x-codex-parent-thread-id": "t" }))).toBe("collaboration-turn");
     expect(reason({}, new Headers({ "x-opencodex-grok": "1" }))).toBe("grok-surface");
+  });
+
+  test("declines destinations whose effort ladders come from models.dev, and v1 guidance turns", async () => {
+    for (const baseUrl of ["https://opencode.ai/zen/v1", "https://opencode.ai/zen/go/v1/"]) {
+      const reasons: string[] = [];
+      const config = JSON.stringify({ providers: { p: { ...provider, baseUrl } } });
+      const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1")), new Headers(), new AbortController().signal, {
+        readConfig: async () => config, fetch: async () => { throw new Error("unexpected"); }, onDecline: reason => reasons.push(reason),
+      });
+      expect([response, reasons]).toEqual([null, ["responses:reasoning-metadata-destination"]]);
+    }
+    const reasons: string[] = [];
+    const v1 = codexTurn("p/m-1", { reasoning: { effort: "max" }, tools: [{ type: "namespace", name: "multi_agent_v1", tools: [fn("spawn_agent"), fn("send_input")] }] });
+    await serveNativeResponses(JSON.stringify(v1), new Headers(), new AbortController().signal, {
+      readConfig: async () => externalConfig, fetch: async () => { throw new Error("unexpected"); }, onDecline: reason => reasons.push(reason),
+    });
+    expect(reasons).toEqual(["responses:collaboration-v1-guidance"]);
   });
 
   test("an upstream error is left to the container, before anything reaches the client", async () => {

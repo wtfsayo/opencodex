@@ -18,6 +18,8 @@
  * entitlement gap (muse-spark max needs an active Muse Code subscription) costs one rejected
  * request instead of failing every turn that selects that rung.
  */
+import { BASE_URL_TO_METADATA_PROVIDER, metadataProviderKeyForBaseUrl, normalizeDestinationUrl } from "./reasoning-metadata-destinations";
+export { normalizeDestinationUrl };
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -51,27 +53,6 @@ const CLASSIFIED_STYLE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
  * destination URL is the stable handle. Only destinations this patch has evidence for are
  * listed; an unlisted provider simply keeps its current behaviour.
  */
-const BASE_URL_TO_METADATA_PROVIDER: Record<string, string> = {
-  "https://opencode.ai/zen/go/v1": "opencode-go",
-  "https://opencode.ai/zen/v1": "opencode",
-};
-
-/**
- * Both sides of the mapping are compared after this normalisation, so a trailing slash or a
- * `/v1` suffix never decides whether a destination resolves. models.dev publishes each
- * provider's own `api` URL; the snapshot keeps it (v2) so the mapping can be checked against
- * published data instead of trusted blindly.
- */
-export function normalizeDestinationUrl(url: string | undefined): string | undefined {
-  if (typeof url !== "string" || url.trim() === "") return undefined;
-  try {
-    const parsed = new URL(url.trim());
-    const path = parsed.pathname.replace(/\/+$/, "").replace(/\/v1$/i, "");
-    return (parsed.protocol + "//" + parsed.host + path).toLowerCase();
-  } catch {
-    return undefined;
-  }
-}
 
 export type ReasoningMetadataOption = { type: string; values?: string[] };
 export type ReasoningMetadataModel = { reasoning: boolean; options: ReasoningMetadataOption[] };
@@ -129,12 +110,7 @@ function sanitizeLadder(values: readonly string[] | undefined): string[] | undef
 }
 
 function metadataProviderKey(provider: OcxProviderConfig): string | undefined {
-  const normalized = normalizeDestinationUrl(typeof provider.baseUrl === "string" ? provider.baseUrl : undefined);
-  if (!normalized) return undefined;
-  for (const [destination, key] of Object.entries(BASE_URL_TO_METADATA_PROVIDER)) {
-    if (normalizeDestinationUrl(destination) === normalized) return key;
-  }
-  return undefined;
+  return metadataProviderKeyForBaseUrl(typeof provider.baseUrl === "string" ? provider.baseUrl : undefined);
 }
 
 /** Whether catalog sync should bootstrap metadata for this destination. */

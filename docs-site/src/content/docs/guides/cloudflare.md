@@ -169,7 +169,8 @@ The Worker serves a request only when all of these hold, and otherwise passes it
 - `model` is `<provider>/<model>` for a provider you added yourself (not a built-in provider name
   such as `openai` or `deepseek`), whose config has only `adapter: "openai-chat"`, an `https`
   `baseUrl` on a public host name, a literal `apiKey`, `models` (which must list the model), and
-  optionally `authMode: "key"`. The key can be a literal or a `${NAME}` reference to a secret listed
+  optionally `authMode: "key"`, and a `baseUrl` other than OpenCode Zen's, whose reasoning levels
+  `ocx` looks up in models.dev. The key can be a literal or a `${NAME}` reference to a secret listed
   in `OCX_PASSTHROUGH_SECRETS`, as `ocx` would resolve it. Workers AI qualifies as shown above.
 - The config has nothing beyond basic settings: any routing, redirect, limit, or surface section
   sends every request to `ocx`.
@@ -181,7 +182,7 @@ When the Worker passes a request on, it logs why once per reason (for example
 `Worker-native chat declined: config-keys:<names>`); `npx wrangler tail` shows it.
 
 It also answers `POST /v1/responses`, the API Codex uses, for the same providers when the turn is
-streamed, not stored (`"store": false`, as Codex sends it), sets no reasoning effort, and uses only
+streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
 is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only
 messages; and no `<skills_instructions>` block. That covers what Codex CLI sends on an ordinary

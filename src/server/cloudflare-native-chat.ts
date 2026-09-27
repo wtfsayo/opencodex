@@ -17,6 +17,7 @@ import { chatCollabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { createTranslatorBudget } from "../lib/translator-budget";
 import type { OcxConfig, OcxProviderConfig, OcxUsage } from "../types";
 import { PROVIDER_REGISTRY } from "../providers/registry";
+import { metadataProviderKeyForBaseUrl } from "../providers/reasoning-metadata-destinations";
 
 type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
@@ -103,6 +104,9 @@ export function resolveNativeChatRoute(
   if (provider.adapter !== "openai-chat") return no("adapter");
   if (provider.authMode !== undefined && provider.authMode !== "key") return no("auth-mode");
   if (typeof provider.baseUrl !== "string" || !destinationAllowed(provider.baseUrl, localHosts)) return no("destination");
+  // ocx resolves these destinations' reasoning ladders from models.dev metadata and refusals it
+  // learned, both kept on disk (reasoning-metadata.ts).
+  if (metadataProviderKeyForBaseUrl(provider.baseUrl) !== undefined) return no("reasoning-metadata-destination");
   if (typeof provider.apiKey !== "string" || provider.apiKey.startsWith("keychain:")) return no("key-reference");
   const apiKey = resolveKeyReference(provider.apiKey, secrets);
   if (!apiKey) return no("key-reference-unset");

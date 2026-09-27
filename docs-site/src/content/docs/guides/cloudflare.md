@@ -142,8 +142,11 @@ internal address and name models without the `@cf/` prefix:
 ```
 
 `ai.ocx.internal` exists only inside the container; the Worker answers it through the binding. The
-`apiKey` value is not checked. The shim carries text chat, streamed or not, and refuses requests with
-tools or images rather than dropping them. Workers AI retires models over time; list current ones in
+`apiKey` value is not checked. The shim carries text chat, streamed or not, and function tools for
+models that support function calling, such as `meta/llama-3.3-70b-instruct-fp8-fast` and
+`meta/llama-4-scout-17b-16e-instruct`; those are the ones to use with Codex, which always sends
+tools. It honours `tool_choice: "auto"` only and refuses images and other `tool_choice` values
+rather than dropping them. Workers AI retires models over time; list current ones in
 the dashboard under **AI → Workers AI → Models**.
 
 ## Worker-native requests (experimental)
@@ -180,8 +183,7 @@ When the Worker passes a request on, it logs why once per reason (for example
 It also answers `POST /v1/responses`, the API Codex uses, for the same providers when the turn is
 streamed, not stored (`"store": false`, as Codex sends it), sets no reasoning effort, and uses only
 `function` tools (no MCP namespaces, web search, code-mode `exec`, or multi-agent tools), with
-text-only messages and no `<skills_instructions>` block. Workers AI takes no tools, so a Codex turn
-against a Workers AI model goes to `ocx`, which gets the same refusal.
+text-only messages and no `<skills_instructions>` block.
 
 If the provider returns an error status, the Worker sends the request to `ocx` instead, which
 retries and reports it as usual; the provider then sees that request twice. An answer with a 200

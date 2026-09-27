@@ -13,7 +13,7 @@ import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { HISTORY_DB_FILENAME } from "../../src/routing/history/schema";
 import { MIN_USAGE_LEDGER_MAX_BYTES } from "../../src/usage/retention-contract";
 import { repoPath } from "../helpers/repo-root";
-import { handleWorkersAi, toChatCompletionStream, toWorkersAiRequest, workersAiModel } from "../../deploy/cloudflare/src/workers-ai";
+import { handleWorkersAi, toChatCompletion, toChatCompletionStream, toWorkersAiRequest, workersAiModel } from "../../deploy/cloudflare/src/workers-ai";
 
 const SQLITE = "SQLite format 3\0";
 const created: string[] = [];
@@ -879,6 +879,54 @@ describe("cloudflare Workers AI shim", () => {
     expect(toWorkersAiRequest({ messages: [] })).toMatchObject({ ok: false });
     expect(workersAiModel("meta/llama-3.1-8b-instruct")).toBe("@cf/meta/llama-3.1-8b-instruct");
     expect(workersAiModel("@hf/some/model")).toBe("@hf/some/model");
+  });
+
+  test("passes function tools through and accepts a tool round trip", () => {
+    const tool = { type: "function", function: { name: "get_weather", parameters: { type: "object", properties: {} } } };
+    const translated = toWorkersAiRequest({
+      model: "meta/llama-4-scout-17b-16e-instruct", tool_choice: "auto", tools: [tool],
+      messages: [
+        { role: "user", content: "weather?" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_1", content: "sunny" },
+      ],
+    });
+    expect(translated).toMatchObject({ ok: true, input: { tools: [tool] } });
+    expect((translated as { input: { messages: unknown[] } }).input.messages).toEqual([
+      { role: "user", content: "weather?" },
+      { role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "sunny" },
+    ]);
+    // Workers AI takes no tool_choice, so only "auto" can be honoured.
+    expect(toWorkersAiRequest({ model: "m", messages: [{ role: "user", content: "x" }], tools: [tool], tool_choice: "required" })).toMatchObject({ ok: false, status: 400 });
+  });
+
+  test("converts the traditional tool-call answer to OpenAI tool_calls, streamed or not", async () => {
+    // As @cf/meta/llama-3.1-8b-instruct-fp8 answered on 2026-09-28.
+    const completion = toChatCompletion({ response: null, tool_calls: [{ name: "get_weather", arguments: { city: "Paris" } }] }, "m") as {
+      choices: { message: { content: unknown; tool_calls: { id: string; function: { name: string; arguments: string } }[] }; finish_reason: string }[];
+    };
+    const choice = completion.choices[0]!;
+    expect(choice.finish_reason).toBe("tool_calls");
+    expect(choice.message.content).toBeNull();
+    expect(choice.message.tool_calls[0]!.function).toEqual({ name: "get_weather", arguments: "{\"city\":\"Paris\"}" });
+    expect(choice.message.tool_calls[0]!.id).toMatch(/^call_[0-9a-f]{32}$/);
+
+    const traditional = await new Response(toChatCompletionStream(sse([
+      "data: {\"response\":\"\",\"tool_calls\":[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}]}\n\n", "data: [DONE]\n\n",
+    ]), "m")).text();
+    expect(traditional).toContain("\"tool_calls\":[{\"index\":0,");
+    expect(traditional).toContain("\"finish_reason\":\"tool_calls\"");
+
+    // As @cf/meta/llama-4-scout-17b-16e-instruct streamed: OpenAI deltas, continuation ids null.
+    const openAi = await new Response(toChatCompletionStream(sse([
+      "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"city\\\": \\\"\",\"name\":\"get_weather\"},\"id\":\"t1\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0}],\"tool_calls\":[{}]}\n\n",
+      "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"Paris\\\"}\"},\"id\":null,\"index\":0}]},\"finish_reason\":null,\"index\":0}]}\n\n",
+      "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"tool_calls\",\"index\":0}]}\n\n",
+      "data: [DONE]\n\n",
+    ]), "m")).text();
+    expect(openAi).not.toContain("\"id\":null");
+    expect(openAi.match(/"finish_reason":"tool_calls"/g)).toHaveLength(1);
   });
 
   test("streams Workers AI chunks as OpenAI chat completion chunks", async () => {

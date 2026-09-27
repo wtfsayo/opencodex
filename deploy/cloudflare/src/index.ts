@@ -1,6 +1,6 @@
 import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
 import {
-  containerEnv, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
+  chatAdmitsDataToken, containerEnv, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
 import { type DurableDocument, LeaseState } from "./lease";
@@ -200,18 +200,28 @@ async function serveDashboard(req: Request, assets: Fetcher): Promise<Response> 
   return new Response(page.body, { status: page.status, headers });
 }
 
+// Larger bodies stream to the container untouched: reading them here costs Worker memory (128 MB)
+// and a text-only turn this path would serve is far smaller.
+const NATIVE_MAX_BODY_BYTES = 4 * 1024 * 1024;
+
 /**
  * The Worker-native path runs only where the edge has matched the data token exactly: with
- * OCX_EDGE_KEY_CHECK=presence the key is verified by ocx, which this path would skip. Returns the
- * response, or the request to forward when the body was read and declined, or null when untouched.
+ * OCX_EDGE_KEY_CHECK=presence the key is verified by ocx, which this path would skip. It also
+ * applies ocx's own header rule for chat (chatAdmitsDataToken). Returns the response, or the
+ * request to forward when the body was read and declined, or null when the request is untouched.
  */
 async function tryWorkerNative(req: Request, env: Env): Promise<Response | { forward: Request } | null> {
   if (env.OCX_WORKER_NATIVE?.trim() !== "1" || env.OCX_EDGE_KEY_CHECK?.trim() === "presence") return null;
   if (req.method !== "POST" || new URL(req.url).pathname !== "/v1/chat/completions") return null;
-  const bodyText = await req.text();
+  // ocx decompresses gzip and zstd bodies; this path would have to as well, so leave them to it.
+  if (req.headers.has("content-encoding")) return null;
+  const length = Number(req.headers.get("content-length"));
+  if (!Number.isSafeInteger(length) || length <= 0 || length > NATIVE_MAX_BODY_BYTES) return null;
+  if (!(await chatAdmitsDataToken(req, env))) return null;
+  const bodyBytes = await req.arrayBuffer();
   const hub = getContainer(env.HUB, HUB_NAME);
   try {
-    const served = await serveNativeChat(bodyText, req.signal, {
+    const served = await serveNativeChat(new TextDecoder().decode(bodyBytes), req.signal, {
       readConfig: async () => (await hub.readDocument("config"))?.body,
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
       fetch: request => fetch(request),
@@ -220,7 +230,9 @@ async function tryWorkerNative(req: Request, env: Env): Promise<Response | { for
   } catch (error) {
     console.error(`Worker-native chat declined after an error: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return { forward: new Request(req, { body: bodyText }) };
+  // Nobody is waiting for an answer, so do not wake the container to produce one.
+  if (req.signal.aborted) return new Response(null, { status: 499 });
+  return { forward: new Request(req, { body: bodyBytes }) };
 }
 
 export default {

@@ -126,3 +126,16 @@ Shape:
 
 Not done: usage rows and request logs for Worker-served turns (next: queue them in the Durable
 Object for the container to ingest), Responses and Messages routes, non-streamed turns.
+
+Security review (same day) found the first cut unsafe and it was withdrawn from the test
+deployment until fixed: a provider named after a built-in one had its configured `baseUrl` used
+where ocx substitutes the registry endpoint (the key could go to a stale or hostile URL); ocx's
+private-destination check was skipped; `blockedModelRedirects` was ignored; the edge's any-header
+key check admitted forms ocx refuses on chat; and bodies were read without a cap. Fixes: a
+top-level config key allowlist instead of a section denylist, built-in provider names declined,
+https public host names only (plus the Worker's own hosts), ocx's chat header rule
+(`chatAdmitsDataToken`), a 4 MiB cap checked before reading, compressed bodies left to ocx, and an
+aborted client no longer wakes the container.
+
+Measured with the first cut before it was withdrawn (same deployment, Workers AI, 20 streamed
+turns): p50 time to first byte 471 ms vs 651 ms through the container, p50 total 621 vs 793 ms.

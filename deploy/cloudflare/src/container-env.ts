@@ -126,6 +126,21 @@ export async function edgeDecision(req: Request, env: EdgeEnv): Promise<EdgeDeci
 }
 
 /**
+ * Whether ocx itself would admit this Chat Completions request with the data token. The edge
+ * accepts the token in any header it knows, but ocx's Responses-family admission
+ * (resolveResponsesApiAuth in src/server/auth-cors.ts) reads only `x-opencodex-api-key`, or failing
+ * that the bearer token, and never `x-api-key`. A request answered in the Worker skips ocx, so it
+ * must pass the same rule.
+ */
+export async function chatAdmitsDataToken(req: Request, env: EdgeEnv): Promise<boolean> {
+  const token = env.OPENCODEX_API_AUTH_TOKEN?.trim();
+  if (!token) return false;
+  const dedicated = req.headers.get("x-opencodex-api-key")?.trim();
+  const presented = dedicated || req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
+  return !!presented && secretEquals(presented, token);
+}
+
+/**
  * True when the Worker calling a Durable Object runs a newer version than the object itself.
  * A busy object can keep serving on the version, and so the secrets, it started with long after a
  * `wrangler secret put` published a new one (observed: from 44 s to over 7 minutes), which delays

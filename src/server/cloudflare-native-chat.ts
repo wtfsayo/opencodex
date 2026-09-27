@@ -12,6 +12,7 @@ import { buildOpenAIChatPassthroughRequest } from "../adapters/openai-chat/passt
 import { nativeChatSse } from "./chat-native-sse";
 import { createTranslatorBudget } from "../lib/translator-budget";
 import type { OcxConfig, OcxProviderConfig } from "../types";
+import { PROVIDER_REGISTRY } from "../providers/registry";
 
 type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
@@ -19,10 +20,30 @@ const isRec = (value: unknown): value is Rec => !!value && typeof value === "obj
 // Provider fields whose meaning this path reproduces exactly. Any other field (headers, key pools,
 // aliases, per-model wire overrides, reasoning or capability gates) sends the turn to the container.
 const PROVIDER_FIELDS = new Set(["adapter", "baseUrl", "apiKey", "models", "authMode"]);
-// Config sections that change how ocx routes or accounts for a turn before the explicit
-// provider/model match this path relies on.
-const ROUTING_SECTIONS = ["routingProfiles", "combos", "codexAccountNamespaces", "customModels", "spend"] as const;
+// Top-level config keys that cannot change how ocx admits, routes, shapes or sends a Chat
+// Completions turn. Any other key present sends the turn to the container: a denylist would miss
+// the next section that does (blockedModelRedirects, apiSurfaces and maxInboundBodyBytes were such).
+const CONFIG_KEYS = new Set([
+  "port", "hostname", "providers", "defaultProvider", "stallTimeoutSec", "usageLedgerMaxBytes",
+  "managementUsageMaxReadBytes", "appOwnedMemoryBudgetMb", "configRebaseProvenance", "oauthOpenBrowser",
+  "codexAutoStart", "codexProviderDisplayName", "codexShimAutoRestore", "codexQuotaAutoRefresh",
+  "codexAccountPickerEnabled", "catalogAutoRefresh", "quotaResetNotify", "remoteGui", "metricsExport",
+  "openaiProviderTierVersion", "googleAntigravityStaticCatalogVersion", "subagentModelsVersion",
+  "multiAgentSurfaceAdvisoryVersion", "apiKeys",
+]);
 const RESERVED_NAMESPACES = new Set(["policy", "combo"]);
+// ocx refuses provider destinations on private, loopback and metadata addresses. Its check resolves
+// DNS, which the Worker cannot do the same way, so this path goes further: public https hosts by
+// name only, plus the hosts the Worker answers itself.
+const PRIVATE_HOST = /^(localhost|.*\.(localhost|local|lan|internal|home|corp))$/i;
+const IP_LITERAL = /^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:.]+\])$/i;
+
+function destinationAllowed(baseUrl: string, localHosts: ReadonlySet<string>): boolean {
+  let url: URL;
+  try { url = new URL(baseUrl); } catch { return false; }
+  if (localHosts.has(url.host)) return true;
+  return url.protocol === "https:" && !url.username && !url.password && !PRIVATE_HOST.test(url.hostname) && !IP_LITERAL.test(url.hostname);
+}
 
 export type NativeChatRoute = { providerName: string; provider: OcxProviderConfig; modelId: string; requestedModel: string };
 
@@ -30,24 +51,24 @@ export type NativeChatRoute = { providerName: string; provider: OcxProviderConfi
  * The route ocx would pick for `model`, or null when this path cannot be sure it matches. Only
  * `<provider>/<model>` with an exact configured provider name and an exactly listed model qualifies.
  */
-export function resolveNativeChatRoute(config: unknown, model: unknown): NativeChatRoute | null {
+export function resolveNativeChatRoute(config: unknown, model: unknown, localHosts: ReadonlySet<string> = new Set()): NativeChatRoute | null {
   if (!isRec(config) || !isRec(config.providers) || typeof model !== "string") return null;
-  for (const section of ROUTING_SECTIONS) {
-    const value = config[section];
-    if (value !== undefined && !(isRec(value) && Object.keys(value).length === 0) && !(Array.isArray(value) && value.length === 0)) return null;
-  }
+  if (Object.keys(config).some(key => !CONFIG_KEYS.has(key))) return null;
   const slash = model.indexOf("/");
   if (slash <= 0) return null;
   const providerName = model.slice(0, slash);
   const modelId = model.slice(slash + 1);
   if (RESERVED_NAMESPACES.has(providerName) || !modelId) return null;
   if (!Object.prototype.hasOwnProperty.call(config.providers, providerName)) return null;
+  // ocx replaces a built-in provider's transport (its baseUrl among it) with the registry's, so a
+  // configured URL on such a provider is not where ocx would send the key.
+  if (PROVIDER_REGISTRY.some(entry => entry.id === providerName)) return null;
   const provider = config.providers[providerName];
   if (!isRec(provider)) return null;
   if (Object.keys(provider).some(key => !PROVIDER_FIELDS.has(key))) return null;
   if (provider.adapter !== "openai-chat") return null;
   if (provider.authMode !== undefined && provider.authMode !== "key") return null;
-  if (typeof provider.baseUrl !== "string" || !URL.canParse(provider.baseUrl)) return null;
+  if (typeof provider.baseUrl !== "string" || !destinationAllowed(provider.baseUrl, localHosts)) return null;
   // A literal key only: `keychain:` and `$NAME` / `${NAME}` references are resolved by ocx.
   if (typeof provider.apiKey !== "string" || provider.apiKey.startsWith("$") || provider.apiKey.startsWith("keychain:")) return null;
   const models = provider.models;
@@ -85,7 +106,7 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, signal, deps) =
   if (!configText) return null;
   let config: unknown;
   try { config = JSON.parse(configText); } catch { return null; }
-  const route = resolveNativeChatRoute(config, body.model);
+  const route = resolveNativeChatRoute(config, body.model, new Set(Object.keys(deps.localHosts ?? {})));
   if (!route) return null;
 
   const request = buildOpenAIChatPassthroughRequest(route.provider, body, route.modelId, true);

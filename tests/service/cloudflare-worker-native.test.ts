@@ -5,6 +5,7 @@ import { nativeChatBodyEligible, resolveNativeChatRoute, serveNativeChat } from 
 import { routeModel } from "../../src/router";
 import type { OcxConfig } from "../../src/types";
 import { handleWorkersAi, WORKERS_AI_HOST } from "../../deploy/cloudflare/src/workers-ai";
+import { chatAdmitsDataToken } from "../../deploy/cloudflare/src/container-env";
 import { repoRoot } from "../helpers/repo-root";
 
 // The Worker bundles this module and everything it reaches, dynamic imports included.
@@ -83,7 +84,8 @@ describe("Worker-native chat routing", () => {
       const native = resolveNativeChatRoute(cfg, model);
       expect(native).not.toBeNull();
       const route = routeModel(cfg as unknown as OcxConfig, model);
-      expect([route.providerName, route.modelId, route.provider.adapter]).toEqual([native!.providerName, native!.modelId, "openai-chat"]);
+      expect([route.providerName, route.modelId, route.provider.adapter, route.provider.baseUrl])
+        .toEqual([native!.providerName, native!.modelId, "openai-chat", native!.provider.baseUrl]);
       expect(route.combo).toBeUndefined();
     }
   });
@@ -107,6 +109,20 @@ describe("Worker-native chat routing", () => {
       [config({}, { apiKey: "$OPENAI_KEY" }), "p/m-1"],
       [config({}, { apiKey: "keychain:p" }), "p/m-1"],
       [config({}, { disabled: true }), "p/m-1"],
+      // Sections a denylist once missed, and any key this path does not know.
+      [config({ blockedModelRedirects: { "m-1": "m-2" } }), "p/m-1"],
+      [config({ apiSurfaces: { chat: false } }), "p/m-1"],
+      [config({ maxInboundBodyBytes: 1024 }), "p/m-1"],
+      [config({ someFutureSection: {} }), "p/m-1"],
+      // A built-in provider's transport comes from the registry, not its configured baseUrl.
+      [{ providers: { deepseek: { ...provider, baseUrl: "https://attacker.example/v1" } } }, "deepseek/m-1"],
+      // Destinations ocx refuses, and ones the Worker cannot vet the way ocx does.
+      [config({}, { baseUrl: "http://api.example.test/v1" }), "p/m-1"],
+      [config({}, { baseUrl: "https://169.254.169.254/v1" }), "p/m-1"],
+      [config({}, { baseUrl: "https://[::1]/v1" }), "p/m-1"],
+      [config({}, { baseUrl: "https://localhost/v1" }), "p/m-1"],
+      [config({}, { baseUrl: "https://ai.ocx.internal/v1" }), "p/m-1"],
+      [config({}, { baseUrl: "https://user:pw@api.example.test/v1" }), "p/m-1"],
     ];
     for (const [cfg, model] of declined) expect([model, resolveNativeChatRoute(cfg, model)]).toEqual([model, null]);
   });
@@ -181,3 +197,19 @@ describe("Worker-native chat serving", () => {
     expect([url, authorization]).toEqual(["https://api.example.test/v1/chat/completions", "Bearer sk-literal"]);
   });
 });
+
+describe("Worker-native chat admission", () => {
+  const env = { OPENCODEX_API_AUTH_TOKEN: "data-token" };
+  const req = (headers: Record<string, string>) => new Request("https://hub.test/v1/chat/completions", { method: "POST", headers });
+
+  test("admits only what ocx's chat admission would: the dedicated header, else the bearer", async () => {
+    expect(await chatAdmitsDataToken(req({ "x-opencodex-api-key": "data-token" }), env)).toBe(true);
+    expect(await chatAdmitsDataToken(req({ authorization: "Bearer data-token" }), env)).toBe(true);
+    // The edge accepts these; ocx refuses them on chat, so the Worker must not serve them.
+    expect(await chatAdmitsDataToken(req({ "x-api-key": "data-token" }), env)).toBe(false);
+    expect(await chatAdmitsDataToken(req({ "sec-websocket-protocol": "opencodex-key.ZGF0YS10b2tlbg" }), env)).toBe(false);
+    expect(await chatAdmitsDataToken(req({ "x-opencodex-api-key": "junk", authorization: "Bearer data-token" }), env)).toBe(false);
+    expect(await chatAdmitsDataToken(req({}), env)).toBe(false);
+  });
+});
+

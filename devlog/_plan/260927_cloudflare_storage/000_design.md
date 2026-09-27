@@ -253,3 +253,15 @@ edits by another process. The digest rule makes restore keep any such unrecorded
 covers the supervisor's bootstrap seed. It narrows the 3a coupling: pool account add/remove mirrors
 both of its files, so they can only come back out of step if the container dies in the moment
 between the two writes.
+
+Review fixes (same day):
+- A periodic snapshot can stage a sequence file marked unmirrored just before the rename it
+  describes lands. Restore now takes the Durable Object copy when it is at that sequence and its
+  digest is the one named; otherwise a digest mismatch still means an unrecorded writer and the
+  local file wins. The `mirrored` flag tells the two apart: writers only set it after the Durable
+  Object has the content, so a completed write that was later rewritten shows `mirrored: true`.
+- A boot seeded from `OCX_BOOTSTRAP_CONFIG_JSON` (no snapshot) skips the config document, keeping
+  the documented rule that the bootstrap config applies until a snapshot exists.
+- `seedBootstrapConfig` rejects a `usageLedgerMaxBytes` the schema would silently drop.
+- Excluding `routing-history.sqlite` costs nothing at wake: the indexer keys its source on
+  dev/ino/birthtime, which a restored ledger never matches, so a restored index was always rebuilt.

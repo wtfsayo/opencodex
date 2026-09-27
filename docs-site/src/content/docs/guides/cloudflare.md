@@ -193,8 +193,8 @@ The container's entrypoint is `docker/cloudflare-supervisor.ts`. It:
 1. Takes a lease from the Durable Object, so only one container writes state at a time.
 2. Restores `~/.opencodex` and `~/.codex` from the latest snapshot in R2, then restores `auth.json`,
    `codex-accounts.json`, and `config.json` from the Durable Object when that copy is newer (see
-   below). If either read fails, it stops
-   rather than start `ocx` with an empty home or older credentials.
+   below). If any of these reads fails, it stops rather than start `ocx` with an empty home or
+   older credentials.
 3. Starts `ocx`, renews the lease every 30 seconds, and uploads a snapshot every 30 seconds if
    anything changed.
 4. On `SIGTERM` (sleep or a new rollout), stops `ocx`, uploads a final snapshot with retries, and
@@ -202,14 +202,18 @@ The container's entrypoint is `docker/cloudflare-supervisor.ts`. It:
    stops the old container before starting the new one.
 
 SQLite databases are copied with `VACUUM INTO`, so a snapshot never holds a half-written database.
-Lock databases, the generated management token, and `routing-history.sqlite` (rebuilt from
-`usage.jsonl` at startup) are left out.
+Lock databases, the generated management token, and `routing-history.sqlite` are left out; `ocx`
+rebuilds that index from `usage.jsonl` the first time it is queried after a boot, as it already did
+for a restored copy. Other files are copied as they are; the final snapshot is taken after `ocx` has
+exited, so it cannot catch a file mid-write.
 
-Every snapshot carries the whole usage ledger, so the first boot caps it: the seeded config sets
-`usageLedgerMaxBytes` to 32 MiB unless `OCX_BOOTSTRAP_CONFIG_JSON` sets its own (at least 1 MiB).
-The oldest rows are dropped past the cap. Usage rows written after the last snapshot are lost if
-the container dies without `SIGTERM`; on a normal stop the final snapshot includes them. Other files are copied as they
-are; the final snapshot is taken after `ocx` has exited, so it cannot catch a file mid-write.
+Every snapshot carries the whole usage ledger. When a deployment first boots from
+`OCX_BOOTSTRAP_CONFIG_JSON`, the seeded config caps the ledger at 32 MiB (`usageLedgerMaxBytes`)
+unless the bootstrap config sets its own, which must be at least 1 MiB. A deployment without a
+bootstrap config, or one that already has a snapshot, is not changed; set `usageLedgerMaxBytes`
+yourself there. Past the cap the oldest rows are dropped. Usage rows written after the last
+snapshot are lost if the container dies without `SIGTERM`; a normal stop includes them in the
+final snapshot.
 
 Credentials and settings do not wait for a snapshot. Each change to `auth.json`,
 `codex-accounts.json`, or `config.json` is also written to the Durable Object, numbered, so a token
@@ -218,6 +222,11 @@ next boot. `auth.json` changes wait for that write (up to about 10 seconds); the
 locally first and sent right after. If the Durable Object cannot be reached, the change is still
 saved locally and retried in the background; the snapshot then carries it, and the next boot keeps
 whichever copy is newer.
+
+Adding or removing a Codex pool account changes both `config.json` and `codex-accounts.json`,
+which are mirrored separately. If one of them could not be sent and the container dies without
+`SIGTERM` before the next snapshot, the two can come back out of step: the account is missing from
+the list, or listed but asking you to sign in again. Repeat the change to fix it.
 
 If a container dies without `SIGTERM`, other changes since its last snapshot are lost, and the next
 container waits up to two minutes for the dead one's lease to expire. A container that loses its
@@ -247,8 +256,10 @@ leaving it set does not wipe later boots.
 
 ## Security
 
-- The R2 bucket holds `config.json`, OAuth credentials, client API keys, and usage history. Treat
-  access to the bucket, and to the Cloudflare account, as access to those credentials.
+- The R2 bucket holds `config.json`, OAuth credentials, client API keys, and usage history, and the
+  Durable Object's storage holds copies of `config.json` (which can contain provider API keys),
+  `auth.json`, and `codex-accounts.json`. Treat access to either, and to the Cloudflare account, as
+  access to those credentials.
 - The data token and any client keys are the only thing between the internet and your provider
   accounts. Use long random values.
 - The Worker keeps `/api/*` and the dashboard closed. To open them, set your own

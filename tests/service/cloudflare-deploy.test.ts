@@ -143,6 +143,9 @@ describe("cloudflare supervisor snapshots", () => {
     expect(statSync(join(home, "config.json")).mode & 0o777).toBe(0o600);
     expect(() => seedBootstrapConfig(home, { OCX_BOOTSTRAP_CONFIG_JSON: "{\"hostname\":\"127.0.0.1\"}" })).toThrow("0.0.0.0");
     expect(() => seedBootstrapConfig(home, { OCX_BOOTSTRAP_CONFIG_JSON: "{\"port\":10200}" })).toThrow("10100");
+    for (const cap of ["1024", "2097152.5", "\"32MiB\""]) {
+      expect(() => seedBootstrapConfig(home, { OCX_BOOTSTRAP_CONFIG_JSON: `{"usageLedgerMaxBytes":${cap}}` })).toThrow("usageLedgerMaxBytes");
+    }
   });
 });
 
@@ -767,6 +770,50 @@ describe("cloudflare durable auth store", () => {
     writeFileSync(join(home, "auth.json.seq"), JSON.stringify({ seq: 5, mirrored: true, digest: documentDigest("{\"recorded\":true}") }));
     await bootWith(new Response("{\"recorded\":true}", { headers: { [DOCUMENT_SEQUENCE_HEADER]: "5" } }), home);
     expect(readFileSync(join(home, "auth.json"), "utf8")).toBe("{\"rewritten\":true}");
+  });
+
+  test("a sequence file staged just before its write landed defers to the Durable Object copy it names", async () => {
+    const home = scratch();
+    const named = "{\"v\":\"N\"}";
+    // The snapshot caught the sequence for N but the file from before N's rename.
+    writeFileSync(join(home, "config.json"), "{\"v\":\"N-1\"}");
+    writeFileSync(join(home, "config.json.seq"), JSON.stringify({ seq: 4, mirrored: false, digest: documentDigest(named) }));
+    const state = fakeStateServer({ "GET /documents/config": () => new Response(named, { headers: { [DOCUMENT_SEQUENCE_HEADER]: "4" } }) });
+    const started = join(home, "started");
+    const { code, exit } = recordingExit();
+    const supervisor = new Supervisor({ roots: [{ prefix: "opencodex", dir: home }], intervalMs: 60_000, port: 0, stateOrigin: state.origin, exit, handleSignals: false });
+    void supervisor.main(["bun", "-e", `require("node:fs").writeFileSync(${JSON.stringify(started)}, "1"); setInterval(() => {}, 1000)`]);
+    try {
+      await until(() => existsSync(started));
+      expect(readFileSync(join(home, "config.json"), "utf8")).toBe(named);
+      void supervisor.shutdown("SIGTERM");
+      expect(await code).toBe(0);
+    } finally {
+      state.stop();
+    }
+  });
+
+  test("a boot seeded from the bootstrap config keeps it over the Durable Object's config", async () => {
+    const home = scratch();
+    const state = fakeStateServer({ "GET /documents/config": () => new Response("{\"hostname\":\"0.0.0.0\",\"port\":0,\"old\":true}", { headers: { [DOCUMENT_SEQUENCE_HEADER]: "3" } }) });
+    const started = join(home, "started");
+    const previous = process.env.OCX_BOOTSTRAP_CONFIG_JSON;
+    process.env.OCX_BOOTSTRAP_CONFIG_JSON = "{\"defaultProvider\":\"fixed\"}";
+    const { code, exit } = recordingExit();
+    const supervisor = new Supervisor({ roots: [{ prefix: "opencodex", dir: home }], intervalMs: 60_000, port: 0, stateOrigin: state.origin, exit, handleSignals: false });
+    void supervisor.main(["bun", "-e", `require("node:fs").writeFileSync(${JSON.stringify(started)}, "1"); setInterval(() => {}, 1000)`]);
+    try {
+      await until(() => existsSync(started));
+      expect(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).defaultProvider).toBe("fixed");
+      expect(state.events).not.toContain("GET /documents/config");
+      expect(state.events).toContain("GET /documents/auth");
+      void supervisor.shutdown("SIGTERM");
+      expect(await code).toBe(0);
+    } finally {
+      if (previous === undefined) delete process.env.OCX_BOOTSTRAP_CONFIG_JSON;
+      else process.env.OCX_BOOTSTRAP_CONFIG_JSON = previous;
+      state.stop();
+    }
   });
 
   test("a snapshot stages each sequence file before its document", () => {

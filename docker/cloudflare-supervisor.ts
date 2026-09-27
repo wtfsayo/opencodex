@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { copyFile, cp, lstat, mkdir, mkdtemp, open, readdir, readlink, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { MIN_USAGE_LEDGER_MAX_BYTES } from "../src/usage/retention-contract";
 import { DOCUMENT_SEQUENCE_HEADER, documentDigest, DURABLE_DOCUMENT_FILES, DURABLE_STATE_BOOT_ID_ENV, type DurableDocumentName, readSequenceState, sequenceFileFor, writeSequenceState } from "../src/lib/durable-mirror";
 
 // Intercepted by OpencodexHub.outboundByHost in deploy/cloudflare/src/index.ts; never reaches DNS.
@@ -285,8 +286,13 @@ export class Supervisor {
    * or rotated after the last upload would come back as the older one. The snapshot's file wins only
    * when its sequence is ahead, which means the Durable Object never received its last commit.
    */
-  async restoreDocuments(): Promise<void> {
-    for (const name of Object.keys(DURABLE_DOCUMENT_FILES) as DurableDocumentName[]) await this.restoreDocument(name);
+  async restoreDocuments(seeded: boolean): Promise<void> {
+    for (const name of Object.keys(DURABLE_DOCUMENT_FILES) as DurableDocumentName[]) {
+      // A boot with no snapshot starts from OCX_BOOTSTRAP_CONFIG_JSON, as it did before config was
+      // mirrored; a copy the Durable Object kept from a boot that never uploaded must not override it.
+      if (seeded && name === "config") continue;
+      await this.restoreDocument(name);
+    }
   }
 
   private async restoreDocument(name: DurableDocumentName): Promise<void> {
@@ -303,10 +309,14 @@ export class Supervisor {
     const sequencePath = join(home, sequenceFileFor(name));
     const local = readSequenceState(sequencePath);
     if (existsSync(target)) {
-      // The local file was changed by something that did not record it (an older image, an ocx
-      // process without the boot id), so the Durable Object cannot vouch for being newer.
-      const unrecorded = local.digest !== undefined && local.digest !== documentDigest(readFileSync(target, "utf8"));
-      if (unrecorded || (!local.mirrored && local.seq > seq)) {
+      // The local file does not match what its sequence file names. Either something changed it
+      // without recording (an older image, an ocx process without the boot id), or a periodic
+      // snapshot staged the sequence file just before the write it describes landed. Writers mark
+      // a sequence unmirrored before writing and mirrored only after the Durable Object has it, so
+      // only the second case stages an unmirrored sequence whose content the Durable Object holds.
+      const torn = !local.mirrored && seq >= local.seq && documentDigest(body) === local.digest;
+      const unrecorded = local.digest !== undefined && local.digest !== documentDigest(readFileSync(target, "utf8")) && !torn;
+      if (unrecorded || (!torn && !local.mirrored && local.seq > seq)) {
         console.log(`Kept the snapshot's ${DURABLE_DOCUMENT_FILES[name]}: it holds a change the Durable Object never received.`);
         return;
       }
@@ -417,8 +427,8 @@ export class Supervisor {
       });
     }, Math.min(this.intervalMs, 30_000));
     try {
-      if (!(await this.restore())) seedBootstrapConfig(this.roots[0]!.dir, process.env, this.port);
-      await this.restoreDocuments();
+      const seeded = !(await this.restore()) && seedBootstrapConfig(this.roots[0]!.dir, process.env, this.port);
+      await this.restoreDocuments(seeded);
     } catch (error) {
       // Never fall through to a fresh home: its first upload would replace the saved state.
       await this.releaseLease();
@@ -469,6 +479,11 @@ export function seedBootstrapConfig(
   }
   if (config.port !== undefined && config.port !== port) {
     throw new Error(`OCX_BOOTSTRAP_CONFIG_JSON must use "port": ${port} (or omit it)`);
+  }
+  const cap = config.usageLedgerMaxBytes;
+  if (cap !== undefined && (typeof cap !== "number" || !Number.isSafeInteger(cap) || cap < MIN_USAGE_LEDGER_MAX_BYTES)) {
+    // ocx would silently treat it as unset, which removes the cap this seed exists to add.
+    throw new Error(`OCX_BOOTSTRAP_CONFIG_JSON "usageLedgerMaxBytes" must be a whole number of at least ${MIN_USAGE_LEDGER_MAX_BYTES} (or omit it)`);
   }
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const seeded = { usageLedgerMaxBytes: DEFAULT_USAGE_LEDGER_MAX_BYTES, ...config, hostname: "0.0.0.0", port };

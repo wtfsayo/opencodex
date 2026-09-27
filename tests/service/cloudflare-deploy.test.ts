@@ -671,6 +671,16 @@ describe("cloudflare durable auth store", () => {
     expect(await hub.readDocument("auth")).toEqual({ body: "{\"v\":3}", seq: 3 });
   });
 
+  test("an entry commitDocument did not write reads as absent and is replaced by the next commit", async () => {
+    const storage = memoryStorage();
+    await storage.put("ocx:document:auth", "{\"legacy\":true}");
+    const hub = new LeaseState(storage, () => 0);
+    await hub.acquireLease(holder);
+    expect((await send(hub, get(holder))).status).toBe(404);
+    expect((await send(hub, put(holder, "{}", 1))).status).toBe(204);
+    expect(await hub.readDocument("auth")).toEqual({ body: "{}", seq: 1 });
+  });
+
   test("refuses unknown names, missing sequences, non-objects, and oversized bodies", async () => {
     const hub = new LeaseState(memoryStorage(), () => 0);
     await hub.acquireLease(holder);

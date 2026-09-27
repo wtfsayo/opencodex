@@ -828,8 +828,19 @@ export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValue
     options?.finalizeResult?.(result, store);
     const bytes = authStoreBytes(store);
     const mirror = durableMirrorEnabled() ? await mirrorAuthStore(bytes, getAuthStoreSequencePath()) : null;
-    // The mirror awaited the network; a login superseded meanwhile must still not be written.
-    if (mirror) options?.assertBeforePersist?.();
+    if (mirror) {
+      // The mirror awaited the network; a login superseded meanwhile must still not be written.
+      try {
+        options?.assertBeforePersist?.();
+      } catch (error) {
+        // The Durable Object may already hold the rejected store, and the next boot would restore
+        // it. Commit the unchanged local store over it as the newer sequence.
+        const path = getAuthStorePath();
+        const revert = await mirrorAuthStore(existsSync(path) ? readFileSync(path, "utf8") : "{}\n", getAuthStoreSequencePath());
+        revert?.settle();
+        throw error;
+      }
+    }
     persist(bytes);
     try { mirror?.settle(); } catch (error) { console.warn(`[oauth] Could not record the auth store sequence: ${error instanceof Error ? error.message : String(error)}`); }
     if (scrubbedProviders.length > 0) scrubLegacyBackup(scrubbedProviders);

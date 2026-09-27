@@ -93,8 +93,10 @@ export class LeaseState {
     return { replaced: replaced === key ? undefined : replaced };
   }
 
-  readDocument(name: DurableDocument): Promise<StoredDocument | undefined> {
-    return this.storage.get<StoredDocument>(DOCUMENT_KEY_PREFIX + name);
+  async readDocument(name: DurableDocument): Promise<StoredDocument | undefined> {
+    const stored = await this.storage.get<Partial<StoredDocument>>(DOCUMENT_KEY_PREFIX + name);
+    // Anything else was not written by commitDocument; treating it as absent lets the next commit replace it.
+    return typeof stored?.body === "string" && Number.isSafeInteger(stored.seq) ? stored as StoredDocument : undefined;
   }
 
   /**

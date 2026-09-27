@@ -198,11 +198,13 @@ write always happens (except after a lost lease), and a sequence number decides 
   nothing else there reads it.
 
 Known gaps, all narrower than the snapshot-only behavior they replace:
-- A login rejected by `assertBeforePersist` after its mirror succeeded leaves that document in the
-  Durable Object until the next commit; a restart in between restores it.
-- `auth.json` and `auth.json.seq` are staged into the snapshot one after the other. If a commit
-  lands between them while the Durable Object is unreachable and the container then dies without
-  `SIGTERM`, the next boot can prefer the Durable Object's older copy.
+- A login rejected by the second `assertBeforePersist` has already been mirrored; the unchanged
+  local store is committed over it as the next sequence. If that revert cannot reach the Durable
+  Object, the sequence file records the local store as newer and unmirrored, so restore keeps it.
+- `auth.json` and `auth.json.seq` are staged into the snapshot one after the other. Commits landing
+  between the two copies, with the last one unmirrored, followed by a death without `SIGTERM`, can
+  make the next boot keep a local copy older than the Durable Object's. Carrying the sequence inside
+  the staged pair would close it.
 - Writes from a separate `ocx` process in the container (for example `ocx login` over a shell)
   have no boot id and are not mirrored; the next boot restores the Durable Object copy over them.
 

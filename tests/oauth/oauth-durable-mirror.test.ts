@@ -159,14 +159,20 @@ describe("auth store durable mirror", () => {
     expect(sequenceFile()).toEqual({ seq: 10, mirrored: true });
   });
 
-  test("a login superseded while the mirror was in flight is not written locally", async () => {
+  test("a login superseded while the mirror was in flight is written nowhere", async () => {
     process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
-    recordingTransport([]);
+    const calls = recordingTransport([]);
+    await saveCredential("xai", cred("kept"));
+    const kept = readFileSync(getAuthStorePath(), "utf8");
     let checks = 0;
     await expect(mutateStore(store => {
-      store.xai = { accounts: [], activeAccountId: undefined } as never;
+      delete store.xai;
     }, [], { assertBeforePersist: () => { if (++checks > 1) throw new Error("login superseded"); } })).rejects.toThrow("login superseded");
     expect(checks).toBe(2);
-    expect(existsSync(getAuthStorePath())).toBe(false);
+    expect(readFileSync(getAuthStorePath(), "utf8")).toBe(kept);
+    // The rejected store reached the Durable Object as sequence 2; the unchanged one replaces it as 3.
+    expect(calls.map(call => call.seq)).toEqual([1, 2, 3]);
+    expect(calls[2]!.body).toBe(kept);
+    expect(sequenceFile()).toEqual({ seq: 3, mirrored: true });
   });
 });

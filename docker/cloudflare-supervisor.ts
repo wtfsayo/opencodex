@@ -320,15 +320,16 @@ export class Supervisor {
     const home = this.roots[0]!.dir;
     const target = join(home, DURABLE_DOCUMENT_FILES[name]);
     if (!existsSync(target)) return;
-    const body = readFileSync(target, "utf8");
     const sequencePath = join(home, sequenceFileFor(name));
-    const seq = Math.max(afterSeq, readSequenceState(sequencePath).seq) + 1;
-    writeSequenceState(sequencePath, { seq, mirrored: false, digest: documentDigest(body) });
     try {
+      const body = readFileSync(target, "utf8");
+      const seq = Math.max(afterSeq, readSequenceState(sequencePath).seq) + 1;
+      writeSequenceState(sequencePath, { seq, mirrored: false, digest: documentDigest(body) });
       const put = await this.state(`/documents/${name}`, { method: "PUT", body, headers: { [DOCUMENT_SEQUENCE_HEADER]: String(seq) } });
       if (put.ok) writeSequenceState(sequencePath, { seq, mirrored: true, digest: documentDigest(body) });
       else console.error(`${DURABLE_DOCUMENT_FILES[name]} not published (${put.status}); the local copy still wins at restore.`);
     } catch (error) {
+      // Publishing is an extra; the boot must not fail because of it.
       console.error(`${DURABLE_DOCUMENT_FILES[name]} not published: ${errorText(error)}; the local copy still wins at restore.`);
     }
   }

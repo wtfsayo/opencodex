@@ -336,11 +336,17 @@ jobs:
             # typecheck does not reach it. `ci` omits deploy/** so a Worker-only edit does not start
             # the full matrix; the push trigger mirrors `ci`, so this stays pull-request scope like
             # docs and structure. The supervisor and its test are listed because the job runs that
-            # test, and ci.yml so an edit here verifies itself.
+            # test, and ci.yml so an edit here verifies itself. The src/ files are the ones the Worker
+            # typechecks against or bundles through the Worker-native path.
             deploy:
               - 'deploy/**'
               - 'docker/cloudflare-supervisor.ts'
+              - 'src/server/cloudflare-native-chat*.ts'
+              - 'src/server/collab-surface.ts'
+              - 'src/lib/model-record.ts'
+              - 'src/lib/durable-mirror.ts'
               - 'tests/service/cloudflare-deploy.test.ts'
+              - 'tests/service/cloudflare-worker-native.test.ts'
               - '.github/workflows/ci.yml'
             # Everything that ends up inside `npm pack`, or that decides what
             # does. `src/**` belongs here because package.json ships `src` and
@@ -1234,7 +1240,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Cloudflare deploy unit test
-        run: bun test tests/service/cloudflare-deploy.test.ts
+        run: bun test tests/service/cloudflare-deploy.test.ts tests/service/cloudflare-worker-native.test.ts
 
   # `gates` already runs `privacy:scan` on every event it runs for, so this job
   # covers exactly the pull requests `gates` skips -- its condition is the

@@ -10,8 +10,10 @@ import { repoRoot } from "../helpers/repo-root";
 
 // The Worker bundles this module and everything it reaches, dynamic imports included.
 const ENTRY = "src/server/cloudflare-native-chat.ts";
-// Supported by the Workers runtime under the nodejs_compat flag set in wrangler.jsonc.
-const ALLOWED_NODE = new Set(["node:buffer", "node:crypto"]);
+// Provided by the Workers runtime under the nodejs_compat flag set in wrangler.jsonc. The bare
+// `crypto` and `zlib` forms come from Devin adapter code the provider registry pulls in; the
+// deployed Worker loads them, and nothing on this path calls into them.
+const ALLOWED_NODE = new Set(["node:buffer", "node:crypto", "crypto", "zlib"]);
 // ocx's stateful owners: config on disk, routing state, logs, credentials, the spend ledger.
 const FORBIDDEN_MODULES = [
   "src/config.ts", "src/router.ts", "src/server/request-log.ts", "src/server/lifecycle.ts",
@@ -33,11 +35,14 @@ function closure(entry: string) {
   while (queue.length) {
     const file = queue.shift()!;
     const source = readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-    if (/\bBun\./.test(source)) problems.push(`Bun.* in ${chain(file)}`);
+    if (/\bBun\b/.test(source)) problems.push(`Bun in ${chain(file)}`);
+    if (/\brequire\s*\(|\bimport\s+\w+\s*=\s*require\b|\bimport\s*\(\s*`/.test(source)) problems.push(`require() or a computed import in ${chain(file)}`);
     for (const match of source.matchAll(IMPORT_RE)) {
       const spec = match[1] ?? match[2] ?? match[3] ?? match[4]!;
+      // Every package, bare built-in ("fs") and node: module is refused unless listed: the Worker
+      // bundle has no node_modules of its own to fall back on.
       if (!spec.startsWith(".")) {
-        if (spec === "bun" || spec.startsWith("bun:") || (spec.startsWith("node:") && !ALLOWED_NODE.has(spec))) problems.push(`${spec} in ${chain(file)}`);
+        if (!ALLOWED_NODE.has(spec)) problems.push(`${spec} in ${chain(file)}`);
         continue;
       }
       const base = resolve(dirname(file), spec.replace(/\.js$/, ""));
@@ -68,8 +73,12 @@ describe("Worker-native chat import boundary", () => {
     expect(files.length).toBeLessThanOrEqual(MAX_CLOSURE);
   });
 
-  test("the guard is not vacuous: the container's own chat lane fails it", () => {
-    expect(closure("src/server/chat-native.ts").problems.length).toBeGreaterThan(0);
+  test("the guard is not vacuous: each rule fires on the container's own chat lane", () => {
+    const { problems } = closure("src/server/chat-native.ts");
+    expect(problems.some(problem => problem.startsWith("node:fs in "))).toBe(true);
+    expect(problems.some(problem => problem.startsWith("bun:sqlite in "))).toBe(true);
+    expect(problems.some(problem => problem.startsWith("Bun in "))).toBe(true);
+    expect(problems.some(problem => problem.startsWith("src/router.ts reached via"))).toBe(true);
   });
 });
 
@@ -165,7 +174,7 @@ describe("Worker-native chat serving", () => {
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, ai) },
       fetch: async () => { throw new Error("no network in this test"); },
     });
-    expect(response?.headers.get("content-type")).toBe("text/event-stream");
+    expect(response?.headers.get("content-type")).toBe("text/event-stream; charset=utf-8");
     const text = await response!.text();
     const chunks = text.split("\n\n").filter(block => block.startsWith("data: {")).map(block => JSON.parse(block.slice(6)));
     expect(chunks.map(chunk => chunk.choices?.[0]?.delta?.content ?? "").join("")).toBe("Pong");

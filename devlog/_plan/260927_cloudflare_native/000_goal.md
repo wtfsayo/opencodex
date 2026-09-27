@@ -137,5 +137,20 @@ https public host names only (plus the Worker's own hosts), ocx's chat header ru
 (`chatAdmitsDataToken`), a 4 MiB cap checked before reading, compressed bodies left to ocx, and an
 aborted client no longer wakes the container.
 
-Measured with the first cut before it was withdrawn (same deployment, Workers AI, 20 streamed
-turns): p50 time to first byte 471 ms vs 651 ms through the container, p50 total 621 vs 793 ms.
+Measurement. Sequential runs were useless: the container path's own p50 moved from 651 to 924 ms
+between two runs an hour apart, so any before/after pair mostly measured Workers AI and this
+machine's load. The number that counts is an interleaved A/B in one run: the same streamed turn,
+alternating a plain request (served in the Worker) with the identical request plus
+`content-encoding: identity` (declined by the Worker, served by the container; ocx treats identity
+as a no-op). 30 turns per arm, 2026-09-28:
+
+| Arm | p50 first byte | p50 total | p90 first byte |
+|---|---|---|---|
+| Worker-native | 447 ms | 582 ms | 492 ms |
+| Container | 790 ms | 938 ms | 906 ms |
+
+That is about 340 ms (43%) off each turn, most of it the Durable Object and container hop rather
+than Workers AI. The A/B also caught a silent failure: the first run after the security fixes
+showed no difference because the key allowlist declined every turn (a real hub's config carries
+`runtimeRole`, `hub`, `fastRows`, `subagentModels`), which is why the Worker now logs each decline
+reason once. Worker CPU stays at 1-2 ms per turn.

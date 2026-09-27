@@ -142,5 +142,6 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
     stallTimeoutSec: (config as Pick<OcxConfig, "stallTimeoutSec">).stallTimeoutSec,
     onUsage: () => {},
   });
-  return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
+  // As chat-native.ts answers; Connection is hop-by-hop and the Workers runtime owns it.
+  return new Response(stream, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
 };

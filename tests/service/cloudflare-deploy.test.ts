@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { decideLease, isHolder, LEASE_STALE_MS, LeaseState, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
 import { handleStateRequest, snapshotPrefix, sweepOrphans, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
 import { containerEnv, dashboardEnabled, isAnonymousHealthCheck, DASHBOARD_BOOTSTRAP_META, edgeDecision, envFingerprint, isSupersededBy, forwardableRequest, servedByHub } from "../../deploy/cloudflare/src/container-env";
-import { repoPath } from "../helpers/repo-root";
 import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";

@@ -150,7 +150,8 @@ async function put(name: DurableDocumentName, body: string, seq: number): Promis
       }
     }
     if (response && response.status >= 400 && response.status < 500 && response.status !== 412) {
-      console.warn(`[state] Durable Object refused ${name} (${response.status}); it stays in the local file and the snapshot.`);
+      const reason = response.status === 413 ? `it is larger than the Durable Object accepts (${body.length} bytes)` : `status ${response.status}`;
+      console.warn(`[state] Durable Object refused ${name}: ${reason}. It stays in the local file and the snapshot.`);
       return { durable: false, seq, retry: false };
     }
     if (attempt < ATTEMPTS) await transport.sleep(500);

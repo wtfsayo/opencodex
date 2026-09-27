@@ -207,6 +207,17 @@ describe("codex account store durable mirror", () => {
     removeTreeWithRetry(home);
   });
 
+  test("without a boot id a synchronous write makes no sequence file and no call", async () => {
+    delete process.env[DURABLE_STATE_BOOT_ID_ENV];
+    const calls = recordingTransport([]);
+    saveCodexAccountCredential("acct", codexCred("one"));
+    await flush();
+    expect(calls).toEqual([]);
+    expect(scheduled).toEqual([]);
+    expect(existsSync(join(home, sequenceFileFor("codex-accounts")))).toBe(false);
+    expect(existsSync(codexFile())).toBe(true);
+  });
+
   test("a synchronous write lands locally first, marked unmirrored until the Durable Object has it", async () => {
     const calls = recordingTransport([]);
     const sequences: unknown[] = [];

@@ -218,6 +218,12 @@ next boot preferring the local file; a crash before the local write lands loses 
 snapshot-only design lost. The mirror module moved to `src/lib/durable-mirror.ts` and names its
 documents in `DURABLE_DOCUMENT_FILES`, which a test holds equal to the Worker's allowlist.
 
+Coupling left open until 3c: pool account add/remove writes `config.json` (still snapshot-only)
+and `codex-accounts.json` together, so a death without `SIGTERM` inside one interval can restore
+them out of step. Token refresh, the case this step exists for, touches only `codex-accounts.json`.
+A pool large enough to pass the 1 MiB document cap (about 200 accounts) stays snapshot-only with a
+size warning per write.
+
 Still riding the snapshot: refresh intents (`auth.refresh.*.lock.json`, Codex refresh locks, Nous
 intents) and the `pre-multiauth` backup. Losing an intent in a crash is the same outcome as the
 crash itself today.

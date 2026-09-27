@@ -6,7 +6,7 @@
 //
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
-import { loadNativeConfig, resolveNativeChatRoute, sendUpstream } from "./cloudflare-native-chat";
+import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, sendUpstream } from "./cloudflare-native-chat";
 import { isThreadSpawnRequest } from "./collab-surface";
 import { buildToolBridgeMaps } from "./responses/tool-bridge-maps";
 import { createOpenAIChatAdapterWith, type OpenAIChatAdapterDeps } from "../adapters/openai-chat/adapter";
@@ -122,6 +122,8 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   const upstreamAbort = new AbortController();
   const upstreamSignal = AbortSignal.any([signal, upstreamAbort.signal]);
   const request = await adapter.buildRequest(parsed, { headers: new Headers(), translatorBudget, abortSignal: upstreamSignal });
+  // Everything that can throw runs before the send: after it, a throw would resend via the container.
+  const maps = buildToolBridgeMaps(parsed, translatorBudget);
   const upstream = await sendUpstream(request, upstreamSignal, deps);
   if (!upstream.ok || !upstream.body) {
     await upstream.body?.cancel();
@@ -130,6 +132,7 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
 
   let usage: OcxUsage | undefined;
   let firstOutputAt: number | undefined;
+  let errorStatus: number | undefined;
   let recorded = false;
   const record = (status: number) => {
     if (recorded) return;
@@ -154,17 +157,21 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   const inactivityMs = resolveStallTimeoutMs(config.stallTimeoutSec, { localUpstream: false });
   const events = (async function* (): AsyncGenerator<AdapterEvent> {
     try {
-      yield* readResponseStreamWithInactivity(upstream, upstreamSignal, inactivityMs,
-        response => adapter.parseStream(response, translatorBudget, request.tierLog));
+      for await (const event of readResponseStreamWithInactivity(upstream, upstreamSignal, inactivityMs,
+        response => adapter.parseStream(response, translatorBudget, request.tierLog))) {
+        if (event.type === "error") errorStatus ??= event.status ?? 502;
+        yield event;
+      }
     } catch (error) {
       if (error instanceof ResponseBodyInactivityError) {
+        errorStatus ??= 504;
         yield { type: "error", message: "Upstream response body stalled before completing", status: 504, errorType: "upstream_error" };
         return;
       }
+      errorStatus ??= 502;
       throw error;
     }
   })();
-  const maps = buildToolBridgeMaps(parsed, translatorBudget);
   const sse = bridgeToResponsesSSE(
     events, route.modelId, maps.toolNsMap, maps.freeformToolNames, maps.toolSearchToolNames,
     () => upstreamAbort.abort(), 2_000,
@@ -179,36 +186,13 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
       toolParameterSchemas: maps.toolParameterSchemas,
       onFirstOutput: () => { firstOutputAt ??= Date.now(); },
       onUsage: reported => { usage = reported; },
-      onCompletedResponse: () => record(200),
+      onCompletedResponse: () => record(errorStatus ?? 200),
     },
   );
-  return new Response(recordAtEndOf(sse, () => record(200)), {
+  return new Response(recordAtEnd(sse, end => record(end === "cancel" ? 499 : errorStatus ?? (end === "error" ? 502 : 200))), {
     headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" },
   });
 };
 
-function recordAtEndOf(stream: ReadableStream<Uint8Array>, done: () => void): ReadableStream<Uint8Array> {
-  const reader = stream.getReader();
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const { done: finished, value } = await reader.read();
-        if (finished) {
-          done();
-          controller.close();
-        } else {
-          controller.enqueue(value);
-        }
-      } catch (error) {
-        done();
-        controller.error(error);
-      }
-    },
-    cancel(reason) {
-      done();
-      return reader.cancel(reason);
-    },
-  });
-}
 
 export type { NativeChatDeps };

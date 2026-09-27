@@ -165,6 +165,9 @@ export class OpencodexHub extends Container<Env> {
   peekUsage(bootId: string, limit: number) { return this.leases.peekUsage(bootId, limit); }
   ackUsage(bootId: string, seqs: readonly number[]) { return this.leases.ackUsage(bootId, seqs); }
   enqueueUsage(row: unknown) { return this.leases.enqueueUsage(row); }
+  async nativeConfigSource(): Promise<{ config: string | undefined; hasSnapshot: boolean }> {
+    return { config: (await this.leases.readDocument("config"))?.body, hasSnapshot: (await this.leases.currentSnapshot()) !== undefined };
+  }
 }
 
 async function handleState(req: Request, env: Env): Promise<Response> {
@@ -233,12 +236,18 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   if (req.headers.has("content-encoding")) return null;
   const length = Number(req.headers.get("content-length"));
   if (!Number.isSafeInteger(length) || length <= 0 || length > NATIVE_MAX_BODY_BYTES) return null;
+  // ocx refuses cross-origin data-plane requests unless the origin is loopback, the hub itself, or
+  // configured (isAllowedRequestOrigin); the Worker leaves every request with an Origin to it.
+  if (req.headers.has("origin")) return null;
   if (!(await chatAdmitsDataToken(req, env))) return null;
   const bodyBytes = await req.arrayBuffer();
   const hub = getContainer(env.HUB, HUB_NAME);
   try {
     const served = await serve(new TextDecoder().decode(bodyBytes), req.headers, req.signal, {
-      readConfig: async () => nativeConfigText((await hub.readDocument("config"))?.body, env),
+      readConfig: async () => {
+        const source = await hub.nativeConfigSource();
+        return nativeConfigText(source.config, source.hasSnapshot, env);
+      },
       secrets: containerEnv(env),
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
       fetch: request => fetch(request),

@@ -161,7 +161,8 @@ The Worker serves a request only when all of these hold, and otherwise passes it
 - The request is `POST /v1/chat/completions`, streamed or not, with text-only messages and at
   most `function` tools; its body is uncompressed and under 4 MiB; and it carries the data token in
   `x-opencodex-api-key`, or failing that as a bearer token, which is how `ocx` reads it for chat.
-  With `OCX_EDGE_KEY_CHECK=presence` the Worker never serves a request.
+  With `OCX_EDGE_KEY_CHECK=presence` the Worker never serves a request, and a request that carries
+  an `Origin` header (a browser) always goes to `ocx`, which applies its own origin rules.
 - `model` is `<provider>/<model>` for a provider you added yourself (not a built-in provider name
   such as `openai` or `deepseek`), whose config has only `adapter: "openai-chat"`, an `https`
   `baseUrl` on a public host name, a literal `apiKey`, `models` (which must list the model), and
@@ -191,7 +192,9 @@ next runs (at startup, then every minute), so the Usage page shows them once the
 The queue holds the latest 20,000 turns. They do not appear in request logs, and they do not count
 toward spend ceilings (a config with a `spend` section is never served by the Worker). The Worker reads the provider settings from the copy of
 `config.json` kept in the Durable Object, which the container updates whenever settings change;
-until the container has run once, it uses `OCX_BOOTSTRAP_CONFIG_JSON`. So a deployment whose
+until the container has run once, it uses `OCX_BOOTSTRAP_CONFIG_JSON` as the container would
+seed it. A hub upgraded from a version without this copy serves nothing from the Worker until the
+container has started once and published its settings. So a deployment whose
 clients only make qualifying requests never starts the container at all.
 
 ## Connect Codex

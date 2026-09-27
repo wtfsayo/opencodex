@@ -315,11 +315,17 @@ describe("Worker-native chat admission", () => {
 });
 
 describe("Worker-native config and secrets on a Worker-only deployment", () => {
-  test("the Durable Object's copy wins; before one exists, the bootstrap config is used", () => {
+  test("the Durable Object's copy wins; with neither copy nor snapshot, the bootstrap config as seeded", () => {
     const env = { OCX_BOOTSTRAP_CONFIG_JSON: " {\"providers\":{}} " };
-    expect(nativeConfigText("{\"stored\":true}", env)).toBe("{\"stored\":true}");
-    expect(nativeConfigText(undefined, env)).toBe("{\"providers\":{}}");
-    expect(nativeConfigText(undefined, {})).toBeUndefined();
+    expect(nativeConfigText("{\"stored\":true}", true, env)).toBe("{\"stored\":true}");
+    expect(JSON.parse(nativeConfigText(undefined, false, env)!)).toEqual({ usageLedgerMaxBytes: 32 * 1024 * 1024, providers: {}, hostname: "0.0.0.0", port: 10100 });
+    expect(nativeConfigText(undefined, false, {})).toBeUndefined();
+    // A snapshot holds a config the Worker cannot read; the bootstrap may be long out of date.
+    expect(nativeConfigText(undefined, true, env)).toBeUndefined();
+    // A bootstrap the container would refuse to boot with is not served from either.
+    for (const bad of ["{\"hostname\":\"127.0.0.1\"}", "{\"port\":1}", "{\"usageLedgerMaxBytes\":5}", "[1]", "not json"]) {
+      expect(nativeConfigText(undefined, false, { OCX_BOOTSTRAP_CONFIG_JSON: bad })).toBeUndefined();
+    }
   });
 
   test("references resolve only to what the container would receive", () => {
@@ -358,6 +364,26 @@ describe("Worker-served usage", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ provider: "workers-ai", model: "meta/llama", requestedModel: "workers-ai/meta/llama", inboundProtocol: "chat", admissionKind: "environment", status: 200 });
     expect(rows[0]!.requestId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test("the row records how the turn ended: a client cancel is 499, an in-stream error its status", async () => {
+    const run = async (upstream: () => Response, consume: (response: Response) => Promise<void>) => {
+      const rows: WorkerUsageRow[] = [];
+      const config = JSON.stringify({ providers: { p: { ...provider } } });
+      const response = await serveNativeChat(JSON.stringify({ model: "p/m-1", stream: true, messages: [{ role: "user", content: "hi" }] }), new Headers(), new AbortController().signal, {
+        readConfig: async () => config, fetch: async () => upstream(), recordUsage: row => rows.push(row),
+      });
+      await consume(response!);
+      return rows.map(row => row.status);
+    };
+    const chunk = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n";
+    const cancelled = await run(() => new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(chunk)); } }), { headers: { "content-type": "text/event-stream" } }),
+      async response => { const reader = response.body!.getReader(); await reader.read(); await reader.cancel(); });
+    expect(cancelled).toEqual([499]);
+    const errored = await run(() => sse([chunk, "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\",\"code\":503}}\n\n"]),
+      async response => { await response.text(); });
+    expect(errored).toHaveLength(1);
+    expect(errored[0]).not.toBe(200);
   });
 
   test("the Durable Object queues rows for the lease holder only, caps them, and forgets them on reset", async () => {

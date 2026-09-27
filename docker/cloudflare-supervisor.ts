@@ -6,7 +6,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { copyFile, cp, lstat, mkdir, mkdtemp, open, readdir, readlink, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { MIN_USAGE_LEDGER_MAX_BYTES } from "../src/usage/retention-contract";
+import { DEFAULT_USAGE_LEDGER_MAX_BYTES, parseBootstrapConfig, seededBootstrapConfig } from "../src/server/cloudflare-bootstrap-config";
+export { DEFAULT_USAGE_LEDGER_MAX_BYTES };
 import { DOCUMENT_SEQUENCE_HEADER, documentDigest, DURABLE_DOCUMENT_FILES, DURABLE_STATE_BOOT_ID_ENV, type DurableDocumentName, readSequenceState, sequenceFileFor, writeSequenceState } from "../src/lib/durable-mirror";
 
 // Intercepted by OpencodexHub.outboundByHost in deploy/cloudflare/src/index.ts; never reaches DNS.
@@ -23,9 +24,6 @@ const REGENERATED_SECRETS = new Set(["admin-api-token"]);
 // Projections ocx rebuilds from files the snapshot keeps (routing-history.sqlite from usage.jsonl).
 // Copying them grows every upload with the ledger for nothing.
 const REBUILT_PROJECTIONS = new Set(["routing-history.sqlite"]);
-// Seeded when the operator's bootstrap config sets none. Every snapshot uploads the whole ledger,
-// and without a cap it grows for as long as the hub serves requests.
-export const DEFAULT_USAGE_LEDGER_MAX_BYTES = 32 * 1024 * 1024;
 
 export type StateRoot = { prefix: string; dir: string };
 export type FileClass = "copy" | "sqlite" | "skip";
@@ -508,25 +506,10 @@ export function seedBootstrapConfig(
 ): boolean {
   const raw = env.OCX_BOOTSTRAP_CONFIG_JSON?.trim();
   if (!raw) return false;
-  const parsed: unknown = JSON.parse(raw);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("OCX_BOOTSTRAP_CONFIG_JSON must be a JSON object");
-  }
-  const config = parsed as Record<string, unknown>;
-  if (config.hostname !== undefined && config.hostname !== "0.0.0.0") {
-    throw new Error(`OCX_BOOTSTRAP_CONFIG_JSON must use "hostname": "0.0.0.0" (or omit it); the Worker cannot reach ${String(config.hostname)}`);
-  }
-  if (config.port !== undefined && config.port !== port) {
-    throw new Error(`OCX_BOOTSTRAP_CONFIG_JSON must use "port": ${port} (or omit it)`);
-  }
-  const cap = config.usageLedgerMaxBytes;
-  if (cap !== undefined && (typeof cap !== "number" || !Number.isSafeInteger(cap) || cap < MIN_USAGE_LEDGER_MAX_BYTES)) {
-    // ocx would silently treat it as unset, which removes the cap this seed exists to add.
-    throw new Error(`OCX_BOOTSTRAP_CONFIG_JSON "usageLedgerMaxBytes" must be a whole number of at least ${MIN_USAGE_LEDGER_MAX_BYTES} (or omit it)`);
-  }
+  const parsed = parseBootstrapConfig(raw, port);
+  if ("error" in parsed) throw new Error(parsed.error);
   mkdirSync(home, { recursive: true, mode: 0o700 });
-  const seeded = { usageLedgerMaxBytes: DEFAULT_USAGE_LEDGER_MAX_BYTES, ...config, hostname: "0.0.0.0", port };
-  writeFileSync(join(home, "config.json"), `${JSON.stringify(seeded, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(join(home, "config.json"), `${JSON.stringify(seededBootstrapConfig(parsed.config, port), null, 2)}\n`, { mode: 0o600 });
   return true;
 }
 

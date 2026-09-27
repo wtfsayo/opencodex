@@ -163,6 +163,7 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   const translatorBudget = createTranslatorBudget();
   let usage: OcxUsage | undefined;
   let firstOutputAt: number | undefined;
+  let terminalStatus: number | undefined;
   const record = (status: number) => deps.recordUsage?.({
     requestId: crypto.randomUUID(),
     timestamp: startedAt,
@@ -192,9 +193,12 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
       stallTimeoutSec: (config as Pick<OcxConfig, "stallTimeoutSec">).stallTimeoutSec,
       onFirstOutput: () => { firstOutputAt ??= Date.now(); },
       onUsage: reported => { usage = reported; },
+      onTerminal: status => { terminalStatus = status; },
     });
     // As chat-native.ts answers; Connection is hop-by-hop and the Workers runtime owns it.
-    if (requestedStream) return new Response(recordAtEnd(stream, () => record(200)), { headers: SSE_HEADERS });
+    if (requestedStream) {
+      return new Response(recordAtEnd(stream, end => record(end === "cancel" ? 499 : end === "error" ? terminalStatus ?? 502 : terminalStatus ?? 200)), { headers: SSE_HEADERS });
+    }
     try {
       const completion = await collectChatCompletion(stream, route.requestedModel, translatorBudget);
       record(200);
@@ -222,28 +226,28 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
     : new Response(JSON.stringify(parsed), { headers: { "content-type": "application/json" } });
 };
 
-/** Passes the stream through and calls `done` once it ends, however it ends. */
-function recordAtEnd(stream: ReadableStream<Uint8Array>, done: () => void): ReadableStream<Uint8Array> {
+/** Passes the stream through and calls `done` once, with how it ended. */
+export function recordAtEnd(stream: ReadableStream<Uint8Array>, done: (end: "end" | "error" | "cancel") => void): ReadableStream<Uint8Array> {
   let called = false;
-  const once = () => { if (!called) { called = true; done(); } };
+  const once = (end: "end" | "error" | "cancel") => { if (!called) { called = true; done(end); } };
   const reader = stream.getReader();
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const { done: finished, value } = await reader.read();
         if (finished) {
-          once();
+          once("end");
           controller.close();
         } else {
           controller.enqueue(value);
         }
       } catch (error) {
-        once();
+        once("error");
         controller.error(error);
       }
     },
     cancel(reason) {
-      once();
+      once("cancel");
       return reader.cancel(reason);
     },
   });

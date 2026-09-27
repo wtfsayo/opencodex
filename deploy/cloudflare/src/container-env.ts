@@ -1,4 +1,5 @@
 // Kept free of Workers-only imports so tests/service/cloudflare-deploy.test.ts can drive it.
+import { parseBootstrapConfig, seededBootstrapConfig } from "../../../src/server/cloudflare-bootstrap-config";
 
 export type SecretSource = {
   OPENCODEX_API_AUTH_TOKEN?: string;
@@ -45,11 +46,18 @@ export function containerEnv(env: SecretSource): Record<string, string> {
 
 /**
  * The config the Worker-native path routes with. The Durable Object's copy exists once the container
- * has run (it publishes and mirrors config.json); before that, which on a Worker-only deployment is
- * always, the operator's bootstrap config is exactly what the container would start from.
+ * has run (it publishes and mirrors config.json). With no copy and no snapshot, the container has
+ * never run and would start from the bootstrap config, seeded as the supervisor seeds it; a
+ * bootstrap config it would refuse gives nothing to serve from. With a snapshot but no copy (a hub
+ * upgraded from before config was mirrored), the config lives in the snapshot, which the Worker
+ * cannot read, so it serves nothing until the container publishes it.
  */
-export function nativeConfigText(stored: string | undefined, env: SecretSource): string | undefined {
-  return stored ?? (env.OCX_BOOTSTRAP_CONFIG_JSON?.trim() || undefined);
+export function nativeConfigText(stored: string | undefined, hasSnapshot: boolean, env: SecretSource): string | undefined {
+  if (stored !== undefined) return stored;
+  const raw = env.OCX_BOOTSTRAP_CONFIG_JSON?.trim();
+  if (hasSnapshot || !raw) return undefined;
+  const parsed = parseBootstrapConfig(raw);
+  return "error" in parsed ? undefined : JSON.stringify(seededBootstrapConfig(parsed.config));
 }
 
 /** Changes whenever any value the container was started with changes; stores no secret. */

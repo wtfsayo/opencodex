@@ -28,6 +28,8 @@ a real model provider.
 - A Cloudflare account on the Workers Paid plan, which Containers require.
 - Docker running on the machine you deploy from. `wrangler deploy` builds the root `Dockerfile`
   there and pushes the image to Cloudflare's registry.
+- Deploy from a normal clone. In a `git worktree`, `.git` is a file rather than a directory, so the
+  image build cannot read the index; run `bun scripts/generate-compatibility-version.ts` first.
 - Bun, to install the Wrangler package.
 
 ## Deploy
@@ -214,8 +216,9 @@ leaving it set does not wipe later boots.
 | Update to a new release | `git pull`, then `npx wrangler deploy` |
 | Rotate the data token | Repeat the two token lines from [Deploy](#deploy), save the new value, and update your clients |
 
-A running container keeps the secrets it started with. When any secret it receives changes, the
-next request stops the container, which saves its state, and starts a new one with the new values;
+A running container keeps the secrets it started with. When any secret it receives changes, a
+request within seconds of the change stops the container, which saves its state, and starts a new
+one with the new values (measured at 2–21 seconds after `wrangler secret put` returned);
 requests in between get `503` with `Retry-After`. After a rotation, confirm that a request with the
 old token gets `401`.
 

@@ -795,7 +795,14 @@ describe("cloudflare durable auth store", () => {
 
   test("a boot seeded from the bootstrap config keeps it over the Durable Object's config", async () => {
     const home = scratch();
-    const state = fakeStateServer({ "GET /documents/config": () => new Response("{\"hostname\":\"0.0.0.0\",\"port\":0,\"old\":true}", { headers: { [DOCUMENT_SEQUENCE_HEADER]: "3" } }) });
+    const putBodies: { seq: string | null; body: string }[] = [];
+    const state = fakeStateServer({
+      "GET /documents/config": () => new Response("{\"hostname\":\"0.0.0.0\",\"port\":0,\"old\":true}", { headers: { [DOCUMENT_SEQUENCE_HEADER]: "3" } }),
+      "PUT /documents/config": async req => {
+        putBodies.push({ seq: req.headers.get(DOCUMENT_SEQUENCE_HEADER), body: await req.text() });
+        return new Response(null, { status: 204 });
+      },
+    });
     const started = join(home, "started");
     const previous = process.env.OCX_BOOTSTRAP_CONFIG_JSON;
     process.env.OCX_BOOTSTRAP_CONFIG_JSON = "{\"defaultProvider\":\"fixed\"}";
@@ -804,8 +811,12 @@ describe("cloudflare durable auth store", () => {
     void supervisor.main(["bun", "-e", `require("node:fs").writeFileSync(${JSON.stringify(started)}, "1"); setInterval(() => {}, 1000)`]);
     try {
       await until(() => existsSync(started));
-      expect(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).defaultProvider).toBe("fixed");
-      expect(state.events).not.toContain("GET /documents/config");
+      const seeded = readFileSync(join(home, "config.json"), "utf8");
+      expect(JSON.parse(seeded).defaultProvider).toBe("fixed");
+      // Written over the stale copy one sequence up, so later boots keep it too.
+      expect(state.events).toContain("PUT /documents/config");
+      expect(putBodies).toEqual([{ seq: "4", body: seeded }]);
+      expect(JSON.parse(readFileSync(join(home, "config.json.seq"), "utf8"))).toEqual({ seq: 4, mirrored: true, digest: documentDigest(seeded) });
       expect(state.events).toContain("GET /documents/auth");
       void supervisor.shutdown("SIGTERM");
       expect(await code).toBe(0);

@@ -837,10 +837,12 @@ export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValue
         // it. Commit the unchanged local store over it as the newer sequence.
         const path = getAuthStorePath();
         const revert = await mirrorBeforeWrite("auth", existsSync(path) ? readFileSync(path, "utf8") : "{}\n", getAuthStoreSequencePath());
+        revert?.beforeWrite();
         revert?.settle();
         throw error;
       }
     }
+    mirror?.beforeWrite();
     persist(bytes);
     try { mirror?.settle(); } catch (error) { console.warn(`[oauth] Could not record the auth store sequence: ${error instanceof Error ? error.message : String(error)}`); }
     if (scrubbedProviders.length > 0) scrubLegacyBackup(scrubbedProviders);

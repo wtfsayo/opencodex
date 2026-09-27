@@ -260,8 +260,18 @@ Review fixes (same day):
   digest is the one named; otherwise a digest mismatch still means an unrecorded writer and the
   local file wins. The `mirrored` flag tells the two apart: writers only set it after the Durable
   Object has the content, so a completed write that was later rewritten shows `mirrored: true`.
-- A boot seeded from `OCX_BOOTSTRAP_CONFIG_JSON` (no snapshot) skips the config document, keeping
-  the documented rule that the bootstrap config applies until a snapshot exists.
+- A boot seeded from `OCX_BOOTSTRAP_CONFIG_JSON` (no snapshot) records the seed one sequence above
+  the Durable Object's config and writes it there, keeping the documented rule that the bootstrap
+  config applies until a snapshot exists, on that boot and every later one. Skipping the document
+  only on the seeding boot was not enough: the seed had no sequence file, so the stale copy won
+  again one boot later.
+- A mirror that failed is recorded as unmirrored only immediately before the local write
+  (`MirrorCommit.beforeWrite`), after the auth store's ownership re-check. Recording it earlier let
+  a rejected login's store, if a failed attempt landed anyway, win the torn-snapshot rule.
+- Open, minor: a process without the boot id that rewrites a file while its last mirror is still
+  pending can lose that write to the torn-snapshot rule if the pending mirror lands and the
+  container then dies abruptly. It needs a second writer in the container, which nothing
+  starts.
 - `seedBootstrapConfig` rejects a `usageLedgerMaxBytes` the schema would silently drop.
 - Excluding `routing-history.sqlite` costs nothing at wake: the indexer keys its source on
   dev/ino/birthtime, which a restored ledger never matches, so a restored index was always rebuilt.

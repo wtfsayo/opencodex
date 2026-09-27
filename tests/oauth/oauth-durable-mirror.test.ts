@@ -18,7 +18,7 @@ let home: string;
 let previousHome: string | undefined;
 let previousBootId: string | undefined;
 
-type Call = { url: string; bootId: string | null; seq: number; body: string; fileAtCall: string | null };
+type Call = { url: string; bootId: string | null; seq: number; body: string; fileAtCall: string | null; authSequenceAtCall: string | null };
 type Reply = number | "network" | { status: number; storedSeq: number };
 let scheduled: (() => void)[] = [];
 
@@ -41,6 +41,7 @@ function recordingTransport(replies: Reply[]): Call[] {
         seq: Number(headers.get(DOCUMENT_SEQUENCE_HEADER)),
         body: String(init.body),
         fileAtCall: existsSync(path) ? readFileSync(path, "utf8") : null,
+        authSequenceAtCall: existsSync(join(home, sequenceFileFor("auth"))) ? readFileSync(join(home, sequenceFileFor("auth")), "utf8") : null,
       });
       const reply = replies[calls.length - 1] ?? 204;
       if (reply === "network") throw new TypeError("fetch failed");
@@ -159,6 +160,22 @@ describe("auth store durable mirror", () => {
     await saveCredential("xai", cred("two"));
     expect(behind.map(call => call.seq)).toEqual([2, 10]);
     expect(sequenceFile()).toMatchObject({ seq: 10, mirrored: true });
+  });
+
+  test("a rejected store whose mirror failed is never recorded as the local sequence", async () => {
+    process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
+    recordingTransport([204]);
+    await saveCredential("xai", cred("kept"));
+    const kept = readFileSync(getAuthStorePath(), "utf8");
+    // The rejected store's attempts fail (they may still land); the revert then succeeds.
+    const calls = recordingTransport(["network", "network", 204]);
+    let checks = 0;
+    await expect(mutateStore(store => { delete store.xai; }, [], {
+      assertBeforePersist: () => { if (++checks > 1) throw new Error("login superseded"); },
+    })).rejects.toThrow("login superseded");
+    // A snapshot taken before the revert must not see a sequence naming the rejected store.
+    expect(JSON.parse(calls[2]!.authSequenceAtCall!)).toEqual({ seq: 1, mirrored: true, digest: documentDigest(kept) });
+    expect(sequenceFile()).toEqual({ seq: 3, mirrored: true, digest: documentDigest(kept) });
   });
 
   test("a login superseded while the mirror was in flight is written nowhere", async () => {

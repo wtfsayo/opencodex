@@ -178,6 +178,12 @@ function mirrorUntilDurable(name: DurableDocumentName, body: string, seq: number
 
 export type MirrorCommit = {
   readonly durable: boolean;
+  /**
+   * Call immediately before writing the local file, once nothing can still reject the write. A
+   * failed mirror is recorded as unmirrored here, not earlier: a record for a store that is then
+   * rejected would let the next boot restore it.
+   */
+  beforeWrite(): void;
   /** Call after the local file is written: records the sequence, or keeps retrying a failed mirror. */
   settle(): void;
 };
@@ -186,19 +192,19 @@ export type MirrorCommit = {
  * For writers that can await: mirrors the whole document ahead of the local file, or returns null
  * when the deployment has none. A failure does not stop the local write: a refresh token the
  * provider has already rotated must reach the disk, and a rejected commit here would discard it.
- * The sequence file is marked unmirrored first, so the next boot restores the local copy instead.
+ * `beforeWrite` marks the sequence unmirrored, so the next boot restores the local copy instead.
  * Throws only when the lease is gone, in which case the supervisor is already stopping this
  * container without saving anything.
  */
 export async function mirrorBeforeWrite(name: DurableDocumentName, body: string, statePath: string): Promise<MirrorCommit | null> {
   if (!durableMirrorEnabled()) return null;
   const result = await put(name, body, nextSequence(name, statePath));
-  if (!result.durable) {
-    recordSequence(statePath, { seq: result.seq, mirrored: false, digest: documentDigest(body) });
-    console.warn(`[state] Could not reach the Durable Object; ${name} was saved locally and will be retried.`);
-  }
+  if (!result.durable) console.warn(`[state] Could not reach the Durable Object; ${name} will be saved locally and retried.`);
   return {
     durable: result.durable,
+    beforeWrite() {
+      if (!result.durable) recordSequence(statePath, { seq: result.seq, mirrored: false, digest: documentDigest(body) });
+    },
     settle() {
       if (result.durable) recordSequence(statePath, { seq: result.seq, mirrored: true, digest: documentDigest(body) });
       else if (result.retry) {

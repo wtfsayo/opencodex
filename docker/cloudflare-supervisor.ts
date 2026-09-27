@@ -288,10 +288,35 @@ export class Supervisor {
    */
   async restoreDocuments(seeded: boolean): Promise<void> {
     for (const name of Object.keys(DURABLE_DOCUMENT_FILES) as DurableDocumentName[]) {
-      // A boot with no snapshot starts from OCX_BOOTSTRAP_CONFIG_JSON, as it did before config was
-      // mirrored; a copy the Durable Object kept from a boot that never uploaded must not override it.
-      if (seeded && name === "config") continue;
-      await this.restoreDocument(name);
+      if (seeded && name === "config") await this.adoptSeededConfig();
+      else await this.restoreDocument(name);
+    }
+  }
+
+  /**
+   * A boot with no snapshot starts from OCX_BOOTSTRAP_CONFIG_JSON, as it did before config was
+   * mirrored, so a config the Durable Object kept from a boot that never uploaded must not win now
+   * or on any later boot. The seed is recorded one sequence above it before anything else, so it
+   * wins at restore even if the write below never lands, then written there.
+   */
+  private async adoptSeededConfig(): Promise<void> {
+    const response = await this.state("/documents/config");
+    if (response.status === 404) return;
+    if (!response.ok) throw new Error(`config download failed: ${response.status}`);
+    const stored = Number(response.headers.get(DOCUMENT_SEQUENCE_HEADER));
+    await response.body?.cancel();
+    if (!Number.isSafeInteger(stored) || stored < 1) throw new Error("config has no sequence");
+    const home = this.roots[0]!.dir;
+    const body = readFileSync(join(home, DURABLE_DOCUMENT_FILES.config), "utf8");
+    const seq = stored + 1;
+    const sequencePath = join(home, sequenceFileFor("config"));
+    writeSequenceState(sequencePath, { seq, mirrored: false, digest: documentDigest(body) });
+    try {
+      const put = await this.state("/documents/config", { method: "PUT", body, headers: { [DOCUMENT_SEQUENCE_HEADER]: String(seq) } });
+      if (put.ok) writeSequenceState(sequencePath, { seq, mirrored: true, digest: documentDigest(body) });
+      else console.error(`Seeded config not mirrored (${put.status}); the local copy still wins at restore.`);
+    } catch (error) {
+      console.error(`Seeded config not mirrored: ${errorText(error)}; the local copy still wins at restore.`);
     }
   }
 

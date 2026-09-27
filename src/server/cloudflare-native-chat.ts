@@ -9,7 +9,10 @@
 // import graph is held free of Bun, node:fs and friends by tests/service/cloudflare-worker-native.test.ts.
 import type { ServeNativeChat } from "./cloudflare-native-chat-api";
 import { buildOpenAIChatPassthroughRequest } from "../adapters/openai-chat/passthrough";
-import { nativeChatSse } from "./chat-native-sse";
+import { jsonCompletionSse, nativeChatSse, structuredError } from "./chat-native-sse";
+import { chatCompletionsErrorResponse, collectChatCompletion, isChatCompletionsStreamError } from "../chat/outbound";
+import { redactSecretString } from "../lib/redact";
+import { fastPolicyForModel } from "../providers/service-tier";
 import { chatCollabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { createTranslatorBudget } from "../lib/translator-budget";
 import type { OcxConfig, OcxProviderConfig } from "../types";
@@ -110,7 +113,7 @@ export function resolveNativeChatRoute(
 
 /** The request fields ocx's native Chat lane refuses or reroutes, plus anything carrying an image. */
 export function nativeChatBodyEligible(body: Rec): boolean {
-  if (body.stream !== true) return false;
+  if (body.stream !== undefined && typeof body.stream !== "boolean") return false;
   if (body.store === true || body.background === true) return false;
   if (body.previous_response_id !== undefined || body.compaction_trigger !== undefined) return false;
   // ocx answers an empty conversation itself with a 400 (src/chat/inbound.ts).
@@ -145,7 +148,12 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   const route = resolveNativeChatRoute(config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets);
   if (!route) return null;
 
-  const request = buildOpenAIChatPassthroughRequest(route.provider, body, route.modelId, true);
+  const requestedStream = body.stream === true;
+  // The same Fast policy arguments chat-native.ts passes; a config with fastMode is declined.
+  const request = buildOpenAIChatPassthroughRequest(
+    route.provider, body, route.modelId, requestedStream,
+    fastPolicyForModel(route.provider, route.modelId, route.providerName, "chat"),
+  );
   // As ocx sends it (sendWithConnectionPolicy): a redirect is an error, never followed with the key,
   // and headers must arrive within ocx's default connect timeout.
   const headerDeadline = new AbortController();
@@ -161,17 +169,65 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   } finally {
     clearTimeout(timer);
   }
-  if (!upstream.ok || !upstream.body || !(upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
+  if (!upstream.ok || !upstream.body) {
     await upstream.body?.cancel();
     return no(`upstream-${upstream.status}`);
   }
-  const stream = nativeChatSse(upstream.body, {
-    requestedModel: route.requestedModel,
-    translatorBudget: createTranslatorBudget(),
-    signal,
-    stallTimeoutSec: (config as Pick<OcxConfig, "stallTimeoutSec">).stallTimeoutSec,
-    onUsage: () => {},
-  });
-  // As chat-native.ts answers; Connection is hop-by-hop and the Workers runtime owns it.
-  return new Response(stream, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
+  const translatorBudget = createTranslatorBudget();
+  const fail = (status: number, message: string, type?: string, code?: string | null) =>
+    chatCompletionsErrorResponse(status, redactSecretString(message), type, code);
+
+  // The rest follows chat-native.ts from the upstream response on. The request has been sent, so
+  // from here an error is answered, not handed to the container, which would send it again.
+  if ((upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
+    const stream = nativeChatSse(upstream.body, {
+      requestedModel: route.requestedModel,
+      translatorBudget,
+      signal,
+      stallTimeoutSec: (config as Pick<OcxConfig, "stallTimeoutSec">).stallTimeoutSec,
+      onUsage: () => {},
+    });
+    // As chat-native.ts answers; Connection is hop-by-hop and the Workers runtime owns it.
+    if (requestedStream) return new Response(stream, { headers: SSE_HEADERS });
+    try {
+      return Response.json(await collectChatCompletion(stream, route.requestedModel, translatorBudget));
+    } catch (error) {
+      if (signal.aborted) return fail(499, "Client cancelled request", "client_cancelled");
+      if (isChatCompletionsStreamError(error)) return fail(error.status, error.message, error.type, error.code);
+      return fail(502, error instanceof Error ? error.message : String(error), "upstream_error");
+    }
+  }
+  const text = await readBounded(upstream.body, MAX_JSON_BYTES);
+  if (text === null) return fail(502, "upstream response exceeded the safe limit", "upstream_error", "translation_buffer_limit");
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return fail(502, "upstream returned malformed Chat Completions JSON", "upstream_error"); }
+  const error = structuredError(parsed);
+  if (error) return fail(error.status ?? 502, error.message, error.type, error.code);
+  if (!isRec(parsed) || !Array.isArray(parsed.choices) || parsed.choices.length === 0) {
+    return fail(502, "upstream response contained no choices", "upstream_error");
+  }
+  return requestedStream
+    ? new Response(jsonCompletionSse(parsed, route.requestedModel, translatorBudget), { headers: SSE_HEADERS })
+    : new Response(JSON.stringify(parsed), { headers: { "content-type": "application/json" } });
 };
+
+const SSE_HEADERS = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" };
+// chat-native.ts's MAX_NATIVE_CHAT_JSON_BYTES.
+const MAX_JSON_BYTES = 32 * 1024 * 1024;
+
+async function readBounded(body: ReadableStream<Uint8Array>, maxBytes: number): Promise<string | null> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return text + decoder.decode();
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+}

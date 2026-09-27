@@ -148,8 +148,8 @@ the dashboard under **AI → Workers AI → Models**.
 
 ## Worker-native Chat Completions (experimental)
 
-Setting `OCX_WORKER_NATIVE` to `1` lets the Worker answer some streamed `/v1/chat/completions`
-requests itself, without the container. That removes the Worker-to-container hop from each turn
+Setting `OCX_WORKER_NATIVE` to `1` lets the Worker answer some `/v1/chat/completions` requests
+itself, without the container. That removes the Worker-to-container hop from each turn
 and lets those turns run while the container is asleep. It is off by default.
 
 ```bash
@@ -158,14 +158,15 @@ echo 1 | npx wrangler secret put OCX_WORKER_NATIVE
 
 The Worker serves a request only when all of these hold, and otherwise passes it to `ocx` unchanged:
 
-- The request is `POST /v1/chat/completions` with `"stream": true`, text-only messages, and at
+- The request is `POST /v1/chat/completions`, streamed or not, with text-only messages and at
   most `function` tools; its body is uncompressed and under 4 MiB; and it carries the data token in
   `x-opencodex-api-key`, or failing that as a bearer token, which is how `ocx` reads it for chat.
   With `OCX_EDGE_KEY_CHECK=presence` the Worker never serves a request.
 - `model` is `<provider>/<model>` for a provider you added yourself (not a built-in provider name
   such as `openai` or `deepseek`), whose config has only `adapter: "openai-chat"`, an `https`
   `baseUrl` on a public host name, a literal `apiKey`, `models` (which must list the model), and
-  optionally `authMode: "key"`. Workers AI qualifies as shown above.
+  optionally `authMode: "key"`. The key can be a literal or a `${NAME}` reference to a secret listed
+  in `OCX_PASSTHROUGH_SECRETS`, as `ocx` would resolve it. Workers AI qualifies as shown above.
 - The config has nothing beyond basic settings: any routing, redirect, limit, or surface section
   sends every request to `ocx`.
 - The turn is not a multi-agent collaboration turn (a `spawn_agent` tool, or a spawned child's
@@ -175,12 +176,15 @@ The Worker serves a request only when all of these hold, and otherwise passes it
 When the Worker passes a request on, it logs why once per reason (for example
 `Worker-native chat declined: config-keys:<names>`); `npx wrangler tail` shows it.
 
-If the provider returns an error, or answers without streaming, the Worker sends the request to
-`ocx` instead, which retries and reports it as usual. The provider then sees that request twice.
+If the provider returns an error status, the Worker sends the request to `ocx` instead, which
+retries and reports it as usual; the provider then sees that request twice. An answer with a 200
+status is relayed or reported by the Worker itself, as `ocx` would.
 
 Turns the Worker serves are not recorded in usage history or request logs, and they do not count
 toward anything `ocx` accounts for. The Worker reads the provider settings from the copy of
-`config.json` kept in the Durable Object, which the container updates whenever settings change.
+`config.json` kept in the Durable Object, which the container updates whenever settings change;
+until the container has run once, it uses `OCX_BOOTSTRAP_CONFIG_JSON`. So a deployment whose
+clients only make qualifying requests never starts the container at all.
 
 ## Connect Codex
 

@@ -158,12 +158,13 @@ describe("Worker-native chat routing", () => {
     expect(cfg.providers.p.apiKey).toBe("${OPENAI_KEY}");
   });
 
-  test("takes only streamed, text-only turns the native lane would also take", () => {
+  test("takes only text-only turns the native lane would also take", () => {
     const base = { model: "p/m-1", stream: true, messages: [{ role: "user", content: "hi" }] };
     expect(nativeChatBodyEligible(base)).toBe(true);
     expect(nativeChatBodyEligible({ ...base, tools: [{ type: "function", function: { name: "f" } }] })).toBe(true);
+    expect(nativeChatBodyEligible({ ...base, stream: false })).toBe(true);
     for (const body of [
-      { ...base, stream: false },
+      { ...base, stream: "yes" },
       { ...base, messages: [] },
       { ...base, store: true },
       { ...base, previous_response_id: "r" },
@@ -202,7 +203,6 @@ describe("Worker-native chat serving", () => {
     const neverCalled = { readConfig: async () => workersAiConfig, fetch: async () => { throw new Error("unexpected upstream call"); } };
     const signal = new AbortController().signal;
     expect(await serveNativeChat("not json", new Headers(), signal, neverCalled)).toBeNull();
-    expect(await serveNativeChat(JSON.stringify({ ...JSON.parse(turn), stream: false }), new Headers(), signal, neverCalled)).toBeNull();
     expect(await serveNativeChat(turn, new Headers(), signal, { ...neverCalled, readConfig: async () => undefined })).toBeNull();
     // An upstream error is left to the container, which owns retries and error shaping.
     const failing = await serveNativeChat(turn, new Headers(), signal, {
@@ -215,6 +215,41 @@ describe("Worker-native chat serving", () => {
     const spawn = JSON.stringify({ ...JSON.parse(turn), tools: [{ type: "function", function: { name: "spawn_agent" } }] });
     expect(await serveNativeChat(spawn, new Headers(), signal, neverCalled)).toBeNull();
     expect(await serveNativeChat(turn, new Headers({ "x-openai-subagent": "collab_spawn" }), signal, neverCalled)).toBeNull();
+  });
+
+  test("answers non-streamed turns as JSON, and a JSON upstream to a streamed turn as SSE, like chat-native", async () => {
+    const ai = { run: async (_model: string, input: Record<string, unknown>) =>
+      input.stream ? sse(["data: {\"response\":\"Pong\"}\n\n", "data: [DONE]\n\n"]).body! : { response: "Pong" } };
+    const deps = { readConfig: async () => workersAiConfig, localHosts: { [WORKERS_AI_HOST]: (request: Request) => handleWorkersAi(request, ai) }, fetch: async () => { throw new Error("unexpected"); } };
+    const plain = await serveNativeChat(JSON.stringify({ ...JSON.parse(turn), stream: false }), new Headers(), new AbortController().signal, deps);
+    expect(plain?.headers.get("content-type")).toBe("application/json");
+    const completion = await plain!.json() as { choices: { message: { content: string } }[] };
+    expect(completion.choices[0]!.message.content).toBe("Pong");
+
+    const config = JSON.stringify({ providers: { p: { ...provider } } });
+    const jsonUpstream = await serveNativeChat(JSON.stringify({ model: "p/m-1", stream: true, messages: [{ role: "user", content: "hi" }] }), new Headers(), new AbortController().signal, {
+      readConfig: async () => config,
+      fetch: async () => Response.json({ id: "c", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }),
+    });
+    expect(jsonUpstream?.headers.get("content-type")).toBe("text/event-stream; charset=utf-8");
+    expect(await jsonUpstream!.text()).toContain("\"ok\"");
+  });
+
+  test("once the upstream has answered 200, a bad body is reported, not sent again through the container", async () => {
+    const config = JSON.stringify({ providers: { p: { ...provider } } });
+    const answer = async (response: Response) => serveNativeChat(JSON.stringify({ model: "p/m-1", stream: false, messages: [{ role: "user", content: "hi" }] }), new Headers(), new AbortController().signal, {
+      readConfig: async () => config,
+      fetch: async () => response,
+    });
+    const malformed = await answer(new Response("not json", { headers: { "content-type": "application/json" } }));
+    expect(malformed?.status).toBe(502);
+    const empty = await answer(Response.json({ choices: [] }));
+    expect(empty?.status).toBe(502);
+    // Built at run time so no key-shaped literal sits in the source.
+    const fakeKey = ["sk", "a".repeat(40)].join("-");
+    const embedded = await answer(Response.json({ error: { message: `quota exceeded for key ${fakeKey}`, type: "insufficient_quota" } }));
+    expect(embedded?.status).toBe(502);
+    expect(await embedded!.text()).not.toContain(fakeKey);
   });
 
   test("a redirect is never followed with the key; the turn goes to the container", async () => {

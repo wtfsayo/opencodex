@@ -150,6 +150,7 @@ describe("Worker-native chat routing", () => {
     expect(nativeChatBodyEligible({ ...base, tools: [{ type: "function", function: { name: "f" } }] })).toBe(true);
     for (const body of [
       { ...base, stream: false },
+      { ...base, messages: [] },
       { ...base, store: true },
       { ...base, previous_response_id: "r" },
       { ...base, messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:," } }] }] },
@@ -200,6 +201,19 @@ describe("Worker-native chat serving", () => {
     const spawn = JSON.stringify({ ...JSON.parse(turn), tools: [{ type: "function", function: { name: "spawn_agent" } }] });
     expect(await serveNativeChat(spawn, new Headers(), signal, neverCalled)).toBeNull();
     expect(await serveNativeChat(turn, new Headers({ "x-openai-subagent": "collab_spawn" }), signal, neverCalled)).toBeNull();
+  });
+
+  test("a redirect is never followed with the key; the turn goes to the container", async () => {
+    const config = JSON.stringify({ providers: { p: { ...provider } } });
+    let redirect: RequestRedirect | undefined;
+    const response = await serveNativeChat(JSON.stringify({ model: "p/m-1", stream: true, messages: [{ role: "user", content: "hi" }] }), new Headers(), new AbortController().signal, {
+      readConfig: async () => config,
+      fetch: async request => {
+        redirect = request.redirect;
+        return new Response(null, { status: 307, headers: { location: "https://elsewhere.example.test/v1/chat/completions" } });
+      },
+    });
+    expect([redirect, response]).toEqual(["manual", null]);
   });
 
   test("an external provider is called with its literal key", async () => {

@@ -26,13 +26,15 @@ const PROVIDER_FIELDS = new Set(["adapter", "baseUrl", "apiKey", "models", "auth
 // the next section that does (blockedModelRedirects, apiSurfaces and maxInboundBodyBytes were such).
 const CONFIG_KEYS = new Set([
   "port", "hostname", "runtimeRole", "hub", "fastRows", "providers", "defaultProvider", "stallTimeoutSec", "usageLedgerMaxBytes",
-  "managementUsageMaxReadBytes", "appOwnedMemoryBudgetMb", "configRebaseProvenance", "oauthOpenBrowser",
+  "managementUsageMaxReadBytes", "configRebaseProvenance", "oauthOpenBrowser",
   "codexAutoStart", "codexProviderDisplayName", "codexShimAutoRestore", "codexQuotaAutoRefresh",
   "codexAccountPickerEnabled", "catalogAutoRefresh", "quotaResetNotify", "remoteGui", "metricsExport",
   "openaiProviderTierVersion", "googleAntigravityStaticCatalogVersion", "subagentModelsVersion",
   "multiAgentSurfaceAdvisoryVersion", "apiKeys", "subagentModels",
 ]);
 const RESERVED_NAMESPACES = new Set(["policy", "combo"]);
+// chat-native.ts: config.connectTimeoutMs ?? 200_000; a config that sets it is declined.
+const HEADER_TIMEOUT_MS = 200_000;
 // ocx refuses provider destinations on private, loopback and metadata addresses. Its check resolves
 // DNS, which the Worker cannot do the same way, so this path goes further: public https hosts by
 // name only, plus the hosts the Worker answers itself.
@@ -96,7 +98,8 @@ export function nativeChatBodyEligible(body: Rec): boolean {
   if (body.stream !== true) return false;
   if (body.store === true || body.background === true) return false;
   if (body.previous_response_id !== undefined || body.compaction_trigger !== undefined) return false;
-  if (!Array.isArray(body.messages)) return false;
+  // ocx answers an empty conversation itself with a 400 (src/chat/inbound.ts).
+  if (!Array.isArray(body.messages) || body.messages.length === 0) return false;
   for (const message of body.messages) {
     if (!isRec(message)) return false;
     if (Array.isArray(message.content) && message.content.some(part => !isRec(part) || part.type !== "text")) return false;
@@ -128,9 +131,21 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   if (!route) return null;
 
   const request = buildOpenAIChatPassthroughRequest(route.provider, body, route.modelId, true);
-  const upstreamRequest = new Request(request.url, { method: request.method, headers: request.headers, body: request.body, signal });
+  // As ocx sends it (sendWithConnectionPolicy): a redirect is an error, never followed with the key,
+  // and headers must arrive within ocx's default connect timeout.
+  const headerDeadline = new AbortController();
+  const timer = setTimeout(() => headerDeadline.abort(new Error("upstream headers timed out")), HEADER_TIMEOUT_MS);
+  const upstreamRequest = new Request(request.url, {
+    method: request.method, headers: request.headers, body: request.body, redirect: "manual",
+    signal: AbortSignal.any([signal, headerDeadline.signal]),
+  });
   const local = deps.localHosts?.[new URL(request.url).host];
-  const upstream = local ? await local(upstreamRequest) : await deps.fetch(upstreamRequest);
+  let upstream: Response;
+  try {
+    upstream = local ? await local(upstreamRequest) : await deps.fetch(upstreamRequest);
+  } finally {
+    clearTimeout(timer);
+  }
   if (!upstream.ok || !upstream.body || !(upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
     await upstream.body?.cancel();
     return no(`upstream-${upstream.status}`);

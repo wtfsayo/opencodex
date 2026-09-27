@@ -154,3 +154,10 @@ than Workers AI. The A/B also caught a silent failure: the first run after the s
 showed no difference because the key allowlist declined every turn (a real hub's config carries
 `runtimeRole`, `hub`, `fastRows`, `subagentModels`), which is why the Worker now logs each decline
 reason once. Worker CPU stays at 1-2 ms per turn.
+
+Open after the final review (all low): upstream rewriter plugins under `$OPENCODEX_HOME/plugins`
+are not run by the Worker and not declined (not reachable on Cloudflare today); the import guard
+misses non-literal `import(x)` and its comment stripping ignores strings; CI never bundles the
+Worker, so a module-scope incompatibility in the reused code shows up only at deploy time. Fixed
+from that review: redirects are `manual` as in ocx, a 200 s header timeout as ocx's default,
+empty `messages` declined, and `appOwnedMemoryBudgetMb` removed from the allowlist.

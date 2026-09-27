@@ -23,8 +23,25 @@ function toEntry(row: unknown): PersistedUsageEntry | null {
   const num = (key: string) => typeof value[key] === "number" && Number.isFinite(value[key] as number);
   if (!str("requestId") || !str("provider") || !str("model") || !num("timestamp") || !num("status") || !num("durationMs")) return null;
   if (value.usageStatus !== "reported" && value.usageStatus !== "unreported") return null;
-  return row as PersistedUsageEntry;
+  // Projected, not passed through: usage.jsonl holds request metadata and token counts, and that
+  // must not depend on what the Worker happened to put in the row.
+  const entry: Record<string, unknown> = {};
+  for (const key of ENTRY_FIELDS) if (value[key] !== undefined) entry[key] = value[key];
+  if (value.usage && typeof value.usage === "object" && !Array.isArray(value.usage)) {
+    const usage: Record<string, number> = {};
+    for (const [key, count] of Object.entries(value.usage as Record<string, unknown>)) {
+      if (typeof count === "number" && Number.isFinite(count) && key.endsWith("Tokens")) usage[key] = count;
+    }
+    entry.usage = usage;
+  }
+  return entry as unknown as PersistedUsageEntry;
 }
+
+// WorkerUsageRow (src/server/cloudflare-native-chat-api.ts), minus usage, which is projected above.
+const ENTRY_FIELDS = [
+  "requestId", "timestamp", "provider", "model", "requestedModel", "inboundProtocol", "admissionKind",
+  "status", "durationMs", "firstOutputMs", "usageStatus", "totalTokens",
+] as const;
 
 /** Appends every queued row it can take, acknowledging each batch; returns how many were appended. */
 export function drainWorkerUsageInbox(): Promise<number> {

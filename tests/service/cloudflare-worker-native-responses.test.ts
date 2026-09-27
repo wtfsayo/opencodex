@@ -133,3 +133,14 @@ describe("Worker-native Responses", () => {
     expect(response).toBeNull();
   });
 });
+
+describe("proxy wiring the Worker path depends on", () => {
+  test("loading the proxy's Responses bridge registers the disk-backed thought-signature store", async () => {
+    // parser.ts and bridge/sse.ts read the slot; the proxy fills it only because its bridge barrel
+    // imports thought-signature-replay.ts. Losing that import would silently stop Gemini replay.
+    await import("../../src/bridge");
+    const { thoughtSignatureStoreRegistered } = await import("../../src/responses/thought-signature-slot");
+    expect(thoughtSignatureStoreRegistered()).toBe(true);
+  });
+});
+

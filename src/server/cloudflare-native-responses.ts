@@ -26,6 +26,9 @@ const isRec = (value: unknown): value is Rec => !!value && typeof value === "obj
 const BODY_FIELDS = new Set([
   "model", "instructions", "input", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "store",
   "stream", "include", "prompt_cache_key", "text", "max_output_tokens", "temperature", "top_p", "metadata", "user",
+  // Codex CLI sends it on every turn. Over HTTP ocx reads it only for compaction routing, which needs
+  // a compactionRouting config section and a compaction_trigger item, both declined here.
+  "client_metadata",
 ]);
 const INPUT_ITEMS = new Set(["message", "function_call", "function_call_output", "reasoning"]);
 const TEXT_PARTS = new Set(["input_text", "output_text"]);

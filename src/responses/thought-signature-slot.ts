@@ -22,6 +22,10 @@ export function registerThoughtSignatureStore(next: ThoughtSignatureStore): void
   store = next;
 }
 
+export function thoughtSignatureStoreRegistered(): boolean {
+  return store !== NO_STORE;
+}
+
 /** Look up a signature previously handed out for this call in THIS scope, if still fresh. */
 export function lookupReplayThoughtSignature(
   callId: string,

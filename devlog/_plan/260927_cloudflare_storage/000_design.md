@@ -90,6 +90,30 @@ Where Durable Object single-threading replaces a filesystem mechanism:
 | Hard-link no-replace publication | `INSERT` that fails on conflict |
 | Inode/mtime revision keys for `usage.jsonl` tails | A monotonically increasing row id |
 
+## Findings that changed the order (2026-09-27, from a full trace of the spend path)
+
+- **Every hub journals every send.** The request tracker is attached unconditionally
+  (`src/server/inference/context.ts:24`, `messages-native.ts:380`, `chat-native.ts:316`) and the
+  first physical send appends a reserve record even with no `spend` ceilings configured, by design
+  ("accounted and journalled"). A remote journal therefore means a network write on every request of
+  every Cloudflare hub, not only those with limits.
+- **The reserve path is synchronous end to end.** `SpendJournal.append` returns `void` and must throw
+  on failure; `ledger.reserve` → `RequestSendObserver.charge` (`request-spend.ts:84`) →
+  `RequestExecutionBudget.reserveDispatch` are all synchronous, with 11 `reserveDispatch` call sites,
+  2 native `charge` sites, and about 13 more behind three synchronous helpers.
+- **Admission is decided from in-process memory**; the journal is only replayed at construction. The
+  local SQLite lease is what keeps a second writer out. On Cloudflare the Phase 1 boot lease already
+  plays that role.
+
+Consequences: making the reserve durable against a remote store before admission is either a wide
+change to core send signatures (about 27 sites) or a narrower "durability barrier" awaited at the
+three real send points (`adapters/physical-send.ts`, `chat-native.ts:460`, `messages-native.ts:485`),
+plus a journal/salt injection point on `sharedSpendLedger` and a startup-time async replay. Either
+way it touches the core request path, and it only closes a crash window of one snapshot interval
+for hubs that configure ceilings. The spend ledger therefore moves from first to last, and should
+be preceded by gating the tracker on `spendCeilingsConfigured()` so an unconfigured Cloudflare hub
+makes no remote spend writes at all.
+
 ## Order of work
 
 Each step is independently shippable and shrinks what the snapshot must carry. Items not yet
@@ -97,13 +121,13 @@ migrated keep riding in the Phase 1 snapshot.
 
 | Step | Store | Why this order | Backend | Seam |
 |---|---|---|---|---|
-| 3a | Spend ledger | Only store with a correctness invariant the snapshot breaks | Durable Object SQLite, one row per journal record | Existing `SpendJournal { read; append; rewrite }` (`spend-reservation-ledger.ts:367`); add an async `appendDurable` used at admission |
-| 3b | OAuth `auth.json` + refresh intents, `codex-accounts.json` | Credential loss on crash forces re-login; per-lookup file reads are the hottest I/O | Durable Object SQLite, one row per provider account set / pool record, with the existing generation fields as the fence | New `CredentialStoreBackend` behind `oauth/store.ts` `loadStore`/`persist` and `account-store.ts` load/persist |
-| 3c | `usage.jsonl` | Unbounded; biggest snapshot cost | Durable Object SQLite table (append rows, row id as revision), or D1 if cross-deployment queries are wanted | `appendUsageEntry` / `readRecentUsageEntries` in `usage/log.ts`; `routing-history` becomes a query, not a projection |
-| 3d | `config.json` | Rarely written; snapshot already handles it well | Durable Object row + generation | `persisted-mutation.ts` commit path |
+| 3a | OAuth `auth.json` + refresh intents, `codex-accounts.json` | Credential loss on crash forces re-login; per-lookup file reads are the hottest I/O | Durable Object SQLite, one row per provider account set / pool record, with the existing generation fields as the fence | New `CredentialStoreBackend` behind `oauth/store.ts` `loadStore`/`persist` and `account-store.ts` load/persist |
+| 3b | `usage.jsonl` | Unbounded; biggest snapshot cost | Durable Object SQLite table (append rows, row id as revision), or D1 if cross-deployment queries are wanted | `appendUsageEntry` / `readRecentUsageEntries` in `usage/log.ts`; `routing-history` becomes a query, not a projection |
+| 3c | `config.json` | Rarely written; snapshot already handles it well | Durable Object row + generation | `persisted-mutation.ts` commit path |
+| 3d | Spend ledger | Only store with a durability invariant, but also the only one on every request's synchronous send path; first gate journalling on configured ceilings | Durable Object SQLite | `SpendJournal` plus a durability barrier awaited at the three physical send points |
 | — | Caches, responses state, tokens | Loss is tolerated or they are regenerated | Stay in the snapshot, or are simply not persisted | none |
 
-After 3a–3c the snapshot carries only config and small caches, which removes gap 2, and the
+After 3a–3b the snapshot carries only config, the spend journal, and small caches, which removes gap 2, and the
 interval can grow.
 
 ## Invariants each step must keep (and test)

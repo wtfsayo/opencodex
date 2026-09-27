@@ -197,3 +197,18 @@ uploads a snapshot within 30 s). `wrangler containers instances` lists the `hub`
 inactive with no location or version. The first deploy of the Responses path failed at upload:
 `reasoning-replay-cache.ts` drew `randomBytes(32)` at module scope, which Workers refuse; the key is
 now created on first use, and the import guard flags module-scope random, timers and I/O.
+
+Real Codex CLI (0.157.1, `codex exec` with an isolated CODEX_HOME, provider set by `-c` overrides,
+wire_api responses) against a Worker-only deployment, 2026-09-28. It took four fixes found only by
+running the real client: Codex sends `client_metadata`, a `multi_agent_v1` namespace tool, hosted
+`{type:"web_search", external_web_access:false}` and a `<skills_instructions>` block on every turn,
+and the Worker declined each in turn. With those reproduced (namespaces via ocx's own flattening,
+web_search admitted when no `openai` provider can run the search sidecar, the skills freeze kept in
+the Durable Object), a plain turn and a full tool loop with `meta/llama-3.3-70b-instruct-fp8-fast`
+(model calls the shell tool, Codex runs `wc -l`, model answers "2 lines") were served with only
+Worker events and Durable Object calls (`nativeConfigSource`, `skillsSnapshot`, `enqueueUsage`) in
+the log. Llama 4 Scout answered Codex's full tool set with a tool call written as text, a model
+limitation. Codex CLI made no `/v1/models` request in these runs.
+
+Still container-only: `/v1/models`, `/v1/messages` (Claude Code), WebSocket Responses, the
+dashboard and management API, OAuth and Codex-pool providers, and any turn with reasoning effort.

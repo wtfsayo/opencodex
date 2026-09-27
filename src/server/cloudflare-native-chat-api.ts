@@ -11,10 +11,11 @@ export type NativeChatDeps = {
   /** The environment ocx would run with, for `${NAME}` key references; see containerEnv. */
   secrets?: Readonly<Record<string, string>>;
   /**
-   * The Worker's per-session <skills_instructions> freeze: returns the block this session is frozen
-   * to, storing `incoming` when there is none. `scope` is a hex digest of the session identity.
+   * The Worker's per-session <skills_instructions> freeze. `read` returns the block a session is
+   * frozen to; `commit` freezes it to one once the turn has been sent (first block wins). Scopes are
+   * hex digests; `principal` is folded into them and never stored.
    */
-  skillsSnapshot?(scope: string, incoming: string): Promise<string>;
+  skills?: { read(scope: string): Promise<string | undefined>; commit(scope: string, block: string): void; principal: string };
   /** Called once per served turn, after its last byte; the Worker queues it for ocx's usage log. */
   recordUsage?(row: WorkerUsageRow): void;
   /** Why a request went to the container. Reasons name config keys and fields, never values. */

@@ -186,7 +186,10 @@ streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
 is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only
 messages; and no `<skills_instructions>` block. That covers what Codex CLI sends on an ordinary
-turn.
+turn. Like `ocx`, the Worker freezes each session's `<skills_instructions>` catalog to the first one
+it sends, for four idle hours; the two keep separate copies (the Worker's in the Durable Object,
+`ocx`'s in memory, lost whenever the container sleeps), so a session whose catalog changes while its
+turns alternate between them can see both versions.
 
 If the provider returns an error status, the Worker sends the request to `ocx` instead, which
 retries and reports it as usual; the provider then sees that request twice. An answer with a 200

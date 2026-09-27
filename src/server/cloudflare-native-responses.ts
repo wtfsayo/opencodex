@@ -58,25 +58,27 @@ async function sha256Hex(value: string): Promise<string> {
 
 /**
  * skills-snapshot.ts for the Worker: the same scope (the session's own thread-id, else session-id;
- * the parent-thread case is declined earlier), the same single-block rule, and first block wins.
- * The data token is the only principal that reaches this path, so it needs no part in the key.
+ * the parent-thread case is declined earlier, and the data token is the principal), the same
+ * single-block rule, and first block wins. A frozen block is substituted at once; a new one is only
+ * returned for the caller to commit once the turn has been sent, as ocx stores only after admission.
  */
-async function freezeSkillsCatalog(body: Rec, headers: Headers, config: unknown, deps: NativeChatDeps): Promise<"decline" | undefined> {
+async function freezeSkillsCatalog(body: Rec, headers: Headers, deps: NativeChatDeps): Promise<"decline" | (() => void) | undefined> {
   const found = singleSkillsBlock(body);
   if (!found) return undefined;
-  // A `skills` config section (which could select per_turn) is outside the Worker's config keys, so
-  // the default per_session applies here.
-  void config;
   const conversation = reasoningReplayConversationIdFromResponsesRequest({
     threadIdHeader: headers.get("thread-id")?.trim() || undefined,
     sessionIdHeader: sessionIdHeaderFromRequest(headers),
   });
   if (!conversation) return undefined;
-  if (!deps.skillsSnapshot) return "decline";
-  const scope = await sha256Hex(JSON.stringify(["skills_catalog_snapshot_v1", conversation]));
-  const block = await deps.skillsSnapshot(scope, found.block);
-  if (block !== found.block) replaceSkillsBlock(found, block);
-  return undefined;
+  if (!deps.skills) return "decline";
+  const skills = deps.skills;
+  const scope = await sha256Hex(JSON.stringify(["skills_catalog_snapshot_v1", await sha256Hex(skills.principal), conversation]));
+  const frozen = await skills.read(scope);
+  if (frozen !== undefined) {
+    if (frozen !== found.block) replaceSkillsBlock(found, frozen);
+    return undefined;
+  }
+  return () => skills.commit(scope, found.block);
 }
 
 function hasHostedWebSearch(body: Rec): boolean {
@@ -169,8 +171,9 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
 
   // skills-snapshot.ts: a session's first catalog block is kept and substituted on later turns,
   // before the body is parsed. The Worker keeps its own copy; see skillsSnapshot.
-  const frozen = await freezeSkillsCatalog(body, headers, loaded.config, deps);
+  const frozen = await freezeSkillsCatalog(body, headers, deps);
   if (frozen === "decline") return no("skills-snapshot-unavailable");
+  const commitSkills = typeof frozen === "function" ? frozen : undefined;
 
   let parsed;
   try { parsed = parseRequest(body); } catch { return no("parse"); }
@@ -201,6 +204,7 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
     await upstream.body?.cancel();
     return no(`upstream-${upstream.status}`);
   }
+  commitSkills?.();
 
   let usage: OcxUsage | undefined;
   let firstOutputAt: number | undefined;

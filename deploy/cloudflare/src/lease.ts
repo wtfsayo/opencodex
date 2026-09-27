@@ -100,12 +100,17 @@ export class LeaseState {
     const discarded = await this.storage.get<string>(SNAPSHOT_KEY);
     await this.storage.delete(SNAPSHOT_KEY);
     for (const name of DURABLE_DOCUMENTS) await this.storage.delete(DOCUMENT_KEY_PREFIX + name);
-    for (const prefix of [USAGE_KEY_PREFIX, SKILLS_META_PREFIX, SKILLS_BLOCK_PREFIX]) {
-      for (;;) {
-        const queued = await this.storage.list({ prefix, limit: 1000 });
-        if (queued.size === 0) break;
-        for (const key of queued.keys()) await this.storage.delete(key);
-      }
+    for (;;) {
+      const queued = await this.storage.list({ prefix: USAGE_KEY_PREFIX, limit: 1000 });
+      if (queued.size === 0) break;
+      for (const key of queued.keys()) await this.storage.delete(key);
+    }
+    // Blocks are deleted by the keys their small metadata rows name, never listed: 1,000 of them
+    // at the size limit would not fit in a Durable Object's memory.
+    for (;;) {
+      const metas = await this.storage.list<SkillsMeta>({ prefix: SKILLS_META_PREFIX, limit: 1000 });
+      if (metas.size === 0) break;
+      for (const key of metas.keys()) await this.dropSkills(key.slice(SKILLS_META_PREFIX.length));
     }
     await this.storage.delete(LEASE_KEY);
     return discarded;
@@ -159,25 +164,28 @@ export class LeaseState {
     return true;
   }
 
-  /**
-   * The catalog block this session is frozen to: the stored one while it is live (its expiry
-   * slides), otherwise `incoming`, which becomes the stored one. `scope` is already a digest.
-   */
-  async skillsSnapshot(scope: string, incoming: string): Promise<string> {
+  /** The catalog block this session is frozen to while it is live (its expiry slides), else undefined. */
+  async skillsSnapshotRead(scope: string): Promise<string | undefined> {
     const now = this.now();
     const meta = await this.storage.get<SkillsMeta>(SKILLS_META_PREFIX + scope);
-    if (meta && now - meta.lastAccessed <= SKILLS_SNAPSHOT_TTL_MS) {
-      const block = await this.storage.get<string>(SKILLS_BLOCK_PREFIX + scope);
-      if (block !== undefined) {
-        await this.storage.put<SkillsMeta>(SKILLS_META_PREFIX + scope, { lastAccessed: now });
-        return block;
-      }
-    }
-    if (new TextEncoder().encode(incoming).byteLength > MAX_SKILLS_BLOCK_BYTES) return incoming;
-    await this.pruneSkills(now);
-    await this.storage.put(SKILLS_BLOCK_PREFIX + scope, incoming);
+    if (!meta || now - meta.lastAccessed > SKILLS_SNAPSHOT_TTL_MS) return undefined;
+    const block = await this.storage.get<string>(SKILLS_BLOCK_PREFIX + scope);
+    if (block === undefined) return undefined;
     await this.storage.put<SkillsMeta>(SKILLS_META_PREFIX + scope, { lastAccessed: now });
-    return incoming;
+    return block;
+  }
+
+  /**
+   * Freezes the session to `block` unless a live one is already stored: the first catalog wins, as in
+   * ocx. Called only once the turn has been sent, as ocx stores only after admission.
+   */
+  async skillsSnapshotCommit(scope: string, block: string): Promise<void> {
+    if ((await this.skillsSnapshotRead(scope)) !== undefined) return;
+    if (new TextEncoder().encode(block).byteLength > MAX_SKILLS_BLOCK_BYTES) return;
+    const now = this.now();
+    await this.pruneSkills(now);
+    await this.storage.put(SKILLS_BLOCK_PREFIX + scope, block);
+    await this.storage.put<SkillsMeta>(SKILLS_META_PREFIX + scope, { lastAccessed: now });
   }
 
   /** Drops expired sessions, then the least recently used until there is room for one more. */

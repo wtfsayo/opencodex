@@ -165,7 +165,8 @@ export class OpencodexHub extends Container<Env> {
   peekUsage(bootId: string, limit: number) { return this.leases.peekUsage(bootId, limit); }
   ackUsage(bootId: string, seqs: readonly number[]) { return this.leases.ackUsage(bootId, seqs); }
   enqueueUsage(row: unknown) { return this.leases.enqueueUsage(row); }
-  skillsSnapshot(scope: string, incoming: string) { return this.leases.skillsSnapshot(scope, incoming); }
+  skillsSnapshotRead(scope: string) { return this.leases.skillsSnapshotRead(scope); }
+  skillsSnapshotCommit(scope: string, block: string) { return this.leases.skillsSnapshotCommit(scope, block); }
   async nativeConfigSource(): Promise<{ config: string | undefined; hasSnapshot: boolean }> {
     return { config: (await this.leases.readDocument("config"))?.body, hasSnapshot: (await this.leases.currentSnapshot()) !== undefined };
   }
@@ -250,7 +251,13 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
         return nativeConfigText(source.config, source.hasSnapshot, env);
       },
       secrets: containerEnv(env),
-      skillsSnapshot: (scope, incoming) => hub.skillsSnapshot(scope, incoming),
+      skills: {
+        read: scope => hub.skillsSnapshotRead(scope),
+        commit: (scope, block) => { ctx.waitUntil(hub.skillsSnapshotCommit(scope, block).catch(() => {})); },
+        // The data token is the only principal this path admits; rotating it starts fresh sessions,
+        // as ocx's principal-keyed snapshot does.
+        principal: env.OPENCODEX_API_AUTH_TOKEN ?? "",
+      },
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
       fetch: request => fetch(request),
       onDecline: logDeclineOnce,

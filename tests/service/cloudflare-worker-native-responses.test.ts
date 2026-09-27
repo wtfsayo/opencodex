@@ -249,7 +249,7 @@ describe("Worker-native skills catalog freeze", () => {
     let system = "";
     const response = await serveNativeResponses(bodyText, headers, new AbortController().signal, {
       readConfig: async () => externalConfig,
-      skillsSnapshot: (scope, incoming) => hub.skillsSnapshot(scope, incoming),
+      skills: { read: scope => hub.skillsSnapshotRead(scope), commit: (scope, block) => { void hub.skillsSnapshotCommit(scope, block); }, principal: "token" },
       fetch: async request => {
         const sent = await request.json() as { messages: { role: string; content: string }[] };
         system = sent.messages.filter(message => message.role === "system").map(message => message.content).join("\n");
@@ -273,16 +273,32 @@ describe("Worker-native skills catalog freeze", () => {
     let now = 0;
     const storage = memoryStorage();
     const hub = new LeaseState(storage, () => now);
-    expect(await hub.skillsSnapshot("s", "first")).toBe("first");
+    await hub.skillsSnapshotCommit("s", "first");
+    await hub.skillsSnapshotCommit("s", "second");
     now += SKILLS_SNAPSHOT_TTL_MS - 1;
-    expect(await hub.skillsSnapshot("s", "second")).toBe("first");
+    expect(await hub.skillsSnapshotRead("s")).toBe("first");
     now += SKILLS_SNAPSHOT_TTL_MS + 1;
-    expect(await hub.skillsSnapshot("s", "third")).toBe("third");
-    const big = "x".repeat(MAX_SKILLS_BLOCK_BYTES + 1);
-    expect(await hub.skillsSnapshot("big", big)).toBe(big);
+    expect(await hub.skillsSnapshotRead("s")).toBeUndefined();
+    await hub.skillsSnapshotCommit("big", "x".repeat(MAX_SKILLS_BLOCK_BYTES + 1));
     expect(storage.keys().some(key => key.endsWith(":big"))).toBe(false);
-    for (let i = 0; i < MAX_SKILLS_SESSIONS + 5; i++) await hub.skillsSnapshot(`n${i}`, "b");
+    for (let i = 0; i < MAX_SKILLS_SESSIONS + 5; i++) await hub.skillsSnapshotCommit(`n${i}`, "b");
     expect(storage.keys().filter(key => key.startsWith("ocx:skills-meta:")).length).toBeLessThanOrEqual(MAX_SKILLS_SESSIONS);
+    await hub.discardSnapshot();
+    expect(storage.keys().filter(key => key.startsWith("ocx:skills"))).toEqual([]);
   });
+
+  test("a turn that is never sent freezes nothing", async () => {
+    const hub = new LeaseState(memoryStorage());
+    const session = new Headers({ "thread-id": "thread-9" });
+    const deps = (fetchResult: () => Promise<Response>) => ({
+      readConfig: async () => externalConfig,
+      skills: { read: (scope: string) => hub.skillsSnapshotRead(scope), commit: (scope: string, block: string) => { void hub.skillsSnapshotCommit(scope, block); }, principal: "token" },
+      fetch: fetchResult,
+    });
+    // Declined after the catalog was seen: the upstream refused, so the container sends it again.
+    expect(await serveNativeResponses(turnWith("rejected"), session, new AbortController().signal, deps(async () => new Response("no", { status: 429 })))).toBeNull();
+    expect(await sentInstructions(turnWith("kept"), session, hub)).toContain("<skills_instructions>kept</skills_instructions>");
+  });
+
 });
 

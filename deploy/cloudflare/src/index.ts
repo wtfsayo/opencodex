@@ -1,11 +1,16 @@
 import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
-import { containerEnv, edgeDecision, envFingerprint, forwardableRequest, isSupersededBy, type EdgeEnv } from "./container-env";
+import {
+  containerEnv, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
+  forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
+} from "./container-env";
 import { LeaseState } from "./lease";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
 
 export interface Env extends EdgeEnv {
+  /** gui/dist, served by the Worker when dashboardEnabled(); see wrangler.jsonc `assets`. */
+  ASSETS?: Fetcher;
   /** version_metadata binding; lets a stale Durable Object notice a newer Worker version. */
   CF_VERSION?: WorkerVersionMetadata;
   HUB: DurableObjectNamespace<OpencodexHub>;
@@ -128,6 +133,14 @@ export class OpencodexHub extends Container<Env> {
     }
   }
 
+  /** The container's own /healthz if it is already running; never starts it. */
+  async healthIfRunning(): Promise<Response> {
+    if ((await this.getState()).status !== "healthy") {
+      return Response.json({ status: "sleeping" }, { status: 503, headers: { "retry-after": "30", "cache-control": "no-store" } });
+    }
+    return this.proxy(new Request("http://container/healthz"));
+  }
+
   /** Resets this object when the calling Worker is newer, so the next instance sees current secrets. */
   assertCurrentVersion(workerVersionTimestamp: string | undefined): void {
     if (isSupersededBy(workerVersionTimestamp, this.env.CF_VERSION?.timestamp)) {
@@ -165,8 +178,27 @@ async function handleState(req: Request, env: Env): Promise<Response> {
 
 OpencodexHub.outboundByHost = { [STATE_HOST]: handleState };
 
+async function serveDashboard(req: Request, assets: Fetcher): Promise<Response> {
+  const response = await assets.fetch(req);
+  if (!(response.headers.get("content-type") ?? "").startsWith("text/html")) return response;
+  const page = new HTMLRewriter()
+    .on("head", { element(head) { head.append(DASHBOARD_BOOTSTRAP_META, { html: true }); } })
+    .transform(response);
+  const headers = new Headers(page.headers);
+  for (const [name, value] of Object.entries(DASHBOARD_HTML_HEADERS)) headers.set(name, value);
+  return new Response(page.body, { status: page.status, headers });
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    // The dashboard's static files come from the Worker and never start the container; the admin
+    // token it asks for is checked at the edge on /api/* and again by ocx.
+    if (env.ASSETS && dashboardEnabled(env) && !servedByHub(new URL(req.url).pathname)) {
+      return serveDashboard(req, env.ASSETS);
+    }
+    if (env.OPENCODEX_API_AUTH_TOKEN && isAnonymousHealthCheck(req)) {
+      return getContainer(env.HUB, HUB_NAME).healthIfRunning();
+    }
     const decision = await edgeDecision(req, env);
     if (!decision.forward) {
       if (decision.status === 204) return new Response(null, { status: 204 });

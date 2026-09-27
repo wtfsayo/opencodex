@@ -115,8 +115,9 @@ export async function edgeDecision(req: Request, env: EdgeEnv): Promise<EdgeDeci
   const presented = presentedKeys(req).filter(key => key !== KEY_PROTOCOL_PREFIX);
   if (env.OCX_EDGE_KEY_CHECK?.trim() === "presence") return presented.length ? { forward: true } : unauthorized;
   const token = env.OPENCODEX_API_AUTH_TOKEN.trim();
-  const accepted = [token, KEY_PROTOCOL_PREFIX + base64url(token)];
-  // The management API takes the admin token, which the Worker does know.
+  // The management API takes only the admin token (ocx refuses a data token there), so a data token
+  // on /api/* is turned away here instead of starting the container to be refused.
+  const accepted = management ? [] : [token, KEY_PROTOCOL_PREFIX + base64url(token)];
   if (management && env.OPENCODEX_ADMIN_AUTH_TOKEN) accepted.push(env.OPENCODEX_ADMIN_AUTH_TOKEN.trim());
   for (const key of presented) {
     for (const expected of accepted) if (await secretEquals(key, expected)) return { forward: true };
@@ -136,6 +137,47 @@ export function isSupersededBy(workerVersionTimestamp: string | undefined, ownVe
   const own = Date.parse(ownVersionTimestamp ?? "");
   return Number.isFinite(worker) && Number.isFinite(own) && worker > own;
 }
+
+/**
+ * Paths ocx itself answers. Everything else is the dashboard, served as static files by the Worker
+ * so opening it never starts the container. `/backend-api/` is the Codex context prefix ocx maps
+ * onto /v1 (CONTEXT_BACKEND_PREFIX in src/codex/context-compat.ts).
+ */
+export function servedByHub(pathname: string): boolean {
+  const exact = ["/v1", "/api", "/healthz", "/readyz", "/opencodex-session"];
+  const prefixes = ["/v1/", "/api/", "/remote-workspace/", "/backend-api/"];
+  return exact.includes(pathname) || prefixes.some(prefix => pathname.startsWith(prefix));
+}
+
+/**
+ * A keyless GET /healthz, which the dashboard polls for its online badge. It is answered with the
+ * real health while the container runs and never starts it, so scanners cannot keep one billed.
+ */
+export function isAnonymousHealthCheck(req: Request): boolean {
+  if (req.method !== "GET" || new URL(req.url).pathname !== "/healthz") return false;
+  return !["x-opencodex-api-key", "authorization", "x-api-key"].some(name => req.headers.get(name)?.trim());
+}
+
+/** The dashboard is served only where the operator opened the management API with their own admin token. */
+export function dashboardEnabled(env: EdgeEnv): boolean {
+  return env.OCX_EXPOSE_MANAGEMENT_API === "1" && !!env.OPENCODEX_ADMIN_AUTH_TOKEN?.trim();
+}
+
+/**
+ * What ocx adds to index.html for a hub whose management API needs a typed credential
+ * (runtimeRoleMeta and managementAuthRequiredMeta in src/server/gui-static.ts). The dashboard reads
+ * them on first paint and asks for the admin token instead of waiting for a session.
+ */
+export const DASHBOARD_BOOTSTRAP_META =
+  '<meta name="opencodex-runtime-role" content="hub"><meta name="opencodex-management-auth-required" content="1">';
+
+/** Headers ocx sends with index.html (htmlDocumentResponse and browserSecurityHeaders in src/server). */
+export const DASHBOARD_HTML_HEADERS: Record<string, string> = {
+  "Cache-Control": "no-store",
+  Pragma: "no-cache",
+  "X-Frame-Options": "DENY",
+  "Content-Security-Policy": "frame-ancestors 'none'",
+};
 
 /** The request as the container should see it: the client never chooses which container port it reaches. */
 export function forwardableRequest(req: Request): Request {

@@ -17,10 +17,10 @@ client ──HTTPS──▶ Worker ──▶ OpencodexHub (Durable Object) ─�
 
 :::note[Status]
 This is the first stage of Cloudflare support. `ocx` still runs as a Linux process inside a
-container; it is not yet a Workers-native runtime. The deployment is a data-plane hub: clients call
-`/v1/*` with a key, and the dashboard and management API are not available remotely. It has been
-exercised with `wrangler dev` and on a production Cloudflare account, without routing a request to
-a real model provider.
+container; it is not yet a Workers-native runtime. Clients call `/v1/*` with a key; the dashboard
+is available when you open it with your own admin token (see [Dashboard](#dashboard)). It has been
+exercised with `wrangler dev` and on a production Cloudflare account, including a real browser
+sign-in to the dashboard, without routing a request to a real model provider.
 :::
 
 ## Requirements
@@ -139,6 +139,28 @@ env_key = "OPENCODEX_API_AUTH_TOKEN"
 This is the table `ocx` itself writes for a remote hub. Export `OPENCODEX_API_AUTH_TOKEN` in the
 shell that starts Codex.
 
+## Dashboard
+
+The Worker serves the dashboard's files itself, so opening it never starts the container. It is off
+until you choose an admin token:
+
+```bash
+export OPENCODEX_ADMIN_AUTH_TOKEN="$(openssl rand -hex 32)"   # save this value
+printf '%s' "$OPENCODEX_ADMIN_AUTH_TOKEN" | npx wrangler secret put OPENCODEX_ADMIN_AUTH_TOKEN
+printf '1' | npx wrangler secret put OCX_EXPOSE_MANAGEMENT_API
+```
+
+Set `hub.managementPublicOrigin` to the Worker's URL (for example in `OCX_BOOTSTRAP_CONFIG_JSON`),
+then open `https://opencodex.<your-subdomain>.workers.dev/`. The dashboard asks for the admin token
+and keeps it only in page memory, so it asks again after a reload.
+
+- `wrangler deploy` builds the dashboard first (`bun run build:gui`); `gui/dist` is uploaded as
+  static assets.
+- On `/api/*` the Worker accepts only the admin token; a data token there is refused before the
+  container starts. `ocx` checks the admin token again.
+- A keyless `GET /healthz`, which the dashboard polls for its status badge, returns the hub's health
+  while the container runs and `503 {"status":"sleeping"}` otherwise, without starting it.
+
 ## How state is kept
 
 The container's entrypoint is `docker/cloudflare-supervisor.ts`. It:
@@ -188,10 +210,10 @@ leaving it set does not wipe later boots.
   access to the bucket, and to the Cloudflare account, as access to those credentials.
 - The data token and any client keys are the only thing between the internet and your provider
   accounts. Use long random values.
-- The Worker keeps `/api/*` closed. To expose the management API anyway, set your own
-  `OPENCODEX_ADMIN_AUTH_TOKEN` (different from the data token) and `OCX_EXPOSE_MANAGEMENT_API=1`.
-  Anyone with that token can then administer the hub from the internet, so leave it closed unless
-  you need it.
+- The Worker keeps `/api/*` and the dashboard closed. To open them, set your own
+  `OPENCODEX_ADMIN_AUTH_TOKEN` (different from the data token) and `OCX_EXPOSE_MANAGEMENT_API=1`, as
+  in [Dashboard](#dashboard). Anyone with that token can then administer the hub from the internet,
+  so use a long random value and rotate it if it leaks; a rotation takes effect within seconds.
 - Do not put tokens in `wrangler.jsonc`; `vars` there are stored in plain text.
 - The Worker always sends requests to port `10100`; a client cannot reach any other port in the
   container.

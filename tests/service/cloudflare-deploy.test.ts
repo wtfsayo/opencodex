@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decideLease, isHolder, LEASE_STALE_MS, LeaseState, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
 import { handleStateRequest, snapshotPrefix, sweepOrphans, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
-import { containerEnv, edgeDecision, envFingerprint, isSupersededBy, forwardableRequest } from "../../deploy/cloudflare/src/container-env";
+import { containerEnv, dashboardEnabled, isAnonymousHealthCheck, DASHBOARD_BOOTSTRAP_META, edgeDecision, envFingerprint, isSupersededBy, forwardableRequest, servedByHub } from "../../deploy/cloudflare/src/container-env";
+import { repoPath } from "../helpers/repo-root";
 import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
@@ -272,6 +273,52 @@ describe("cloudflare worker edge", () => {
     } finally {
       console.warn = warn;
     }
+  });
+
+  test("the hub's own paths go to the container and everything else is the dashboard", () => {
+    for (const path of ["/v1", "/v1/models", "/v1/responses", "/api", "/api/config", "/healthz", "/readyz",
+      "/opencodex-session", "/remote-workspace/pair", "/backend-api/codex/responses"]) {
+      expect(servedByHub(path)).toBe(true);
+    }
+    for (const path of ["/", "/models", "/assets/index-abc123.js", "/favicon.svg", "/v1beta", "/apis", "/healthzz"]) {
+      expect(servedByHub(path)).toBe(false);
+    }
+  });
+
+  test("the management API accepts only the admin token at the edge", async () => {
+    const exposed = { OPENCODEX_API_AUTH_TOKEN: "data", OCX_EXPOSE_MANAGEMENT_API: "1", OPENCODEX_ADMIN_AUTH_TOKEN: "admin" };
+    const at = (path: string, key: string) => new Request(`https://hub.example${path}`, { headers: { authorization: `Bearer ${key}` } });
+    expect(await edgeDecision(at("/api/config", "admin"), exposed)).toEqual({ forward: true });
+    expect(await edgeDecision(at("/api/config", "data"), exposed)).toMatchObject({ forward: false, status: 401 });
+    expect(await edgeDecision(at("/v1/models", "data"), exposed)).toEqual({ forward: true });
+  });
+
+  test("only a keyless GET /healthz is an anonymous health check", () => {
+    const req = (path: string, init: RequestInit = {}) => new Request(`https://hub.example${path}`, init);
+    expect(isAnonymousHealthCheck(req("/healthz"))).toBe(true);
+    expect(isAnonymousHealthCheck(req("/healthz", { headers: { authorization: "Bearer data" } }))).toBe(false);
+    expect(isAnonymousHealthCheck(req("/healthz", { method: "POST" }))).toBe(false);
+    expect(isAnonymousHealthCheck(req("/readyz"))).toBe(false);
+    expect(isAnonymousHealthCheck(req("/healthz/"))).toBe(false);
+  });
+
+  test("the dashboard is served only when the operator opened management with their own admin token", () => {
+    expect(dashboardEnabled({ OPENCODEX_API_AUTH_TOKEN: "data" })).toBe(false);
+    expect(dashboardEnabled({ OPENCODEX_API_AUTH_TOKEN: "data", OCX_EXPOSE_MANAGEMENT_API: "1" })).toBe(false);
+    expect(dashboardEnabled({ OPENCODEX_API_AUTH_TOKEN: "data", OPENCODEX_ADMIN_AUTH_TOKEN: "admin" })).toBe(false);
+    expect(dashboardEnabled({ OPENCODEX_API_AUTH_TOKEN: "data", OCX_EXPOSE_MANAGEMENT_API: "1", OPENCODEX_ADMIN_AUTH_TOKEN: "admin" })).toBe(true);
+  });
+
+  test("the Worker adds the same bootstrap tags ocx adds to index.html", () => {
+    // Source oracle: if ocx renames either tag, the dashboard served by the Worker would silently
+    // stop asking for the admin token.
+    const guiStatic = readFileSync(repoPath("src/server/gui-static.ts"), "utf8");
+    for (const name of ["opencodex-runtime-role", "opencodex-management-auth-required"]) {
+      expect(guiStatic).toContain(`<meta name="${name}"`);
+      expect(DASHBOARD_BOOTSTRAP_META).toContain(`<meta name="${name}"`);
+    }
+    expect(DASHBOARD_BOOTSTRAP_META).toContain('content="hub"');
+    expect(DASHBOARD_BOOTSTRAP_META).toContain('opencodex-management-auth-required" content="1"');
   });
 
   test("a Durable Object is superseded only by a strictly newer Worker version", () => {

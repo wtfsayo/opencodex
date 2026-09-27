@@ -54,6 +54,16 @@ function destinationAllowed(baseUrl: string, localHosts: ReadonlySet<string>): b
   return url.protocol === "https:" && !url.username && !url.password && !PRIVATE_HOST.test(hostname) && !IP_LITERAL.test(hostname);
 }
 
+/**
+ * ocx's resolveEnvValue (src/config/proxy-env.ts) over the environment the container would have:
+ * `${NAME}` or `$NAME` names a variable, anything else is the key itself.
+ */
+function resolveKeyReference(value: string, secrets: Readonly<Record<string, string>>): string | undefined {
+  const name = /^\$\{(\w+)\}$/.exec(value)?.[1] ?? (value.startsWith("$") ? value.slice(1) : undefined);
+  if (name === undefined) return value;
+  return Object.prototype.hasOwnProperty.call(secrets, name) ? secrets[name] : undefined;
+}
+
 export type NativeChatRoute = { providerName: string; provider: OcxProviderConfig; modelId: string; requestedModel: string };
 
 /**
@@ -65,6 +75,7 @@ export function resolveNativeChatRoute(
   model: unknown,
   localHosts: ReadonlySet<string> = new Set(),
   why: (reason: string) => void = () => {},
+  secrets: Readonly<Record<string, string>> = {},
 ): NativeChatRoute | null {
   const no = (reason: string) => { why(reason); return null; };
   if (!isRec(config) || !isRec(config.providers) || typeof model !== "string") return no("config-or-model-shape");
@@ -89,11 +100,12 @@ export function resolveNativeChatRoute(
   if (provider.adapter !== "openai-chat") return no("adapter");
   if (provider.authMode !== undefined && provider.authMode !== "key") return no("auth-mode");
   if (typeof provider.baseUrl !== "string" || !destinationAllowed(provider.baseUrl, localHosts)) return no("destination");
-  // A literal key only: `keychain:` and `$NAME` / `${NAME}` references are resolved by ocx.
-  if (typeof provider.apiKey !== "string" || provider.apiKey.startsWith("$") || provider.apiKey.startsWith("keychain:")) return no("key-reference");
+  if (typeof provider.apiKey !== "string" || provider.apiKey.startsWith("keychain:")) return no("key-reference");
+  const apiKey = resolveKeyReference(provider.apiKey, secrets);
+  if (!apiKey) return no("key-reference-unset");
   const models = provider.models;
   if (!Array.isArray(models) || !models.includes(modelId) || models.includes(model)) return no("model-not-listed");
-  return { providerName, provider: provider as unknown as OcxProviderConfig, modelId, requestedModel: model };
+  return { providerName, provider: { ...provider, apiKey } as unknown as OcxProviderConfig, modelId, requestedModel: model };
 }
 
 /** The request fields ocx's native Chat lane refuses or reroutes, plus anything carrying an image. */
@@ -130,7 +142,7 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   if (!configText) return no("no-config-copy");
   let config: unknown;
   try { config = JSON.parse(configText); } catch { return no("config-not-json"); }
-  const route = resolveNativeChatRoute(config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no);
+  const route = resolveNativeChatRoute(config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets);
   if (!route) return null;
 
   const request = buildOpenAIChatPassthroughRequest(route.provider, body, route.modelId, true);

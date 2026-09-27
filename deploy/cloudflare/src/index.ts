@@ -1,6 +1,6 @@
 import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
 import {
-  chatAdmitsDataToken, containerEnv, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
+  chatAdmitsDataToken, containerEnv, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
 import { type DurableDocument, LeaseState } from "./lease";
@@ -230,7 +230,8 @@ async function tryWorkerNative(req: Request, env: Env): Promise<Response | { for
   const hub = getContainer(env.HUB, HUB_NAME);
   try {
     const served = await serveNativeChat(new TextDecoder().decode(bodyBytes), req.headers, req.signal, {
-      readConfig: async () => (await hub.readDocument("config"))?.body,
+      readConfig: async () => nativeConfigText((await hub.readDocument("config"))?.body, env),
+      secrets: containerEnv(env),
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
       fetch: request => fetch(request),
       onDecline: logDeclineOnce,

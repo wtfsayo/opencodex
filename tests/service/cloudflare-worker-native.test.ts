@@ -5,7 +5,7 @@ import { nativeChatBodyEligible, resolveNativeChatRoute, serveNativeChat } from 
 import { routeModel } from "../../src/router";
 import type { OcxConfig } from "../../src/types";
 import { handleWorkersAi, WORKERS_AI_HOST } from "../../deploy/cloudflare/src/workers-ai";
-import { chatAdmitsDataToken } from "../../deploy/cloudflare/src/container-env";
+import { chatAdmitsDataToken, containerEnv, nativeConfigText } from "../../deploy/cloudflare/src/container-env";
 import { repoRoot } from "../helpers/repo-root";
 
 // The Worker bundles this module and everything it reaches, dynamic imports included.
@@ -117,6 +117,7 @@ describe("Worker-native chat routing", () => {
       [config({}, { alias: "q" }), "p/m-1"],
       [config({}, { adapter: "anthropic" }), "p/m-1"],
       [config({}, { authMode: "oauth" }), "p/m-1"],
+      // Unset references: ocx would have no key either.
       [config({}, { apiKey: "${OPENAI_KEY}" }), "p/m-1"],
       [config({}, { apiKey: "$OPENAI_KEY" }), "p/m-1"],
       [config({}, { apiKey: "keychain:p" }), "p/m-1"],
@@ -142,6 +143,19 @@ describe("Worker-native chat routing", () => {
       [config({}, { baseUrl: "https://2130706433/v1" }), "p/m-1"],
     ];
     for (const [cfg, model] of declined) expect([model, resolveNativeChatRoute(cfg, model)]).toEqual([model, null]);
+  });
+
+  test("resolves ${NAME} and $NAME keys against the environment ocx would run with", () => {
+    const secrets = { OPENAI_KEY: "sk-from-secret" };
+    for (const apiKey of ["${OPENAI_KEY}", "$OPENAI_KEY"]) {
+      const route = resolveNativeChatRoute(config({}, { apiKey }), "p/m-1", new Set(), () => {}, secrets);
+      expect(route?.provider.apiKey).toBe("sk-from-secret");
+    }
+    expect(resolveNativeChatRoute(config({}, { apiKey: "${OTHER}" }), "p/m-1", new Set(), () => {}, secrets)).toBeNull();
+    // The config object itself is not rewritten with the secret.
+    const cfg = config({}, { apiKey: "${OPENAI_KEY}" });
+    resolveNativeChatRoute(cfg, "p/m-1", new Set(), () => {}, secrets);
+    expect(cfg.providers.p.apiKey).toBe("${OPENAI_KEY}");
   });
 
   test("takes only streamed, text-only turns the native lane would also take", () => {
@@ -245,6 +259,23 @@ describe("Worker-native chat admission", () => {
     expect(await chatAdmitsDataToken(req({ "sec-websocket-protocol": "opencodex-key.ZGF0YS10b2tlbg" }), env)).toBe(false);
     expect(await chatAdmitsDataToken(req({ "x-opencodex-api-key": "junk", authorization: "Bearer data-token" }), env)).toBe(false);
     expect(await chatAdmitsDataToken(req({}), env)).toBe(false);
+  });
+});
+
+describe("Worker-native config and secrets on a Worker-only deployment", () => {
+  test("the Durable Object's copy wins; before one exists, the bootstrap config is used", () => {
+    const env = { OCX_BOOTSTRAP_CONFIG_JSON: " {\"providers\":{}} " };
+    expect(nativeConfigText("{\"stored\":true}", env)).toBe("{\"stored\":true}");
+    expect(nativeConfigText(undefined, env)).toBe("{\"providers\":{}}");
+    expect(nativeConfigText(undefined, {})).toBeUndefined();
+  });
+
+  test("references resolve only to what the container would receive", () => {
+    const env = { OPENCODEX_API_AUTH_TOKEN: "t", OCX_PASSTHROUGH_SECRETS: "OPENAI_KEY,PATH", OPENAI_KEY: "sk", PATH: "/bin", UNLISTED: "x" };
+    const secrets = containerEnv(env as never);
+    expect(secrets.OPENAI_KEY).toBe("sk");
+    expect(secrets.PATH).toBeUndefined();
+    expect(secrets.UNLISTED).toBeUndefined();
   });
 });
 

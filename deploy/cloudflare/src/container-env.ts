@@ -43,6 +43,15 @@ export function containerEnv(env: SecretSource): Record<string, string> {
   return Object.fromEntries([...passthrough, ...Object.entries(fixed)].filter((entry): entry is [string, string] => !!entry[1]));
 }
 
+/**
+ * The config the Worker-native path routes with. The Durable Object's copy exists once the container
+ * has run (it publishes and mirrors config.json); before that, which on a Worker-only deployment is
+ * always, the operator's bootstrap config is exactly what the container would start from.
+ */
+export function nativeConfigText(stored: string | undefined, env: SecretSource): string | undefined {
+  return stored ?? (env.OCX_BOOTSTRAP_CONFIG_JSON?.trim() || undefined);
+}
+
 /** Changes whenever any value the container was started with changes; stores no secret. */
 export async function envFingerprint(env: Record<string, string>): Promise<string> {
   const canonical = JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)));

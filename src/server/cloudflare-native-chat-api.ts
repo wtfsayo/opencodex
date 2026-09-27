@@ -3,11 +3,13 @@
 // against Workers types, where the ocx modules behind the implementation do not typecheck.
 
 export type NativeChatDeps = {
-  /** The Durable Object's mirror of the hub's config.json, or undefined when it has none. */
+  /** The hub's config.json: the Durable Object's copy, or the bootstrap config before one exists. */
   readConfig(): Promise<string | undefined>;
   /** Upstream hosts answered inside the Worker (the Workers AI binding), by host name. */
   localHosts?: Record<string, (request: Request) => Promise<Response>>;
   fetch(request: Request): Promise<Response>;
+  /** The environment ocx would run with, for `${NAME}` key references; see containerEnv. */
+  secrets?: Readonly<Record<string, string>>;
   /** Why a request went to the container. Reasons name config keys and fields, never values. */
   onDecline?(reason: string): void;
 };

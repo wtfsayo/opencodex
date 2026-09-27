@@ -9,6 +9,8 @@ import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudfla
 import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, sendUpstream } from "./cloudflare-native-chat";
 import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { buildToolBridgeMaps } from "./responses/tool-bridge-maps";
+import { replaceSkillsBlock, singleSkillsBlock } from "./responses/skills-catalog";
+import { reasoningReplayConversationIdFromResponsesRequest, sessionIdHeaderFromRequest } from "./request-log-conversation";
 import { createOpenAIChatAdapterWith, type OpenAIChatAdapterDeps } from "../adapters/openai-chat/adapter";
 import { renameRoutedIdentityInContext } from "../adapters/identity";
 import { bridgeToResponsesSSE } from "../bridge/sse";
@@ -40,6 +42,41 @@ const SKILLS_BLOCK = "<skills_instructions>";
 // What Codex CLI 0.157 sends: {"type":"web_search","external_web_access":false}. Without the sidecar
 // ocx drops the tool whatever its options; other options stay with the container.
 const WEB_SEARCH_FIELDS = new Set(["type", "external_web_access"]);
+
+/** Every text in the body that ocx's catalog snapshot does not look at (user, assistant, tool text). */
+function nonCatalogText(body: Rec): unknown[] {
+  if (!Array.isArray(body.input)) return [];
+  return body.input.filter(item => !(isRec(item) && (item.type === undefined || item.type === "message")
+    && (item.role === "developer" || item.role === "system")));
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * skills-snapshot.ts for the Worker: the same scope (the session's own thread-id, else session-id;
+ * the parent-thread case is declined earlier), the same single-block rule, and first block wins.
+ * The data token is the only principal that reaches this path, so it needs no part in the key.
+ */
+async function freezeSkillsCatalog(body: Rec, headers: Headers, config: unknown, deps: NativeChatDeps): Promise<"decline" | undefined> {
+  const found = singleSkillsBlock(body);
+  if (!found) return undefined;
+  // A `skills` config section (which could select per_turn) is outside the Worker's config keys, so
+  // the default per_session applies here.
+  void config;
+  const conversation = reasoningReplayConversationIdFromResponsesRequest({
+    threadIdHeader: headers.get("thread-id")?.trim() || undefined,
+    sessionIdHeader: sessionIdHeaderFromRequest(headers),
+  });
+  if (!conversation) return undefined;
+  if (!deps.skillsSnapshot) return "decline";
+  const scope = await sha256Hex(JSON.stringify(["skills_catalog_snapshot_v1", conversation]));
+  const block = await deps.skillsSnapshot(scope, found.block);
+  if (block !== found.block) replaceSkillsBlock(found, block);
+  return undefined;
+}
 
 function hasHostedWebSearch(body: Rec): boolean {
   return Array.isArray(body.tools) && body.tools.some(tool => isRec(tool) && tool.type === "web_search");
@@ -96,8 +133,9 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
       if (item.type === "function_call_output" && typeof item.output !== "string") return "tool-output-shape";
     }
   }
-  // ocx substitutes a per-session skills snapshot for this block.
-  if (containsSkillsBlock(body.instructions) || containsSkillsBlock(body.input)) return "skills-instructions";
+  // A catalog anywhere but instructions or developer/system text is not one ocx would freeze, and
+  // not one this path has reasoned about.
+  if (containsSkillsBlock(nonCatalogText(body))) return "skills-instructions";
   if (isThreadSpawnRequest(headers) || headers.has("x-codex-parent-thread-id")) return "collaboration-turn";
   if (headers.has("x-opencodex-grok")) return "grok-surface";
   return undefined;
@@ -131,6 +169,11 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   const providers = (loaded.config as { providers: Record<string, unknown> }).providers;
   const openai = providers.openai;
   if (hasHostedWebSearch(body) && openai !== undefined && !(isRec(openai) && openai.disabled === true)) return no("web-search-sidecar");
+
+  // skills-snapshot.ts: a session's first catalog block is kept and substituted on later turns,
+  // before the body is parsed. The Worker keeps its own copy; see skillsSnapshot.
+  const frozen = await freezeSkillsCatalog(body, headers, loaded.config, deps);
+  if (frozen === "decline") return no("skills-snapshot-unavailable");
 
   let parsed;
   try { parsed = parseRequest(body); } catch { return no("parse"); }

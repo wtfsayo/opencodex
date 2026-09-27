@@ -4,6 +4,7 @@ import { createOpenAIChatAdapter, createOpenAIChatAdapterWith } from "../../src/
 import { parseRequest } from "../../src/responses/parser";
 import { createTranslatorBudget } from "../../src/lib/translator-budget";
 import { handleWorkersAi, WORKERS_AI_HOST } from "../../deploy/cloudflare/src/workers-ai";
+import { LeaseState, MAX_SKILLS_BLOCK_BYTES, MAX_SKILLS_SESSIONS, SKILLS_SNAPSHOT_TTL_MS, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
 
 const sse = (lines: string[]) => new Response(lines.join(""), { headers: { "content-type": "text/event-stream" } });
 const provider = { adapter: "openai-chat", baseUrl: "https://api.example.test/v1", apiKey: "sk-literal", models: ["m-1"] };
@@ -125,7 +126,8 @@ describe("Worker-native Responses", () => {
     expect(reason({ input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:," }] }] })).toBe("message-parts");
     expect(reason({ input: [{ type: "compaction", encrypted_content: "x" }] })).toBe("input-item");
     expect(reason({ input: [{ type: "function_call_output", call_id: "", output: "x" }] })).toBe("tool-call-id");
-    expect(reason({ instructions: "x <skills_instructions>y</skills_instructions>" })).toBe("skills-instructions");
+    expect(reason({ instructions: "x <skills_instructions>y</skills_instructions>" })).toBeUndefined();
+    expect(reason({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "<skills_instructions>y</skills_instructions>" }] }] })).toBe("skills-instructions");
     expect(reason({}, new Headers({ "x-codex-parent-thread-id": "t" }))).toBe("collaboration-turn");
     expect(reason({}, new Headers({ "x-opencodex-grok": "1" }))).toBe("grok-surface");
   });
@@ -192,6 +194,63 @@ describe("Worker-native Responses with Codex CLI's real tool list", () => {
     });
     expect(response).toBeNull();
     expect(reasons).toEqual(["responses:web-search-sidecar"]);
+  });
+});
+
+function memoryStorage(): LeaseStorage & { keys(): string[] } {
+  const map = new Map<string, unknown>();
+  return {
+    get: async <T>(key: string) => map.get(key) as T | undefined,
+    put: async (key, value) => { map.set(key, value); },
+    delete: async key => map.delete(key),
+    list: async <T>({ prefix, limit }: { prefix: string; limit: number }) =>
+      new Map([...map].filter(([key]) => key.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b)).slice(0, limit)) as Map<string, T>,
+    keys: () => [...map.keys()],
+  };
+}
+
+describe("Worker-native skills catalog freeze", () => {
+  const catalog = (skills: string) => `You are a coding agent.\n<skills_instructions>${skills}</skills_instructions>`;
+  const turnWith = (skills: string) => JSON.stringify(codexTurn("p/m-1", { instructions: catalog(skills), tools: [], tool_choice: "none" }));
+
+  async function sentInstructions(bodyText: string, headers: Headers, hub: LeaseState): Promise<string> {
+    let system = "";
+    const response = await serveNativeResponses(bodyText, headers, new AbortController().signal, {
+      readConfig: async () => externalConfig,
+      skillsSnapshot: (scope, incoming) => hub.skillsSnapshot(scope, incoming),
+      fetch: async request => {
+        const sent = await request.json() as { messages: { role: string; content: string }[] };
+        system = sent.messages.filter(message => message.role === "system").map(message => message.content).join("\n");
+        return sse(["data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n", "data: [DONE]\n\n"]);
+      },
+    });
+    await response!.text();
+    return system;
+  }
+
+  test("a session keeps its first catalog; another session and a keyless turn are left alone", async () => {
+    const hub = new LeaseState(memoryStorage());
+    const session = new Headers({ "thread-id": "thread-1" });
+    expect(await sentInstructions(turnWith("alpha"), session, hub)).toContain("<skills_instructions>alpha</skills_instructions>");
+    expect(await sentInstructions(turnWith("beta"), session, hub)).toContain("<skills_instructions>alpha</skills_instructions>");
+    expect(await sentInstructions(turnWith("beta"), new Headers({ "thread-id": "thread-2" }), hub)).toContain("<skills_instructions>beta</skills_instructions>");
+    expect(await sentInstructions(turnWith("gamma"), new Headers(), hub)).toContain("<skills_instructions>gamma</skills_instructions>");
+  });
+
+  test("the stored catalog expires after four idle hours, refuses oversized blocks, and bounds sessions", async () => {
+    let now = 0;
+    const storage = memoryStorage();
+    const hub = new LeaseState(storage, () => now);
+    expect(await hub.skillsSnapshot("s", "first")).toBe("first");
+    now += SKILLS_SNAPSHOT_TTL_MS - 1;
+    expect(await hub.skillsSnapshot("s", "second")).toBe("first");
+    now += SKILLS_SNAPSHOT_TTL_MS + 1;
+    expect(await hub.skillsSnapshot("s", "third")).toBe("third");
+    const big = "x".repeat(MAX_SKILLS_BLOCK_BYTES + 1);
+    expect(await hub.skillsSnapshot("big", big)).toBe(big);
+    expect(storage.keys().some(key => key.endsWith(":big"))).toBe(false);
+    for (let i = 0; i < MAX_SKILLS_SESSIONS + 5; i++) await hub.skillsSnapshot(`n${i}`, "b");
+    expect(storage.keys().filter(key => key.startsWith("ocx:skills-meta:")).length).toBeLessThanOrEqual(MAX_SKILLS_SESSIONS);
   });
 });
 

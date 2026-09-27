@@ -13,12 +13,12 @@
  */
 import type { OcxConfig, SkillsCatalogRefresh } from "../../types/config";
 import { isApiAuthRequired, resolveContextPrincipal, type DataPlaneAdmission } from "../auth-cors";
+import { replaceSkillsBlock, singleSkillsBlock } from "./skills-catalog";
 import {
   reasoningReplayConversationIdFromResponsesRequest,
   sessionIdHeaderFromRequest,
 } from "../request-log-conversation";
 
-const SKILLS_BLOCK_GLOBAL_REGEX = /<skills_instructions>([\s\S]*?)<\/skills_instructions>/g;
 
 /** Maximum distinct sessions tracked in the memory LRU. */
 export const MAX_SNAPSHOT_SESSIONS = 1000;
@@ -118,42 +118,6 @@ export function resolveSkillsSnapshotScopeKey(input: ResolveSkillsSessionScopeIn
   return JSON.stringify(["skills_catalog_snapshot_v1", principal, standaloneId]);
 }
 
-/** One text slot that may carry a catalog: `instructions` or a developer/system text part. */
-interface CatalogSlot {
-  text: string;
-  write(next: string): void;
-}
-
-/** Every developer/system text slot, walked the same way the replacement writes. */
-function catalogSlots(body: Record<string, unknown>): CatalogSlot[] {
-  const slots: CatalogSlot[] = [];
-  if (typeof body.instructions === "string") {
-    slots.push({ text: body.instructions, write: next => { body.instructions = next; } });
-  }
-  if (!Array.isArray(body.input)) return slots;
-  for (const item of body.input) {
-    if (!item || typeof item !== "object") continue;
-    const it = item as Record<string, unknown>;
-    // Restrict message item type: must be undefined or "message", so role-like tool objects are untouched
-    if (it.type !== undefined && it.type !== "message") continue;
-    // Only developer and system content is inspected/transformed
-    if (it.role !== "developer" && it.role !== "system") continue;
-    const content = it.content;
-    if (typeof content === "string") {
-      slots.push({ text: content, write: next => { it.content = next; } });
-    } else if (Array.isArray(content)) {
-      for (const part of content) {
-        if (!part || typeof part !== "object") continue;
-        const p = part as Record<string, unknown>;
-        // Restrict text parts to known text / input_text
-        if (p.type !== "text" && p.type !== "input_text") continue;
-        if (typeof p.text === "string") slots.push({ text: p.text, write: next => { p.text = next; } });
-      }
-    }
-  }
-  return slots;
-}
-
 function liveSnapshot(scopeKey: string, now: number): SnapshotEntry | undefined {
   const existing = snapshotCache.get(scopeKey);
   if (!existing) return undefined;
@@ -209,22 +173,12 @@ export function snapshotSkillsCatalogInBody(
   if (resolveSkillsCatalogRefresh(config) === "per_turn") return undefined;
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
 
-  let found: { slot: CatalogSlot; block: string } | undefined;
-  let blocks = 0;
-  for (const slot of catalogSlots(body as Record<string, unknown>)) {
-    if (!slot.text.includes("<skills_instructions>")) continue;
-    for (const match of slot.text.matchAll(SKILLS_BLOCK_GLOBAL_REGEX)) {
-      blocks++;
-      found ??= { slot, block: match[0] };
-    }
-  }
-  if (blocks !== 1 || !found) return undefined;
+  const found = singleSkillsBlock(body as Record<string, unknown>);
+  if (!found) return undefined;
 
   const existing = liveSnapshot(scopeKey, now);
   if (existing) {
-    const { slot, block } = found;
-    const at = slot.text.indexOf(block);
-    slot.write(slot.text.slice(0, at) + existing.skillsBlock + slot.text.slice(at + block.length));
+    replaceSkillsBlock(found, existing.skillsBlock);
     return undefined;
   }
   const incoming = found.block;

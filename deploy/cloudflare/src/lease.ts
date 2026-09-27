@@ -37,6 +37,16 @@ const USAGE_SEQ_KEY = "ocx:usage-seq";
 export const MAX_QUEUED_USAGE = 20_000;
 const usageKey = (seq: number) => `${USAGE_KEY_PREFIX}${String(seq).padStart(12, "0")}`;
 
+// The Worker's copy of ocx's per-session skills-catalog snapshot (src/server/responses/skills-snapshot.ts):
+// the same TTL, per-block limit and session bound, in storage because a Worker has no process to
+// hold them. Metadata sits apart from the blocks so pruning reads only small rows.
+const SKILLS_BLOCK_PREFIX = "ocx:skills:";
+const SKILLS_META_PREFIX = "ocx:skills-meta:";
+export const SKILLS_SNAPSHOT_TTL_MS = 4 * 60 * 60 * 1000;
+export const MAX_SKILLS_BLOCK_BYTES = 512 * 1024;
+export const MAX_SKILLS_SESSIONS = 1000;
+type SkillsMeta = { lastAccessed: number };
+
 const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
 const DOCUMENT_KEY_PREFIX = "ocx:document:";
@@ -90,10 +100,12 @@ export class LeaseState {
     const discarded = await this.storage.get<string>(SNAPSHOT_KEY);
     await this.storage.delete(SNAPSHOT_KEY);
     for (const name of DURABLE_DOCUMENTS) await this.storage.delete(DOCUMENT_KEY_PREFIX + name);
-    for (;;) {
-      const queued = await this.storage.list({ prefix: USAGE_KEY_PREFIX, limit: 1000 });
-      if (queued.size === 0) break;
-      for (const key of queued.keys()) await this.storage.delete(key);
+    for (const prefix of [USAGE_KEY_PREFIX, SKILLS_META_PREFIX, SKILLS_BLOCK_PREFIX]) {
+      for (;;) {
+        const queued = await this.storage.list({ prefix, limit: 1000 });
+        if (queued.size === 0) break;
+        for (const key of queued.keys()) await this.storage.delete(key);
+      }
     }
     await this.storage.delete(LEASE_KEY);
     return discarded;
@@ -145,5 +157,44 @@ export class LeaseState {
     if (!(await this.holdsLease(bootId))) return false;
     for (const seq of seqs) if (Number.isSafeInteger(seq) && seq > 0) await this.storage.delete(usageKey(seq));
     return true;
+  }
+
+  /**
+   * The catalog block this session is frozen to: the stored one while it is live (its expiry
+   * slides), otherwise `incoming`, which becomes the stored one. `scope` is already a digest.
+   */
+  async skillsSnapshot(scope: string, incoming: string): Promise<string> {
+    const now = this.now();
+    const meta = await this.storage.get<SkillsMeta>(SKILLS_META_PREFIX + scope);
+    if (meta && now - meta.lastAccessed <= SKILLS_SNAPSHOT_TTL_MS) {
+      const block = await this.storage.get<string>(SKILLS_BLOCK_PREFIX + scope);
+      if (block !== undefined) {
+        await this.storage.put<SkillsMeta>(SKILLS_META_PREFIX + scope, { lastAccessed: now });
+        return block;
+      }
+    }
+    if (new TextEncoder().encode(incoming).byteLength > MAX_SKILLS_BLOCK_BYTES) return incoming;
+    await this.pruneSkills(now);
+    await this.storage.put(SKILLS_BLOCK_PREFIX + scope, incoming);
+    await this.storage.put<SkillsMeta>(SKILLS_META_PREFIX + scope, { lastAccessed: now });
+    return incoming;
+  }
+
+  /** Drops expired sessions, then the least recently used until there is room for one more. */
+  private async pruneSkills(now: number): Promise<void> {
+    const metas = await this.storage.list<SkillsMeta>({ prefix: SKILLS_META_PREFIX, limit: MAX_SKILLS_SESSIONS + 50 });
+    const live: [string, number][] = [];
+    for (const [key, meta] of metas) {
+      const scope = key.slice(SKILLS_META_PREFIX.length);
+      if (now - meta.lastAccessed > SKILLS_SNAPSHOT_TTL_MS) await this.dropSkills(scope);
+      else live.push([scope, meta.lastAccessed]);
+    }
+    live.sort((a, b) => a[1] - b[1]);
+    while (live.length >= MAX_SKILLS_SESSIONS) await this.dropSkills(live.shift()![0]);
+  }
+
+  private async dropSkills(scope: string): Promise<void> {
+    await this.storage.delete(SKILLS_META_PREFIX + scope);
+    await this.storage.delete(SKILLS_BLOCK_PREFIX + scope);
   }
 }

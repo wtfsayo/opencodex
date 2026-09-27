@@ -160,4 +160,6 @@ are not run by the Worker and not declined (not reachable on Cloudflare today); 
 misses non-literal `import(x)` and its comment stripping ignores strings; CI never bundles the
 Worker, so a module-scope incompatibility in the reused code shows up only at deploy time. Fixed
 from that review: redirects are `manual` as in ocx, a 200 s header timeout as ocx's default,
-empty `messages` declined, and `appOwnedMemoryBudgetMb` removed from the allowlist.
+and empty `messages` declined. `appOwnedMemoryBudgetMb` was removed from the allowlist, which made
+the test hub (whose config sets it) decline every turn; tracing showed no module on the native chat
+lane consults it (it bounds the container process's retained state), so it was allowed again.

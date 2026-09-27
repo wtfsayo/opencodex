@@ -31,6 +31,9 @@ const CONFIG_KEYS = new Set([
   "codexAccountPickerEnabled", "catalogAutoRefresh", "quotaResetNotify", "remoteGui", "metricsExport",
   "openaiProviderTierVersion", "googleAntigravityStaticCatalogVersion", "subagentModelsVersion",
   "multiAgentSurfaceAdvisoryVersion", "apiKeys", "subagentModels",
+  // Caps the retained state (logs, caches, continuations) of the container process; no module on
+  // the native chat lane consults it, so it shapes the container's load, not this turn.
+  "appOwnedMemoryBudgetMb",
 ]);
 const RESERVED_NAMESPACES = new Set(["policy", "combo"]);
 // chat-native.ts: config.connectTimeoutMs ?? 200_000; a config that sets it is declined.

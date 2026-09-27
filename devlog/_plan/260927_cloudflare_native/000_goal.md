@@ -163,3 +163,26 @@ from that review: redirects are `manual` as in ocx, a 200 s header timeout as oc
 and empty `messages` declined. `appOwnedMemoryBudgetMb` was removed from the allowlist, which made
 the test hub (whose config sets it) decline every turn; tracing showed no module on the native chat
 lane consults it (it bounds the container process's retained state), so it was allowed again.
+
+## Phase 5 progress (2026-09-28): Worker-only serving
+
+Branch `feat/cloudflare-worker-only`, stacked on `feat/cloudflare-worker-native`.
+
+- Config: the Worker routes with the Durable Object's copy, or `OCX_BOOTSTRAP_CONFIG_JSON` before
+  the container has ever run, and resolves `${NAME}` keys against `containerEnv(env)`, the exact
+  environment the container would get.
+- Chat: non-streamed turns too, following chat-native.ts from the upstream response on.
+- Usage: rows queued in the Durable Object (20,000 max), drained into usage.jsonl by ocx at startup
+  and each minute through appendUsageEntry; at-least-once.
+- Responses: `/v1/responses` for openai-chat providers, reusing `parseRequest`, the openai-chat
+  adapter and `bridgeToResponsesSSE`. Getting there took moving disk-backed state out of their
+  import graphs without changing proxy behaviour: a thought-signature slot the disk store registers
+  into, the replay-prefix WeakMap in its own module, the adapter taking effort mapping and image
+  normalization as dependencies, and `buildToolBridgeMaps` in its own module. An exploration
+  traced the container's path for eligible turns (request-prepare, core-normalize, dispatch,
+  delivery); the Worker reproduces its pure steps (routed model id, identity rename,
+  hideThinkingSummary) and declines where it is stateful (skills snapshot, stored responses,
+  effort ladders, collaboration, code mode, namespaces, images). Both guards are off for these
+  turns (terminal: provider opt-in; empty completion: config opt-in).
+- Not reproduced, by design: `/v1/models` (upstream discovery and the Codex catalog template),
+  `/v1/messages`, WebSocket Responses. Those still start the container.

@@ -146,7 +146,7 @@ internal address and name models without the `@cf/` prefix:
 tools or images rather than dropping them. Workers AI retires models over time; list current ones in
 the dashboard under **AI → Workers AI → Models**.
 
-## Worker-native Chat Completions (experimental)
+## Worker-native requests (experimental)
 
 Setting `OCX_WORKER_NATIVE` to `1` lets the Worker answer some `/v1/chat/completions` requests
 itself, without the container. That removes the Worker-to-container hop from each turn
@@ -175,6 +175,12 @@ The Worker serves a request only when all of these hold, and otherwise passes it
 
 When the Worker passes a request on, it logs why once per reason (for example
 `Worker-native chat declined: config-keys:<names>`); `npx wrangler tail` shows it.
+
+It also answers `POST /v1/responses`, the API Codex uses, for the same providers when the turn is
+streamed, not stored (`"store": false`, as Codex sends it), sets no reasoning effort, and uses only
+`function` tools (no MCP namespaces, web search, code-mode `exec`, or multi-agent tools), with
+text-only messages and no `<skills_instructions>` block. Workers AI takes no tools, so a Codex turn
+against a Workers AI model goes to `ocx`, which gets the same refusal.
 
 If the provider returns an error status, the Worker sends the request to `ocx` instead, which
 retries and reports it as usual; the provider then sees that request twice. An answer with a 200

@@ -4,10 +4,10 @@
 // ocx's, and any request or config this does not fully understand returns null so the Worker
 // forwards it untouched to the container, which stays the reference implementation.
 //
-// It runs in the Cloudflare Worker (deploy/cloudflare/src/index.ts, which reaches it through the
-// "ocx-worker-native" alias and typechecks against ./cloudflare-native-chat-api.ts). Its
+// It runs in the Cloudflare Worker (deploy/cloudflare/src/index.ts, which reaches it through
+// cloudflare-native.ts and typechecks against ./cloudflare-native-chat-api.ts). Its
 // import graph is held free of Bun, node:fs and friends by tests/service/cloudflare-worker-native.test.ts.
-import type { ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
+import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
 import { buildOpenAIChatPassthroughRequest } from "../adapters/openai-chat/passthrough";
 import { jsonCompletionSse, nativeChatSse, structuredError, usageFromChat } from "./chat-native-sse";
 import { chatCompletionsErrorResponse, collectChatCompletion, isChatCompletionsStreamError } from "../chat/outbound";
@@ -155,21 +155,7 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
     route.provider, body, route.modelId, requestedStream,
     fastPolicyForModel(route.provider, route.modelId, route.providerName, "chat"),
   );
-  // As ocx sends it (sendWithConnectionPolicy): a redirect is an error, never followed with the key,
-  // and headers must arrive within ocx's default connect timeout.
-  const headerDeadline = new AbortController();
-  const timer = setTimeout(() => headerDeadline.abort(new Error("upstream headers timed out")), HEADER_TIMEOUT_MS);
-  const upstreamRequest = new Request(request.url, {
-    method: request.method, headers: request.headers, body: request.body, redirect: "manual",
-    signal: AbortSignal.any([signal, headerDeadline.signal]),
-  });
-  const local = deps.localHosts?.[new URL(request.url).host];
-  let upstream: Response;
-  try {
-    upstream = local ? await local(upstreamRequest) : await deps.fetch(upstreamRequest);
-  } finally {
-    clearTimeout(timer);
-  }
+  const upstream = await sendUpstream(request, signal, deps);
   if (!upstream.ok || !upstream.body) {
     await upstream.body?.cancel();
     return no(`upstream-${upstream.status}`);
@@ -261,6 +247,37 @@ function recordAtEnd(stream: ReadableStream<Uint8Array>, done: () => void): Read
       return reader.cancel(reason);
     },
   });
+}
+
+/**
+ * Sends a built adapter request as ocx does (sendWithConnectionPolicy): a redirect is an error,
+ * never followed with the key, and headers must arrive within ocx's default connect timeout. Hosts
+ * the Worker answers itself (Workers AI) never leave it.
+ */
+export async function sendUpstream(
+  request: { url: string; method: string; headers: Record<string, string>; body: string },
+  signal: AbortSignal,
+  deps: Pick<NativeChatDeps, "fetch" | "localHosts">,
+): Promise<Response> {
+  const headerDeadline = new AbortController();
+  const timer = setTimeout(() => headerDeadline.abort(new Error("upstream headers timed out")), HEADER_TIMEOUT_MS);
+  const upstreamRequest = new Request(request.url, {
+    method: request.method, headers: request.headers, body: request.body, redirect: "manual",
+    signal: AbortSignal.any([signal, headerDeadline.signal]),
+  });
+  const local = deps.localHosts?.[new URL(request.url).host];
+  try {
+    return local ? await local(upstreamRequest) : await deps.fetch(upstreamRequest);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The hub config as the Worker routes with it, or a decline reason. */
+export async function loadNativeConfig(deps: Pick<NativeChatDeps, "readConfig">): Promise<{ config: unknown } | { decline: string }> {
+  const configText = await deps.readConfig();
+  if (!configText) return { decline: "no-config-copy" };
+  try { return { config: JSON.parse(configText) }; } catch { return { decline: "config-not-json" }; }
 }
 
 const SSE_HEADERS = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" };

@@ -5,7 +5,7 @@ import {
 } from "./container-env";
 import { type DurableDocument, LeaseState } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
-import { serveNativeChat } from "ocx-worker-native";
+import { serveNativeChat, serveNativeResponses } from "ocx-worker-native";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
@@ -223,7 +223,12 @@ const NATIVE_MAX_BODY_BYTES = 4 * 1024 * 1024;
  */
 async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): Promise<Response | { forward: Request } | null> {
   if (env.OCX_WORKER_NATIVE?.trim() !== "1" || env.OCX_EDGE_KEY_CHECK?.trim() === "presence") return null;
-  if (req.method !== "POST" || new URL(req.url).pathname !== "/v1/chat/completions") return null;
+  const path = new URL(req.url).pathname;
+  const serve = req.method !== "POST" ? undefined
+    : path === "/v1/chat/completions" ? serveNativeChat
+    : path === "/v1/responses" ? serveNativeResponses
+    : undefined;
+  if (!serve) return null;
   // ocx decompresses gzip and zstd bodies; this path would have to as well, so leave them to it.
   if (req.headers.has("content-encoding")) return null;
   const length = Number(req.headers.get("content-length"));
@@ -232,7 +237,7 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   const bodyBytes = await req.arrayBuffer();
   const hub = getContainer(env.HUB, HUB_NAME);
   try {
-    const served = await serveNativeChat(new TextDecoder().decode(bodyBytes), req.headers, req.signal, {
+    const served = await serve(new TextDecoder().decode(bodyBytes), req.headers, req.signal, {
       readConfig: async () => nativeConfigText((await hub.readDocument("config"))?.body, env),
       secrets: containerEnv(env),
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
@@ -244,7 +249,7 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
     });
     if (served) return served;
   } catch (error) {
-    console.error(`Worker-native chat declined after an error: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`Worker-native request declined after an error: ${error instanceof Error ? error.message : String(error)}`);
   }
   // Nobody is waiting for an answer, so do not wake the container to produce one.
   if (req.signal.aborted) return new Response(null, { status: 499 });

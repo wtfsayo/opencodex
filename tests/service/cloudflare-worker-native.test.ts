@@ -12,17 +12,23 @@ import type { WorkerUsageRow } from "../../src/server/cloudflare-native-chat-api
 import { repoRoot } from "../helpers/repo-root";
 
 // The Worker bundles this module and everything it reaches, dynamic imports included.
-const ENTRY = "src/server/cloudflare-native-chat.ts";
+const ENTRY = "src/server/cloudflare-native.ts";
 // Provided by the Workers runtime under the nodejs_compat flag set in wrangler.jsonc. The bare
 // `crypto` and `zlib` forms come from Devin adapter code the provider registry pulls in; the
 // deployed Worker loads them, and nothing on this path calls into them.
-const ALLOWED_NODE = new Set(["node:buffer", "node:crypto", "crypto", "zlib"]);
+const ALLOWED_NODE = new Set(["node:buffer", "node:crypto", "node:path", "crypto", "zlib"]);
+// Pure-JS packages the Worker bundle inlines: the Responses parser validates requests with zod.
+const BUNDLED_PACKAGES = new Set(["zod", "zod/v4"]);
+// Files that name Bun only inside a function the Worker never calls. code-mode-shell-input parses
+// Codex's code-mode `exec` input with Bun's transpiler; the Worker declines any turn declaring `exec`.
+const LAZY_BUN = new Set(["src/responses/code-mode-shell-input.ts"]);
 // ocx's stateful owners: config on disk, routing state, logs, credentials, the spend ledger.
 const FORBIDDEN_MODULES = [
   "src/config.ts", "src/router.ts", "src/server/request-log.ts", "src/server/lifecycle.ts",
   "src/usage/log.ts", "src/oauth/store.ts", "src/codex/account-store.ts", "src/lib/spend-reservation-ledger.ts", "src/storage/",
 ];
-const MAX_CLOSURE = 80;
+// The Responses path brings the request parser, the openai-chat adapter and the SSE bridge.
+const MAX_CLOSURE = 140;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {
@@ -38,14 +44,14 @@ function closure(entry: string) {
   while (queue.length) {
     const file = queue.shift()!;
     const source = readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-    if (/\bBun\b/.test(source)) problems.push(`Bun in ${chain(file)}`);
+    if (/\bBun\b/.test(source) && !LAZY_BUN.has(relative(root, file))) problems.push(`Bun in ${chain(file)}`);
     if (/\brequire\s*\(|\bimport\s+\w+\s*=\s*require\b|\bimport\s*\(\s*`/.test(source)) problems.push(`require() or a computed import in ${chain(file)}`);
     for (const match of source.matchAll(IMPORT_RE)) {
       const spec = match[1] ?? match[2] ?? match[3] ?? match[4]!;
       // Every package, bare built-in ("fs") and node: module is refused unless listed: the Worker
       // bundle has no node_modules of its own to fall back on.
       if (!spec.startsWith(".")) {
-        if (!ALLOWED_NODE.has(spec)) problems.push(`${spec} in ${chain(file)}`);
+        if (!ALLOWED_NODE.has(spec) && !BUNDLED_PACKAGES.has(spec)) problems.push(`${spec} in ${chain(file)}`);
         continue;
       }
       const base = resolve(dirname(file), spec.replace(/\.js$/, ""));

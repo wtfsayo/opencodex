@@ -155,6 +155,8 @@ function memoryStorage(): LeaseStorage {
     get: async <T>(key: string) => map.get(key) as T | undefined,
     put: async (key, value) => { map.set(key, value); },
     delete: async key => map.delete(key),
+    list: async <T>({ prefix, limit }: { prefix: string; limit: number }) =>
+      new Map([...map].filter(([key]) => key.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b)).slice(0, limit)) as Map<string, T>,
   };
 }
 

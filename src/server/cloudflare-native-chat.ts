@@ -7,15 +7,15 @@
 // It runs in the Cloudflare Worker (deploy/cloudflare/src/index.ts, which reaches it through the
 // "ocx-worker-native" alias and typechecks against ./cloudflare-native-chat-api.ts). Its
 // import graph is held free of Bun, node:fs and friends by tests/service/cloudflare-worker-native.test.ts.
-import type { ServeNativeChat } from "./cloudflare-native-chat-api";
+import type { ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
 import { buildOpenAIChatPassthroughRequest } from "../adapters/openai-chat/passthrough";
-import { jsonCompletionSse, nativeChatSse, structuredError } from "./chat-native-sse";
+import { jsonCompletionSse, nativeChatSse, structuredError, usageFromChat } from "./chat-native-sse";
 import { chatCompletionsErrorResponse, collectChatCompletion, isChatCompletionsStreamError } from "../chat/outbound";
 import { redactSecretString } from "../lib/redact";
 import { fastPolicyForModel } from "../providers/service-tier";
 import { chatCollabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { createTranslatorBudget } from "../lib/translator-budget";
-import type { OcxConfig, OcxProviderConfig } from "../types";
+import type { OcxConfig, OcxProviderConfig, OcxUsage } from "../types";
 import { PROVIDER_REGISTRY } from "../providers/registry";
 
 type Rec = Record<string, unknown>;
@@ -135,6 +135,7 @@ export function nativeChatBodyEligible(body: Rec): boolean {
  * byte reaches the client: the container's lane owns retries, key failover and error shaping.
  */
 export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal, deps) => {
+  const startedAt = Date.now();
   let body: unknown;
   const no = (reason: string) => { deps.onDecline?.(reason); return null; };
   try { body = JSON.parse(bodyText); } catch { return no("body-not-json"); }
@@ -174,8 +175,26 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
     return no(`upstream-${upstream.status}`);
   }
   const translatorBudget = createTranslatorBudget();
-  const fail = (status: number, message: string, type?: string, code?: string | null) =>
-    chatCompletionsErrorResponse(status, redactSecretString(message), type, code);
+  let usage: OcxUsage | undefined;
+  let firstOutputAt: number | undefined;
+  const record = (status: number) => deps.recordUsage?.({
+    requestId: crypto.randomUUID(),
+    timestamp: startedAt,
+    provider: route.providerName,
+    model: route.modelId,
+    requestedModel: route.requestedModel,
+    inboundProtocol: "chat",
+    admissionKind: "environment",
+    status,
+    durationMs: Date.now() - startedAt,
+    ...(firstOutputAt !== undefined ? { firstOutputMs: firstOutputAt - startedAt } : {}),
+    usageStatus: usage ? "reported" : "unreported",
+    ...(usage ? { usage: usage as NonNullable<WorkerUsageRow["usage"]>, totalTokens: usage.totalTokens ?? usage.inputTokens + usage.outputTokens } : {}),
+  });
+  const fail = (status: number, message: string, type?: string, code?: string | null) => {
+    record(status);
+    return chatCompletionsErrorResponse(status, redactSecretString(message), type, code);
+  };
 
   // The rest follows chat-native.ts from the upstream response on. The request has been sent, so
   // from here an error is answered, not handed to the container, which would send it again.
@@ -185,12 +204,15 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
       translatorBudget,
       signal,
       stallTimeoutSec: (config as Pick<OcxConfig, "stallTimeoutSec">).stallTimeoutSec,
-      onUsage: () => {},
+      onFirstOutput: () => { firstOutputAt ??= Date.now(); },
+      onUsage: reported => { usage = reported; },
     });
     // As chat-native.ts answers; Connection is hop-by-hop and the Workers runtime owns it.
-    if (requestedStream) return new Response(stream, { headers: SSE_HEADERS });
+    if (requestedStream) return new Response(recordAtEnd(stream, () => record(200)), { headers: SSE_HEADERS });
     try {
-      return Response.json(await collectChatCompletion(stream, route.requestedModel, translatorBudget));
+      const completion = await collectChatCompletion(stream, route.requestedModel, translatorBudget);
+      record(200);
+      return Response.json(completion);
     } catch (error) {
       if (signal.aborted) return fail(499, "Client cancelled request", "client_cancelled");
       if (isChatCompletionsStreamError(error)) return fail(error.status, error.message, error.type, error.code);
@@ -206,10 +228,40 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   if (!isRec(parsed) || !Array.isArray(parsed.choices) || parsed.choices.length === 0) {
     return fail(502, "upstream response contained no choices", "upstream_error");
   }
+  usage = usageFromChat(parsed.usage);
+  firstOutputAt = Date.now();
+  record(200);
   return requestedStream
     ? new Response(jsonCompletionSse(parsed, route.requestedModel, translatorBudget), { headers: SSE_HEADERS })
     : new Response(JSON.stringify(parsed), { headers: { "content-type": "application/json" } });
 };
+
+/** Passes the stream through and calls `done` once it ends, however it ends. */
+function recordAtEnd(stream: ReadableStream<Uint8Array>, done: () => void): ReadableStream<Uint8Array> {
+  let called = false;
+  const once = () => { if (!called) { called = true; done(); } };
+  const reader = stream.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done: finished, value } = await reader.read();
+        if (finished) {
+          once();
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        once();
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      once();
+      return reader.cancel(reason);
+    },
+  });
+}
 
 const SSE_HEADERS = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" };
 // chat-native.ts's MAX_NATIVE_CHAT_JSON_BYTES.

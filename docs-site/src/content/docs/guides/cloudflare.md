@@ -180,8 +180,10 @@ If the provider returns an error status, the Worker sends the request to `ocx` i
 retries and reports it as usual; the provider then sees that request twice. An answer with a 200
 status is relayed or reported by the Worker itself, as `ocx` would.
 
-Turns the Worker serves are not recorded in usage history or request logs, and they do not count
-toward anything `ocx` accounts for. The Worker reads the provider settings from the copy of
+Turns the Worker serves are queued in the Durable Object and added to usage history when `ocx`
+next runs (at startup, then every minute), so the Usage page shows them once the container is up.
+The queue holds the latest 20,000 turns. They do not appear in request logs, and they do not count
+toward spend ceilings (a config with a `spend` section is never served by the Worker). The Worker reads the provider settings from the copy of
 `config.json` kept in the Durable Object, which the container updates whenever settings change;
 until the container has run once, it uses `OCX_BOOTSTRAP_CONFIG_JSON`. So a deployment whose
 clients only make qualifying requests never starts the container at all.

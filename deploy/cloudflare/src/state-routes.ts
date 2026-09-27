@@ -13,6 +13,8 @@ export interface StateHub {
   commitSnapshot(bootId: string, key: string): Promise<{ replaced: string | undefined } | null>;
   readDocument(name: DurableDocument): Promise<StoredDocument | undefined>;
   commitDocument(bootId: string, name: DurableDocument, body: string, seq: number): Promise<DocumentCommit>;
+  peekUsage(bootId: string, limit: number): Promise<{ seq: number; row: unknown }[] | null>;
+  ackUsage(bootId: string, seqs: readonly number[]): Promise<boolean>;
 }
 
 export interface StateBucket {
@@ -95,6 +97,17 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     }
     if (commit.replaced) await bucket.delete(commit.replaced);
     return new Response(null, { status: 204 });
+  }
+  if (path === "/usage-inbox" && req.method === "GET") {
+    const limit = Math.min(500, Math.max(1, Number(new URL(req.url).searchParams.get("limit")) || 500));
+    const rows = await hub.peekUsage(bootId, limit);
+    return rows ? Response.json({ rows }) : new Response("lease required", { status: 409 });
+  }
+  if (path === "/usage-inbox/ack" && req.method === "POST") {
+    let seqs: unknown;
+    try { seqs = ((await req.json()) as { seqs?: unknown }).seqs; } catch { seqs = undefined; }
+    if (!Array.isArray(seqs) || seqs.length > 500 || !seqs.every(seq => Number.isSafeInteger(seq))) return new Response("seqs required", { status: 400 });
+    return (await hub.ackUsage(bootId, seqs as number[])) ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
   }
   const document = /^\/documents\/([a-z-]+)$/.exec(path)?.[1];
   if (document !== undefined) {

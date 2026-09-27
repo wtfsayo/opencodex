@@ -10,9 +10,32 @@ export type NativeChatDeps = {
   fetch(request: Request): Promise<Response>;
   /** The environment ocx would run with, for `${NAME}` key references; see containerEnv. */
   secrets?: Readonly<Record<string, string>>;
+  /** Called once per served turn, after its last byte; the Worker queues it for ocx's usage log. */
+  recordUsage?(row: WorkerUsageRow): void;
   /** Why a request went to the container. Reasons name config keys and fields, never values. */
   onDecline?(reason: string): void;
 };
 
 /** Serves the turn, or returns null to hand the request (with `bodyText`) to the container. */
 export type ServeNativeChat = (bodyText: string, headers: Headers, signal: AbortSignal, deps: NativeChatDeps) => Promise<Response | null>;
+
+/**
+ * A usage-log row for a turn the Worker served: the fields of ocx's PersistedUsageEntry
+ * (src/usage/log.ts) this path knows. ocx appends it through appendUsageEntry when it next runs.
+ */
+export type WorkerUsageRow = {
+  requestId: string;
+  timestamp: number;
+  provider: string;
+  model: string;
+  requestedModel: string;
+  inboundProtocol: "chat" | "responses";
+  admissionKind: "environment";
+  status: number;
+  durationMs: number;
+  firstOutputMs?: number;
+  usageStatus: "reported" | "unreported";
+  usage?: { inputTokens: number; outputTokens: number } & Record<string, unknown>;
+  totalTokens?: number;
+};
+

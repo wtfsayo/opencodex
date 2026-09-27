@@ -6,6 +6,9 @@ import { routeModel } from "../../src/router";
 import type { OcxConfig } from "../../src/types";
 import { handleWorkersAi, WORKERS_AI_HOST } from "../../deploy/cloudflare/src/workers-ai";
 import { chatAdmitsDataToken, containerEnv, nativeConfigText } from "../../deploy/cloudflare/src/container-env";
+import { LeaseState, MAX_QUEUED_USAGE, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
+import { handleStateRequest } from "../../deploy/cloudflare/src/state-routes";
+import type { WorkerUsageRow } from "../../src/server/cloudflare-native-chat-api";
 import { repoRoot } from "../helpers/repo-root";
 
 // The Worker bundles this module and everything it reaches, dynamic imports included.
@@ -311,6 +314,67 @@ describe("Worker-native config and secrets on a Worker-only deployment", () => {
     expect(secrets.OPENAI_KEY).toBe("sk");
     expect(secrets.PATH).toBeUndefined();
     expect(secrets.UNLISTED).toBeUndefined();
+  });
+});
+
+function memoryStorage(): LeaseStorage & { size(): number } {
+  const map = new Map<string, unknown>();
+  return {
+    get: async <T>(key: string) => map.get(key) as T | undefined,
+    put: async (key, value) => { map.set(key, value); },
+    delete: async key => map.delete(key),
+    list: async <T>({ prefix, limit }: { prefix: string; limit: number }) =>
+      new Map([...map].filter(([key]) => key.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b)).slice(0, limit)) as Map<string, T>,
+    size: () => map.size,
+  };
+}
+
+describe("Worker-served usage", () => {
+  test("a served turn produces one usage row in ocx's shape", async () => {
+    const rows: WorkerUsageRow[] = [];
+    const ai = { run: async () => sse(["data: {\"response\":\"Pong\"}\n\n", "data: {\"response\":\"\",\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n", "data: [DONE]\n\n"]).body! };
+    const response = await serveNativeChat(turn, new Headers(), new AbortController().signal, {
+      readConfig: async () => workersAiConfig,
+      localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, ai) },
+      fetch: async () => { throw new Error("unexpected"); },
+      recordUsage: row => rows.push(row),
+    });
+    expect(rows).toEqual([]);
+    await response!.text();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ provider: "workers-ai", model: "meta/llama", requestedModel: "workers-ai/meta/llama", inboundProtocol: "chat", admissionKind: "environment", status: 200 });
+    expect(rows[0]!.requestId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test("the Durable Object queues rows for the lease holder only, caps them, and forgets them on reset", async () => {
+    const holder = "a".repeat(32);
+    const storage = memoryStorage();
+    const hub = new LeaseState(storage, () => 0);
+    await hub.acquireLease(holder);
+    for (let i = 0; i < 3; i++) await hub.enqueueUsage({ n: i });
+    const get = (bootId: string) => handleStateRequest(new Request("http://state.ocx.internal/usage-inbox?limit=2", { headers: { "x-ocx-boot-id": bootId } }), hub, { get: async () => null, put: async () => {}, delete: async () => {}, list: async () => [] }, "ns");
+    expect((await get("b".repeat(32))).status).toBe(409);
+    const first = await (await get(holder)).json() as { rows: { seq: number; row: { n: number } }[] };
+    expect(first.rows.map(item => [item.seq, item.row.n])).toEqual([[1, 0], [2, 1]]);
+    expect(await hub.ackUsage(holder, [1, 2])).toBe(true);
+    expect((await hub.peekUsage(holder, 10))!.map(item => item.seq)).toEqual([3]);
+    await hub.discardSnapshot();
+    await hub.acquireLease(holder);
+    expect(await hub.peekUsage(holder, 10)).toEqual([]);
+    expect(MAX_QUEUED_USAGE).toBeGreaterThan(1000);
+  });
+
+  test("past the cap the oldest row is dropped", async () => {
+    const holder = "a".repeat(32);
+    const storage = memoryStorage();
+    const hub = new LeaseState(storage, () => 0);
+    await hub.acquireLease(holder);
+    await hub.enqueueUsage({ n: "oldest" });
+    // As if MAX_QUEUED_USAGE - 1 more had been queued since.
+    await storage.put("ocx:usage-seq", MAX_QUEUED_USAGE);
+    await hub.enqueueUsage({ n: "newest" });
+    const rows = await hub.peekUsage(holder, 10);
+    expect(rows!.map(item => (item.row as { n: string }).n)).toEqual(["newest"]);
   });
 });
 

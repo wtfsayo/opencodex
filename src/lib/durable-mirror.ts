@@ -118,6 +118,14 @@ function nextSequence(name: DurableDocumentName, statePath: string): number {
   return state.lastSeq;
 }
 
+/** A request to the hub's state routes as this container's lease holder, or null without a boot id. */
+export function stateRequest(path: string, init: RequestInit = {}): Promise<Response> | null {
+  if (!durableMirrorEnabled()) return null;
+  const headers = new Headers(init.headers);
+  headers.set("x-ocx-boot-id", process.env[DURABLE_STATE_BOOT_ID_ENV]!);
+  return transport.fetch(`${transport.origin}${path}`, { ...init, headers, signal: init.signal ?? AbortSignal.timeout(ATTEMPT_TIMEOUT_MS) });
+}
+
 type PutResult = { durable: true; seq: number } | { durable: false; seq: number; retry: boolean };
 
 async function put(name: DurableDocumentName, body: string, seq: number): Promise<PutResult> {

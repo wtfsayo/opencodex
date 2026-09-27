@@ -26,7 +26,16 @@ export interface LeaseStorage {
   get<T>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
   delete(key: string): Promise<boolean>;
+  /** Keys under `prefix` in key order, at most `limit`. */
+  list<T>(options: { prefix: string; limit: number }): Promise<Map<string, T>>;
 }
+
+const USAGE_KEY_PREFIX = "ocx:usage:";
+const USAGE_SEQ_KEY = "ocx:usage-seq";
+// Rows the Worker served while ocx was not running to take them. Past this the oldest are dropped:
+// a hub whose container never starts must not grow its storage without end.
+export const MAX_QUEUED_USAGE = 20_000;
+const usageKey = (seq: number) => `${USAGE_KEY_PREFIX}${String(seq).padStart(12, "0")}`;
 
 const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
@@ -81,6 +90,11 @@ export class LeaseState {
     const discarded = await this.storage.get<string>(SNAPSHOT_KEY);
     await this.storage.delete(SNAPSHOT_KEY);
     for (const name of DURABLE_DOCUMENTS) await this.storage.delete(DOCUMENT_KEY_PREFIX + name);
+    for (;;) {
+      const queued = await this.storage.list({ prefix: USAGE_KEY_PREFIX, limit: 1000 });
+      if (queued.size === 0) break;
+      for (const key of queued.keys()) await this.storage.delete(key);
+    }
     await this.storage.delete(LEASE_KEY);
     return discarded;
   }
@@ -109,5 +123,27 @@ export class LeaseState {
     if (current && current.seq >= seq) return { kind: "stale", storedSeq: current.seq };
     await this.storage.put<StoredDocument>(DOCUMENT_KEY_PREFIX + name, { body, seq });
     return { kind: "committed" };
+  }
+
+  /** Queues a usage row from a Worker-served turn for ocx to append to its usage log. */
+  async enqueueUsage(row: unknown): Promise<void> {
+    const seq = ((await this.storage.get<number>(USAGE_SEQ_KEY)) ?? 0) + 1;
+    await this.storage.put(USAGE_SEQ_KEY, seq);
+    await this.storage.put(usageKey(seq), row);
+    if (seq > MAX_QUEUED_USAGE) await this.storage.delete(usageKey(seq - MAX_QUEUED_USAGE));
+  }
+
+  /** The oldest queued rows, for the lease holder only. */
+  async peekUsage(bootId: string, limit: number): Promise<{ seq: number; row: unknown }[] | null> {
+    if (!(await this.holdsLease(bootId))) return null;
+    const queued = await this.storage.list<unknown>({ prefix: USAGE_KEY_PREFIX, limit });
+    return [...queued].map(([key, row]) => ({ seq: Number(key.slice(USAGE_KEY_PREFIX.length)), row }));
+  }
+
+  /** Forgets rows the lease holder has appended to its log. */
+  async ackUsage(bootId: string, seqs: readonly number[]): Promise<boolean> {
+    if (!(await this.holdsLease(bootId))) return false;
+    for (const seq of seqs) if (Number.isSafeInteger(seq) && seq > 0) await this.storage.delete(usageKey(seq));
+    return true;
   }
 }

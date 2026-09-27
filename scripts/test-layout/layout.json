@@ -797,6 +797,7 @@
     "consume-for-inspection-cancel.test.ts": "server",
     "cloudflare-deploy.test.ts": "service",
     "cloudflare-worker-native.test.ts": "service",
+    "worker-usage-inbox.test.ts": "usage",
     "container-bootstrap.test.ts": "service",
     "context-cap-unknown-window.test.ts": "providers",
     "context-compat.test.ts": "codex-integration",

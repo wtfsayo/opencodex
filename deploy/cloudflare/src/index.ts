@@ -162,6 +162,9 @@ export class OpencodexHub extends Container<Env> {
   commitSnapshot(bootId: string, key: string) { return this.leases.commitSnapshot(bootId, key); }
   readDocument(name: DurableDocument) { return this.leases.readDocument(name); }
   commitDocument(bootId: string, name: DurableDocument, body: string, seq: number) { return this.leases.commitDocument(bootId, name, body, seq); }
+  peekUsage(bootId: string, limit: number) { return this.leases.peekUsage(bootId, limit); }
+  ackUsage(bootId: string, seqs: readonly number[]) { return this.leases.ackUsage(bootId, seqs); }
+  enqueueUsage(row: unknown) { return this.leases.enqueueUsage(row); }
 }
 
 async function handleState(req: Request, env: Env): Promise<Response> {
@@ -218,7 +221,7 @@ const NATIVE_MAX_BODY_BYTES = 4 * 1024 * 1024;
  * applies ocx's own header rule for chat (chatAdmitsDataToken). Returns the response, or the
  * request to forward when the body was read and declined, or null when the request is untouched.
  */
-async function tryWorkerNative(req: Request, env: Env): Promise<Response | { forward: Request } | null> {
+async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): Promise<Response | { forward: Request } | null> {
   if (env.OCX_WORKER_NATIVE?.trim() !== "1" || env.OCX_EDGE_KEY_CHECK?.trim() === "presence") return null;
   if (req.method !== "POST" || new URL(req.url).pathname !== "/v1/chat/completions") return null;
   // ocx decompresses gzip and zstd bodies; this path would have to as well, so leave them to it.
@@ -235,6 +238,9 @@ async function tryWorkerNative(req: Request, env: Env): Promise<Response | { for
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
       fetch: request => fetch(request),
       onDecline: logDeclineOnce,
+      // Queued off the response path; ocx appends it to usage.jsonl when it next runs.
+      recordUsage: row => ctx.waitUntil(hub.enqueueUsage(row).catch(error =>
+        console.error(`Worker-native usage row not queued: ${error instanceof Error ? error.message : String(error)}`))),
     });
     if (served) return served;
   } catch (error) {
@@ -246,7 +252,7 @@ async function tryWorkerNative(req: Request, env: Env): Promise<Response | { for
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // The dashboard's static files come from the Worker and never start the container; the admin
     // token it asks for is checked at the edge on /api/* and again by ocx.
     if (env.ASSETS && dashboardEnabled(env) && !servedByHub(new URL(req.url).pathname)) {
@@ -260,7 +266,7 @@ export default {
       if (decision.status === 204) return new Response(null, { status: 204 });
       return Response.json({ error: { message: decision.message, type: "invalid_request_error" } }, { status: decision.status });
     }
-    const native = await tryWorkerNative(req, env);
+    const native = await tryWorkerNative(req, env, ctx);
     if (native instanceof Response) return native;
     if (native) req = native.forward;
     // Only this body-free call is retried: an aborted stale object rejects it until the fresh

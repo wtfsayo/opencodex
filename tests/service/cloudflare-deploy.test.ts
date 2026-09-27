@@ -827,6 +827,14 @@ describe("cloudflare durable auth store", () => {
     }
   });
 
+  test("a local document the Durable Object has none of is published at boot", async () => {
+    const home = scratch();
+    writeFileSync(join(home, "config.json"), "{\"restored\":true}");
+    // bootWith's state server answers 404 for every document and 204 to every write.
+    await bootWith(new Response("none", { status: 404 }), home);
+    expect(JSON.parse(readFileSync(join(home, "config.json.seq"), "utf8"))).toEqual({ seq: 1, mirrored: true, digest: documentDigest("{\"restored\":true}") });
+  });
+
   test("a snapshot stages each sequence file before its document", () => {
     expect(["config.json", "auth.json", "codex-accounts.json.seq", "auth.json.seq", "codex-accounts.json"].sort(sequenceFilesFirst))
       .toEqual(["auth.json.seq", "codex-accounts.json.seq", "auth.json", "codex-accounts.json", "config.json"]);

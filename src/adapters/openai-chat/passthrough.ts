@@ -9,7 +9,7 @@ import { fastPolicyForModel } from "../../providers/service-tier";
 import { canonicalFastTierMarker, decideTier, type ResolvedFastPolicy } from "../../providers/fastwire";
 import { debugProviderDiagnostic } from "../../lib/debug";
 import { isDebugEnabled } from "../../lib/debug-settings";
-import { modelRecordValue } from "../../reasoning-effort";
+import { modelRecordValue } from "../../lib/model-record";
 import { modelInList, type OcxProviderConfig } from "../../types";
 import { chatParallelToolCallsWireValue } from "./parallel-tool-calls";
 import { applyExplicitChatReasoningWirePolicy } from "./reasoning-wire";

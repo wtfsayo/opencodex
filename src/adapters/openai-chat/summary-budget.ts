@@ -1,4 +1,4 @@
-import { modelRecordValue } from "../../reasoning-effort";
+import { modelRecordValue } from "../../lib/model-record";
 import type { OcxParsedRequest, OcxProviderConfig } from "../../types";
 
 export function resolveMaxTokens(provider: OcxProviderConfig, parsed: OcxParsedRequest): number | undefined {

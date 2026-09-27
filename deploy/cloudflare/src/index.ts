@@ -5,6 +5,7 @@ import {
 } from "./container-env";
 import { type DurableDocument, LeaseState } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
+import { serveNativeChat } from "ocx-worker-native";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
@@ -21,6 +22,8 @@ export interface Env extends EdgeEnv {
   OCX_SLEEP_AFTER?: string;
   /** Any new value discards the saved state once; see `applyPendingReset`. */
   OCX_DISCARD_SAVED_STATE?: string;
+  /** "1" answers eligible streamed Chat Completions in the Worker; see native/chat.ts. */
+  OCX_WORKER_NATIVE?: string;
 }
 
 // Must match STATE_ORIGIN in docker/cloudflare-supervisor.ts.
@@ -197,6 +200,29 @@ async function serveDashboard(req: Request, assets: Fetcher): Promise<Response> 
   return new Response(page.body, { status: page.status, headers });
 }
 
+/**
+ * The Worker-native path runs only where the edge has matched the data token exactly: with
+ * OCX_EDGE_KEY_CHECK=presence the key is verified by ocx, which this path would skip. Returns the
+ * response, or the request to forward when the body was read and declined, or null when untouched.
+ */
+async function tryWorkerNative(req: Request, env: Env): Promise<Response | { forward: Request } | null> {
+  if (env.OCX_WORKER_NATIVE?.trim() !== "1" || env.OCX_EDGE_KEY_CHECK?.trim() === "presence") return null;
+  if (req.method !== "POST" || new URL(req.url).pathname !== "/v1/chat/completions") return null;
+  const bodyText = await req.text();
+  const hub = getContainer(env.HUB, HUB_NAME);
+  try {
+    const served = await serveNativeChat(bodyText, req.signal, {
+      readConfig: async () => (await hub.readDocument("config"))?.body,
+      localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
+      fetch: request => fetch(request),
+    });
+    if (served) return served;
+  } catch (error) {
+    console.error(`Worker-native chat declined after an error: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { forward: new Request(req, { body: bodyText }) };
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     // The dashboard's static files come from the Worker and never start the container; the admin
@@ -212,6 +238,9 @@ export default {
       if (decision.status === 204) return new Response(null, { status: 204 });
       return Response.json({ error: { message: decision.message, type: "invalid_request_error" } }, { status: decision.status });
     }
+    const native = await tryWorkerNative(req, env);
+    if (native instanceof Response) return native;
+    if (native) req = native.forward;
     // Only this body-free call is retried: an aborted stale object rejects it until the fresh
     // instance is up. The request itself is sent once, so a body is never replayed.
     let current = false;

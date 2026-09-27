@@ -146,6 +146,34 @@ internal address and name models without the `@cf/` prefix:
 tools or images rather than dropping them. Workers AI retires models over time; list current ones in
 the dashboard under **AI → Workers AI → Models**.
 
+## Worker-native Chat Completions (experimental)
+
+Setting `OCX_WORKER_NATIVE` to `1` lets the Worker answer some streamed `/v1/chat/completions`
+requests itself, without the container. That removes the Worker-to-container hop from each turn
+and lets those turns run while the container is asleep. It is off by default.
+
+```bash
+echo 1 | npx wrangler secret put OCX_WORKER_NATIVE
+```
+
+The Worker serves a request only when all of these hold, and otherwise passes it to `ocx` unchanged:
+
+- The request is `POST /v1/chat/completions` with `"stream": true`, text-only messages, and at
+  most `function` tools, and the edge checked the data token itself (not
+  `OCX_EDGE_KEY_CHECK=presence`).
+- `model` is `<provider>/<model>` for a provider whose config has only `adapter: "openai-chat"`,
+  `baseUrl`, a literal `apiKey`, `models` (which must list the model), and optionally
+  `authMode: "key"`.
+- The config has no routing profiles, combos, Codex account namespaces, custom models, or `spend`
+  section.
+
+If the provider returns an error, the Worker sends the request to `ocx` instead, which retries and
+reports it as usual.
+
+Turns the Worker serves are not recorded in usage history or request logs, and they do not count
+toward anything `ocx` accounts for. The Worker reads the provider settings from the copy of
+`config.json` kept in the Durable Object, which the container updates whenever settings change.
+
 ## Connect Codex
 
 Point Codex at the hub with the data token in an environment variable. In `~/.codex/config.toml`:

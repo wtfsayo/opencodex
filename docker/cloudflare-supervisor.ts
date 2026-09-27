@@ -301,28 +301,41 @@ export class Supervisor {
    */
   private async adoptSeededConfig(): Promise<void> {
     const response = await this.state("/documents/config");
-    if (response.status === 404) return;
+    if (response.status === 404) return this.publishLocal("config", 0);
     if (!response.ok) throw new Error(`config download failed: ${response.status}`);
     const stored = Number(response.headers.get(DOCUMENT_SEQUENCE_HEADER));
     await response.body?.cancel();
     if (!Number.isSafeInteger(stored) || stored < 1) throw new Error("config has no sequence");
+    // Recorded one sequence above the stale copy before the write, so the seed wins at restore
+    // even if the write never lands.
+    return this.publishLocal("config", stored);
+  }
+
+  /**
+   * Gives the Durable Object a copy of a local document it has none of: a fresh deployment's
+   * config would otherwise reach it only with the first saved setting, and the Worker-native path
+   * reads it from there. Best effort: without it the local file simply stays the only copy.
+   */
+  private async publishLocal(name: DurableDocumentName, afterSeq: number): Promise<void> {
     const home = this.roots[0]!.dir;
-    const body = readFileSync(join(home, DURABLE_DOCUMENT_FILES.config), "utf8");
-    const seq = stored + 1;
-    const sequencePath = join(home, sequenceFileFor("config"));
+    const target = join(home, DURABLE_DOCUMENT_FILES[name]);
+    if (!existsSync(target)) return;
+    const body = readFileSync(target, "utf8");
+    const sequencePath = join(home, sequenceFileFor(name));
+    const seq = Math.max(afterSeq, readSequenceState(sequencePath).seq) + 1;
     writeSequenceState(sequencePath, { seq, mirrored: false, digest: documentDigest(body) });
     try {
-      const put = await this.state("/documents/config", { method: "PUT", body, headers: { [DOCUMENT_SEQUENCE_HEADER]: String(seq) } });
+      const put = await this.state(`/documents/${name}`, { method: "PUT", body, headers: { [DOCUMENT_SEQUENCE_HEADER]: String(seq) } });
       if (put.ok) writeSequenceState(sequencePath, { seq, mirrored: true, digest: documentDigest(body) });
-      else console.error(`Seeded config not mirrored (${put.status}); the local copy still wins at restore.`);
+      else console.error(`${DURABLE_DOCUMENT_FILES[name]} not published (${put.status}); the local copy still wins at restore.`);
     } catch (error) {
-      console.error(`Seeded config not mirrored: ${errorText(error)}; the local copy still wins at restore.`);
+      console.error(`${DURABLE_DOCUMENT_FILES[name]} not published: ${errorText(error)}; the local copy still wins at restore.`);
     }
   }
 
   private async restoreDocument(name: DurableDocumentName): Promise<void> {
     const response = await this.state(`/documents/${name}`);
-    if (response.status === 404) return;
+    if (response.status === 404) return this.publishLocal(name, 0);
     if (!response.ok) throw new Error(`${name} download failed: ${response.status}`);
     const seq = Number(response.headers.get(DOCUMENT_SEQUENCE_HEADER));
     if (!Number.isSafeInteger(seq) || seq < 1) throw new Error(`${name} has no sequence`);

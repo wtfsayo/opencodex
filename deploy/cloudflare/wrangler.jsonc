@@ -3,6 +3,10 @@
   "name": "opencodex",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-27",
+  // node:buffer and node:crypto are imported by the ocx modules the Worker-native path reuses.
+  "compatibility_flags": ["nodejs_compat"],
+  // Typechecked with src/ rather than this package; see src/native-chat-api.ts.
+  "alias": { "ocx-worker-native": "../../src/server/cloudflare-native-chat.ts" },
   // A second deployment in the same account needs its own "name" and "bucket_name" below.
   "workers_dev": true,
   "preview_urls": false,

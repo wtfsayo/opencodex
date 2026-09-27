@@ -796,6 +796,7 @@
     "subagent-roster-migration.test.ts": "routing",
     "consume-for-inspection-cancel.test.ts": "server",
     "cloudflare-deploy.test.ts": "service",
+    "cloudflare-worker-native.test.ts": "service",
     "container-bootstrap.test.ts": "service",
     "context-cap-unknown-window.test.ts": "providers",
     "context-compat.test.ts": "codex-integration",

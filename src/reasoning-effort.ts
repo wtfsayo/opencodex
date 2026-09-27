@@ -121,20 +121,8 @@ export function resolveEffortAtOrBelow(
   return atOrBelow.at(-1)?.effort ?? ranked[0]!.effort;
 }
 
-export function modelRecordValue<T>(record: Record<string, T> | undefined, modelId: string): T | undefined {
-  if (!record) return undefined;
-  if (Object.prototype.hasOwnProperty.call(record, modelId)) return record[modelId];
-  const colon = modelId.indexOf(":");
-  if (colon > 0) {
-    const family = modelId.slice(0, colon);
-    if (Object.prototype.hasOwnProperty.call(record, family)) return record[family];
-  }
-  const folded = modelId.toLowerCase();
-  for (const [key, value] of Object.entries(record)) {
-    if (key.toLowerCase() === folded) return value;
-  }
-  return undefined;
-}
+import { modelRecordValue } from "./lib/model-record";
+export { modelRecordValue };
 
 export function sanitizeCodexReasoningEfforts(efforts: readonly string[] | undefined): string[] | undefined {
   if (efforts === undefined) return undefined;

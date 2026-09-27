@@ -101,3 +101,28 @@ edge presence check (re-review), so an anonymous preflight can still wake the co
 - Cold start after sleep includes lease + restore time.
 - Deploy button: Cloudflare's docs do not list Containers among auto-provisioned resources, so
   Phase 1 documents `wrangler deploy` only.
+
+## Phase 4a (2026-09-28): Worker-native streamed Chat Completions, opt-in
+
+Baseline (test deployment, Workers AI `meta/llama-3.1-8b-instruct-fp8`, 20 streamed turns per
+route, container path): p50 time to first byte 651 ms (chat) / 669 ms (responses), p50 total
+793 / 831 ms. The container's outbound call to Workers AI alone had p50 wall 471 ms, so the
+Worker -> Durable Object -> container -> ocx hop cost roughly 300 ms per turn. Worker CPU was
+1-2 ms. Raw rows are in a scratch SQLite database, not committed.
+
+Shape:
+- `src/server/cloudflare-native-chat.ts` reuses ocx's `buildOpenAIChatPassthroughRequest` and
+  `nativeChatSse` unchanged. Routing is a narrow subset (exact `<provider>/<model>`, allowlisted
+  provider fields, no routing sections) that a test holds equal to `routeModel` where it answers.
+  Anything else, and any upstream error, declines to the container before a byte is sent.
+- It lives under `src/` because the ocx modules it reuses do not typecheck against Workers types;
+  the Worker package sees it through `native-chat-api.ts` and a wrangler `alias`.
+- `tests/service/cloudflare-worker-native.test.ts` walks its import graph (dynamic imports and
+  `.js` specifiers included) and fails on Bun APIs, `node:` modules other than `buffer` and
+  `crypto` (enabled by `nodejs_compat`), ocx's stateful owners, or growth past 80 files. Getting
+  under it took one move: `modelRecordValue` out of `reasoning-effort.ts` into `lib/model-record.ts`.
+- The supervisor now publishes a local document the Durable Object lacks at boot, so a fresh
+  deployment's config is readable by the Worker without a settings save.
+
+Not done: usage rows and request logs for Worker-served turns (next: queue them in the Durable
+Object for the container to ingest), Responses and Messages routes, non-streamed turns.

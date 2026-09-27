@@ -3,7 +3,7 @@ import {
   containerEnv, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
-import { LeaseState } from "./lease";
+import { type DurableDocument, LeaseState } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
 import { handleStateRequest } from "./state-routes";
 
@@ -157,6 +157,8 @@ export class OpencodexHub extends Container<Env> {
   releaseLease(bootId: string) { return this.leases.releaseLease(bootId); }
   currentSnapshot() { return this.leases.currentSnapshot(); }
   commitSnapshot(bootId: string, key: string) { return this.leases.commitSnapshot(bootId, key); }
+  readDocument(name: DurableDocument) { return this.leases.readDocument(name); }
+  commitDocument(bootId: string, name: DurableDocument, body: string) { return this.leases.commitDocument(bootId, name, body); }
 }
 
 async function handleState(req: Request, env: Env): Promise<Response> {

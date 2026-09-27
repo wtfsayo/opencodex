@@ -34,6 +34,7 @@ import {
 } from "../lib/state-store-sweeper";
 import { validateCopilotApiBaseUrl } from "./github-copilot";
 import { validateDevinApiBaseUrl } from "./devin/api-base";
+import { mirrorAuthStore } from "./durable-mirror";
 import type { OAuthAccountSelection, OAuthCredentialSource, OAuthCredentials, ProviderAccount, ProviderAccountSet } from "./types";
 
 export type AuthStore = Record<string, ProviderAccountSet>;
@@ -396,7 +397,11 @@ export function peekAuthStore(): AuthStore {
   return snapshot.kind === "ready" ? snapshot.store : {};
 }
 
-function persist(store: AuthStore): void {
+function authStoreBytes(store: AuthStore): string {
+  return JSON.stringify(store, null, 2) + "\n";
+}
+
+function persist(bytes: string): void {
   const dir = getConfigDir();
   assertNotRealHomeUnderTest(dir);
   if (!existsSync(dir)) {
@@ -405,7 +410,7 @@ function persist(store: AuthStore): void {
     try { chmodSync(dir, 0o700); } catch { /* best-effort on existing dir */ }
   }
   hardenConfigDir();
-  atomicWriteFile(getAuthStorePath(), JSON.stringify(store, null, 2) + "\n");
+  atomicWriteFile(getAuthStorePath(), bytes);
 }
 
 export class OAuthFileLockError extends Error { readonly code = "OAUTH_FILE_LOCK_UNAVAILABLE"; constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = "OAuthFileLockError"; } }
@@ -818,7 +823,9 @@ export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValue
     // Receipt-producing mutations need the revision assigned by the bookkeeping above, not the
     // provisional value visible inside their callback. Finalization cannot await or mutate disk.
     options?.finalizeResult?.(result, store);
-    persist(store);
+    const bytes = authStoreBytes(store);
+    await mirrorAuthStore(bytes);
+    persist(bytes);
     if (scrubbedProviders.length > 0) scrubLegacyBackup(scrubbedProviders);
     for (const provider of changedProviders) publishAccountSelection(provider, "oauth");
     return result;

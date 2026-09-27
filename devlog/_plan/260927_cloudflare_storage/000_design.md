@@ -173,3 +173,24 @@ interval can grow.
      Durable Object?
   3. Is the spend-ledger latency cost acceptable, or should Cloudflare hubs with enforced limits
      keep a local durable append plus asynchronous replication?
+
+## 3a progress (2026-09-27): OAuth `auth.json` written through
+
+Smaller than the seam in the table: the file stays the store every reader uses, and the Durable
+Object gets a whole-document copy before each local write.
+
+- `mutateStore` (`src/oauth/store.ts`) is the only writer of `auth.json` and is already async. It
+  now awaits `mirrorAuthStore` (`src/oauth/durable-mirror.ts`) before `persist`, so the durable copy
+  is never older than the file. A failure after three attempts rejects the mutation before the file
+  is touched, which callers already handle as a failed disk write. A 409 (lease lost) is not retried.
+- Nothing runs unless `OCX_STATE_BOOT_ID` is set, which only the supervisor does for its child.
+  The origin is fixed to the intercepted `state.ocx.internal`.
+- The Durable Object stores the document under the lease: a non-holder can neither write nor read
+  it. `OCX_DISCARD_SAVED_STATE` deletes it with the snapshot pointer.
+- The supervisor restores it over the snapshot's `auth.json` after the snapshot restore; a failed
+  read stops the boot like a failed snapshot restore.
+- The ~106 synchronous readers are untouched.
+
+Still riding the snapshot: refresh intents (`auth.refresh.*.lock.json`, Nous intents), the
+`pre-multiauth` backup, and `codex-accounts.json`, whose writers are synchronous and belong to the
+Codex pool. Losing an intent in a crash is the same outcome as the crash itself today.

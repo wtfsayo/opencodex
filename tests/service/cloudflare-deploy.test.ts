@@ -498,6 +498,7 @@ function fakeStateServer(overrides: Record<string, (req: Request) => Response | 
       const override = overrides[key];
       if (override) return override(req);
       if (key === "GET /snapshot") return snapshot ? new Response(snapshot) : new Response("none", { status: 404 });
+      if (key === "GET /documents/auth") return new Response("none", { status: 404 });
       if (key === "PUT /snapshot") {
         uploading++;
         maxUploading = Math.max(maxUploading, uploading);
@@ -620,6 +621,73 @@ describe("cloudflare supervisor lifecycle", () => {
       expect(await code).toBe(0);
       expect(state.maxConcurrentUploads()).toBe(1);
       expect(await readArchive(state.snapshot()!, "opencodex/config.json")).toBe("{\"v\":2}");
+    } finally {
+      state.stop();
+    }
+  });
+});
+
+describe("cloudflare durable auth store", () => {
+  const holder = "a".repeat(32);
+  const other = "b".repeat(32);
+  const put = (bootId: string, body: string) => new Request("http://state.ocx.internal/documents/auth", { method: "PUT", body, headers: { "x-ocx-boot-id": bootId } });
+  const get = (bootId: string, name = "auth") => new Request(`http://state.ocx.internal/documents/${name}`, { headers: { "x-ocx-boot-id": bootId } });
+
+  test("only the lease holder writes or reads it, and a reset forgets it", async () => {
+    const hub = new LeaseState(memoryStorage(), () => 0);
+    await hub.acquireLease(holder);
+    expect((await handleStateRequest(put(holder, "{\"xai\":{}}"), hub, memoryBucket(), "ns")).status).toBe(204);
+    expect(await (await handleStateRequest(get(holder), hub, memoryBucket(), "ns")).text()).toBe("{\"xai\":{}}");
+    // A fenced container must neither overwrite the holder's credentials nor read them.
+    expect((await handleStateRequest(put(other, "{}"), hub, memoryBucket(), "ns")).status).toBe(409);
+    expect((await handleStateRequest(get(other), hub, memoryBucket(), "ns")).status).toBe(409);
+    expect(await hub.readDocument("auth")).toBe("{\"xai\":{}}");
+    await hub.discardSnapshot();
+    expect(await hub.readDocument("auth")).toBeUndefined();
+  });
+
+  test("refuses unknown names, non-objects, and oversized bodies", async () => {
+    const hub = new LeaseState(memoryStorage(), () => 0);
+    await hub.acquireLease(holder);
+    expect((await handleStateRequest(get(holder, "config"), hub, memoryBucket(), "ns")).status).toBe(404);
+    expect((await handleStateRequest(put(holder, "[]"), hub, memoryBucket(), "ns")).status).toBe(400);
+    expect((await handleStateRequest(put(holder, "not json"), hub, memoryBucket(), "ns")).status).toBe(400);
+    expect((await handleStateRequest(put(holder, `{"x":"${"y".repeat(1024 * 1024)}"}`), hub, memoryBucket(), "ns")).status).toBe(413);
+    expect(await hub.readDocument("auth")).toBeUndefined();
+  });
+
+  test("the supervisor restores it over the snapshot's copy and hands ocx the boot id", async () => {
+    const saved = "{\"xai\":{\"accounts\":[]}}";
+    const state = fakeStateServer({ "GET /documents/auth": () => new Response(saved) });
+    const home = scratch();
+    writeFileSync(join(home, "auth.json"), "{\"stale\":true}");
+    const seen = join(home, "boot-id");
+    const { code, exit } = recordingExit();
+    const supervisor = new Supervisor({ roots: [{ prefix: "opencodex", dir: home }], intervalMs: 60_000, port: 0, stateOrigin: state.origin, exit, handleSignals: false });
+    void supervisor.main(["bun", "-e", `require("node:fs").writeFileSync(${JSON.stringify(seen)}, process.env.OCX_STATE_BOOT_ID ?? ""); setInterval(() => {}, 1000)`]);
+    try {
+      await until(() => existsSync(seen) && readFileSync(seen, "utf8").length > 0);
+      expect(readFileSync(join(home, "auth.json"), "utf8")).toBe(saved);
+      if (process.platform !== "win32") expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
+      expect(readFileSync(seen, "utf8")).toMatch(/^[0-9a-f]{32}$/);
+      void supervisor.shutdown("SIGTERM");
+      expect(await code).toBe(0);
+    } finally {
+      state.stop();
+    }
+  });
+
+  test("an unreadable durable copy stops the boot instead of starting on older credentials", async () => {
+    const state = fakeStateServer({ "GET /documents/auth": () => new Response("unavailable", { status: 503 }) });
+    const home = scratch();
+    const marker = join(home, "started");
+    const { exit } = recordingExit();
+    const supervisor = new Supervisor({ roots: [{ prefix: "opencodex", dir: home }], intervalMs: 60_000, port: 0, stateOrigin: state.origin, exit, handleSignals: false });
+    try {
+      await expect(supervisor.main(["bun", "-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "")`])).rejects.toThrow("state restore failed");
+      expect(state.events).toContain("DELETE /lease");
+      await Bun.sleep(300);
+      expect(existsSync(marker)).toBe(false);
     } finally {
       state.stop();
     }

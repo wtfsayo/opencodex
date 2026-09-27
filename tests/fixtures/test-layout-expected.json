@@ -1156,6 +1156,7 @@
   "oauth-refresh-lock-multiprocess.test.ts": "oauth",
   "oauth-refresh.test.ts": "oauth",
   "oauth-status-privacy.test.ts": "oauth",
+  "oauth-durable-mirror.test.ts": "oauth",
   "oauth-store-multi.test.ts": "oauth",
   "oauth-tos-warning.test.ts": "gui",
   "oauth-upsert-preserves-api-key.test.ts": "oauth",

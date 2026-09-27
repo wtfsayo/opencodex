@@ -2,10 +2,11 @@
 // wiped whenever the instance sleeps or rolls out, so this process restores both state homes from
 // R2 before starting ocx and uploads them again while it runs and on SIGTERM.
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { copyFile, cp, lstat, mkdir, mkdtemp, open, readdir, readlink, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { DURABLE_STATE_BOOT_ID_ENV } from "../src/oauth/durable-mirror";
 
 // Intercepted by OpencodexHub.outboundByHost in deploy/cloudflare/src/index.ts; never reaches DNS.
 const STATE_ORIGIN = "http://state.ocx.internal";
@@ -266,6 +267,26 @@ export class Supervisor {
     }
   }
 
+  /**
+   * ocx writes its OAuth store through to the Durable Object on every commit (src/oauth/durable-mirror.ts),
+   * so that copy is never older than the snapshot's and replaces it. Without it, a credential saved or
+   * rotated after the last upload would come back as the older one.
+   */
+  async restoreDocuments(): Promise<void> {
+    const response = await this.state("/documents/auth");
+    if (response.status === 404) return;
+    if (!response.ok) throw new Error(`auth store download failed: ${response.status}`);
+    const body = await response.text();
+    const parsed: unknown = JSON.parse(body);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("auth store is not a JSON object");
+    const home = this.roots[0]!.dir;
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const target = join(home, "auth.json");
+    const temporary = `${target}.${this.bootId}.tmp`;
+    writeFileSync(temporary, body, { mode: 0o600 });
+    renameSync(temporary, target);
+  }
+
   private upload(): Promise<void> {
     const next = this.uploads.then(() => this.uploadNow());
     this.uploads = next.catch(() => {});
@@ -365,6 +386,7 @@ export class Supervisor {
     }, Math.min(this.intervalMs, 30_000));
     try {
       if (!(await this.restore())) seedBootstrapConfig(this.roots[0]!.dir, process.env, this.port);
+      await this.restoreDocuments();
     } catch (error) {
       // Never fall through to a fresh home: its first upload would replace the saved state.
       await this.releaseLease();
@@ -373,7 +395,10 @@ export class Supervisor {
     }
     if (this.stopping) return;
     await this.closePlaceholder();
-    this.child = Bun.spawn(command, { stdio: ["inherit", "inherit", "inherit"] });
+    this.child = Bun.spawn(command, {
+      stdio: ["inherit", "inherit", "inherit"],
+      env: { ...process.env, [DURABLE_STATE_BOOT_ID_ENV]: this.bootId },
+    });
     void this.child.exited.then(() => this.shutdown("SIGTERM"));
 
     while (!this.stopping) {

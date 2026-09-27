@@ -30,6 +30,16 @@ export interface LeaseStorage {
 
 const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
+const DOCUMENT_KEY_PREFIX = "ocx:document:";
+
+/**
+ * Stores written through to the Durable Object on every commit instead of waiting for the next
+ * snapshot. Each is one whole JSON document, restored over the snapshot's copy at boot.
+ */
+export const DURABLE_DOCUMENTS = ["auth"] as const;
+export type DurableDocument = (typeof DURABLE_DOCUMENTS)[number];
+// SQLite-backed Durable Objects cap a stored value at 2 MiB; an auth store is a few KiB.
+export const MAX_DOCUMENT_BYTES = 1024 * 1024;
 
 /** The Durable Object's state. Awaiting DO storage keeps the input gate closed, so these read-modify-writes need no CAS. */
 export class LeaseState {
@@ -68,6 +78,7 @@ export class LeaseState {
   async discardSnapshot(): Promise<string | undefined> {
     const discarded = await this.storage.get<string>(SNAPSHOT_KEY);
     await this.storage.delete(SNAPSHOT_KEY);
+    for (const name of DURABLE_DOCUMENTS) await this.storage.delete(DOCUMENT_KEY_PREFIX + name);
     await this.storage.delete(LEASE_KEY);
     return discarded;
   }
@@ -78,5 +89,16 @@ export class LeaseState {
     const replaced = await this.storage.get<string>(SNAPSHOT_KEY);
     await this.storage.put(SNAPSHOT_KEY, key);
     return { replaced: replaced === key ? undefined : replaced };
+  }
+
+  readDocument(name: DurableDocument): Promise<string | undefined> {
+    return this.storage.get<string>(DOCUMENT_KEY_PREFIX + name);
+  }
+
+  /** False when the caller lost the lease: a fenced container must not overwrite the holder's credentials. */
+  async commitDocument(bootId: string, name: DurableDocument, body: string): Promise<boolean> {
+    if (!(await this.holdsLease(bootId))) return false;
+    await this.storage.put(DOCUMENT_KEY_PREFIX + name, body);
+    return true;
   }
 }

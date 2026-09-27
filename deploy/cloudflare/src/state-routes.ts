@@ -1,4 +1,7 @@
-import { BOOT_ID_PATTERN, DURABLE_DOCUMENTS, type DurableDocument, MAX_DOCUMENT_BYTES } from "./lease";
+import { BOOT_ID_PATTERN, type DocumentCommit, DURABLE_DOCUMENTS, type DurableDocument, MAX_DOCUMENT_BYTES, type StoredDocument } from "./lease";
+
+// Mirrors DOCUMENT_SEQUENCE_HEADER in src/oauth/durable-mirror.ts, which the Worker bundle cannot import.
+export const DOCUMENT_SEQUENCE_HEADER = "x-ocx-document-seq";
 
 // Kept free of Workers-only imports so tests/service/cloudflare-deploy.test.ts can drive it.
 export interface StateHub {
@@ -8,8 +11,8 @@ export interface StateHub {
   releaseLease(bootId: string): Promise<void>;
   currentSnapshot(): Promise<string | undefined>;
   commitSnapshot(bootId: string, key: string): Promise<{ replaced: string | undefined } | null>;
-  readDocument(name: DurableDocument): Promise<string | undefined>;
-  commitDocument(bootId: string, name: DurableDocument, body: string): Promise<boolean>;
+  readDocument(name: DurableDocument): Promise<StoredDocument | undefined>;
+  commitDocument(bootId: string, name: DurableDocument, body: string, seq: number): Promise<DocumentCommit>;
 }
 
 export interface StateBucket {
@@ -99,14 +102,20 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     const name = document as DurableDocument;
     if (req.method === "GET") {
       if (!(await hub.holdsLease(bootId))) return new Response("lease required", { status: 409 });
-      const body = await hub.readDocument(name);
-      return body === undefined ? new Response("no document", { status: 404 }) : new Response(body, { headers: { "content-type": "application/json" } });
+      const stored = await hub.readDocument(name);
+      if (!stored) return new Response("no document", { status: 404 });
+      return new Response(stored.body, { headers: { "content-type": "application/json", [DOCUMENT_SEQUENCE_HEADER]: String(stored.seq) } });
     }
     if (req.method === "PUT") {
+      const seq = Number(req.headers.get(DOCUMENT_SEQUENCE_HEADER));
+      if (!Number.isSafeInteger(seq) || seq < 1) return new Response("sequence required", { status: 400 });
       const body = await req.text();
       if (new TextEncoder().encode(body).byteLength > MAX_DOCUMENT_BYTES) return new Response("document too large", { status: 413 });
       if (!isJsonObject(body)) return new Response("document must be a JSON object", { status: 400 });
-      return (await hub.commitDocument(bootId, name, body)) ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
+      const commit = await hub.commitDocument(bootId, name, body, seq);
+      if (commit.kind === "lease-lost") return new Response("lease lost", { status: 409 });
+      if (commit.kind === "stale") return new Response("stale sequence", { status: 412, headers: { [DOCUMENT_SEQUENCE_HEADER]: String(commit.storedSeq) } });
+      return new Response(null, { status: 204 });
     }
   }
   return new Response("not found", { status: 404 });

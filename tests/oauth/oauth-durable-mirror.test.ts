@@ -3,8 +3,8 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { flushConfigDirHardeningForTests } from "../../src/config/paths";
-import { DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/oauth/durable-mirror";
-import { getAuthStorePath, getCredential, resetOAuthReauthReconcileStateForTests, saveCredential } from "../../src/oauth/store";
+import { AUTH_STORE_SEQUENCE_FILE, DOCUMENT_SEQUENCE_HEADER, DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/oauth/durable-mirror";
+import { getAuthStorePath, getCredential, mutateStore, resetOAuthReauthReconcileStateForTests, saveCredential } from "../../src/oauth/store";
 import { resetHardenedStateForTests, setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
@@ -16,27 +16,41 @@ let home: string;
 let previousHome: string | undefined;
 let previousBootId: string | undefined;
 
-type Call = { url: string; bootId: string | null; body: string; fileAtCall: string | null };
-function recordingTransport(statuses: (number | "network")[]): Call[] {
+type Call = { url: string; bootId: string | null; seq: number; body: string; fileAtCall: string | null };
+type Reply = number | "network" | { status: number; storedSeq: number };
+let scheduled: (() => void)[] = [];
+
+function recordingTransport(replies: Reply[]): Call[] {
   const calls: Call[] = [];
+  scheduled = [];
   setDurableMirrorTransportForTests({
     origin: "http://state.test",
     sleep: async () => {},
+    schedule: run => {
+      scheduled.push(run);
+      return { cancel: () => { scheduled = scheduled.filter(entry => entry !== run); } };
+    },
     fetch: async (url, init) => {
       const path = getAuthStorePath();
+      const headers = new Headers(init.headers);
       calls.push({
         url,
-        bootId: new Headers(init.headers).get("x-ocx-boot-id"),
+        bootId: headers.get("x-ocx-boot-id"),
+        seq: Number(headers.get(DOCUMENT_SEQUENCE_HEADER)),
         body: String(init.body),
         fileAtCall: existsSync(path) ? readFileSync(path, "utf8") : null,
       });
-      const status = statuses[calls.length - 1] ?? 204;
-      if (status === "network") throw new TypeError("fetch failed");
-      return new Response(null, { status });
+      const reply = replies[calls.length - 1] ?? 204;
+      if (reply === "network") throw new TypeError("fetch failed");
+      if (typeof reply === "object") return new Response(null, { status: reply.status, headers: { [DOCUMENT_SEQUENCE_HEADER]: String(reply.storedSeq) } });
+      return new Response(null, { status: reply });
     },
   });
   return calls;
 }
+
+const sequenceFile = () => JSON.parse(readFileSync(join(home, AUTH_STORE_SEQUENCE_FILE), "utf8"));
+const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 
 describe("auth store durable mirror", () => {
   beforeEach(() => {
@@ -68,21 +82,23 @@ describe("auth store durable mirror", () => {
     const calls = recordingTransport([]);
     await saveCredential("xai", cred("one"));
     expect(calls).toEqual([]);
+    expect(existsSync(join(home, AUTH_STORE_SEQUENCE_FILE))).toBe(false);
     expect(getCredential("xai")?.access).toBe("one");
   });
 
-  test("each commit reaches the durable copy before the local file, with the same bytes", async () => {
+  test("each commit reaches the durable copy before the local file, with the same bytes and a rising sequence", async () => {
     process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
     const calls = recordingTransport([]);
     await saveCredential("xai", cred("one"));
     await saveCredential("xai", cred("two"));
-    expect(calls).toHaveLength(2);
-    expect(calls[0]!.url).toBe("http://state.test/documents/auth");
-    expect(calls[0]!.bootId).toBe(BOOT_ID);
-    // The file was absent when the first write was mirrored and held the first commit during the second.
+    expect(calls.map(call => [call.url, call.bootId, call.seq])).toEqual([
+      ["http://state.test/documents/auth", BOOT_ID, 1],
+      ["http://state.test/documents/auth", BOOT_ID, 2],
+    ]);
     expect(calls[0]!.fileAtCall).toBeNull();
     expect(calls[1]!.fileAtCall).toBe(calls[0]!.body);
     expect(readFileSync(getAuthStorePath(), "utf8")).toBe(calls[1]!.body);
+    expect(sequenceFile()).toEqual({ seq: 2, mirrored: true });
   });
 
   test("a lost lease fails the commit at once and leaves the file untouched", async () => {
@@ -94,19 +110,63 @@ describe("auth store durable mirror", () => {
     await expect(saveCredential("xai", cred("two"))).rejects.toThrow("state lease moved");
     expect(calls).toHaveLength(1);
     expect(readFileSync(getAuthStorePath(), "utf8")).toBe(before);
-    expect(getCredential("xai")?.access).toBe("one");
   });
 
-  test("transient failures are retried; exhausting them fails the commit without writing the file", async () => {
+  test("an unreachable Durable Object never costs the local write, and the commit is retried until it lands", async () => {
     process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
-    const retried = recordingTransport(["network", 503, 204]);
-    await saveCredential("xai", cred("one"));
-    expect(retried).toHaveLength(3);
-    expect(getCredential("xai")?.access).toBe("one");
+    // Two attempts per try: the commit, then two catch-up runs.
+    const calls = recordingTransport(["network", 503, 503, "network", 204]);
+    // A refresh token the provider already rotated must reach the disk regardless.
+    await saveCredential("xai", cred("rotated"));
+    expect(getCredential("xai")?.access).toBe("rotated");
+    expect(sequenceFile()).toEqual({ seq: 1, mirrored: false });
+    expect(calls).toHaveLength(2);
 
-    const failed = recordingTransport(["network", 502, "network"]);
-    await expect(saveCredential("xai", cred("two"))).rejects.toThrow("durable auth store is unreachable");
-    expect(failed).toHaveLength(3);
-    expect(getCredential("xai")?.access).toBe("one");
+    scheduled.shift()!();
+    await flush();
+    expect(sequenceFile()).toEqual({ seq: 1, mirrored: false });
+    scheduled.shift()!();
+    await flush();
+    expect(calls.map(call => call.seq)).toEqual([1, 1, 1, 1, 1]);
+    expect(calls[4]!.body).toBe(readFileSync(getAuthStorePath(), "utf8"));
+    expect(sequenceFile()).toEqual({ seq: 1, mirrored: true });
+    expect(scheduled).toEqual([]);
+  });
+
+  test("a newer commit replaces a pending retry instead of racing it", async () => {
+    process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
+    const calls = recordingTransport(["network", "network"]);
+    await saveCredential("xai", cred("one"));
+    expect(scheduled).toHaveLength(1);
+    await saveCredential("xai", cred("two"));
+    expect(scheduled).toEqual([]);
+    expect(calls.map(call => call.seq)).toEqual([1, 1, 2]);
+    expect(sequenceFile()).toEqual({ seq: 2, mirrored: true });
+  });
+
+  test("a stale answer is success when it names this write, and moves past a sequence file that fell behind", async () => {
+    process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
+    // The first attempt timed out after landing; its retry is told the Durable Object already has it.
+    const landed = recordingTransport(["network", { status: 412, storedSeq: 1 }]);
+    await saveCredential("xai", cred("one"));
+    expect(landed.map(call => call.seq)).toEqual([1, 1]);
+    expect(sequenceFile()).toEqual({ seq: 1, mirrored: true });
+
+    setDurableMirrorTransportForTests(null);
+    const behind = recordingTransport([{ status: 412, storedSeq: 9 }, 204]);
+    await saveCredential("xai", cred("two"));
+    expect(behind.map(call => call.seq)).toEqual([2, 10]);
+    expect(sequenceFile()).toEqual({ seq: 10, mirrored: true });
+  });
+
+  test("a login superseded while the mirror was in flight is not written locally", async () => {
+    process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
+    recordingTransport([]);
+    let checks = 0;
+    await expect(mutateStore(store => {
+      store.xai = { accounts: [], activeAccountId: undefined } as never;
+    }, [], { assertBeforePersist: () => { if (++checks > 1) throw new Error("login superseded"); } })).rejects.toThrow("login superseded");
+    expect(checks).toBe(2);
+    expect(existsSync(getAuthStorePath())).toBe(false);
   });
 });

@@ -5,7 +5,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decideLease, isHolder, LEASE_STALE_MS, LeaseState, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
-import { handleStateRequest, snapshotPrefix, sweepOrphans, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
+import { DOCUMENT_SEQUENCE_HEADER, handleStateRequest, snapshotPrefix, sweepOrphans, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
+import { DOCUMENT_SEQUENCE_HEADER as MIRROR_SEQUENCE_HEADER } from "../../src/oauth/durable-mirror";
 import { containerEnv, dashboardEnabled, isAnonymousHealthCheck, DASHBOARD_BOOTSTRAP_META, edgeDecision, envFingerprint, isSupersededBy, forwardableRequest, servedByHub } from "../../deploy/cloudflare/src/container-env";
 import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -630,51 +631,93 @@ describe("cloudflare supervisor lifecycle", () => {
 describe("cloudflare durable auth store", () => {
   const holder = "a".repeat(32);
   const other = "b".repeat(32);
-  const put = (bootId: string, body: string) => new Request("http://state.ocx.internal/documents/auth", { method: "PUT", body, headers: { "x-ocx-boot-id": bootId } });
+  const put = (bootId: string, body: string, seq: number | null = 1) => new Request("http://state.ocx.internal/documents/auth", {
+    method: "PUT",
+    body,
+    headers: { "x-ocx-boot-id": bootId, ...(seq === null ? {} : { [DOCUMENT_SEQUENCE_HEADER]: String(seq) }) },
+  });
   const get = (bootId: string, name = "auth") => new Request(`http://state.ocx.internal/documents/${name}`, { headers: { "x-ocx-boot-id": bootId } });
+  const send = async (hub: LeaseState, req: Request) => handleStateRequest(req, hub, memoryBucket(), "ns");
+
+  test("the Worker and ocx agree on the sequence header", () => {
+    expect(DOCUMENT_SEQUENCE_HEADER).toBe(MIRROR_SEQUENCE_HEADER);
+  });
 
   test("only the lease holder writes or reads it, and a reset forgets it", async () => {
     const hub = new LeaseState(memoryStorage(), () => 0);
     await hub.acquireLease(holder);
-    expect((await handleStateRequest(put(holder, "{\"xai\":{}}"), hub, memoryBucket(), "ns")).status).toBe(204);
-    expect(await (await handleStateRequest(get(holder), hub, memoryBucket(), "ns")).text()).toBe("{\"xai\":{}}");
+    expect((await send(hub, put(holder, "{\"xai\":{}}"))).status).toBe(204);
+    const read = await send(hub, get(holder));
+    expect(await read.text()).toBe("{\"xai\":{}}");
+    expect(read.headers.get(DOCUMENT_SEQUENCE_HEADER)).toBe("1");
     // A fenced container must neither overwrite the holder's credentials nor read them.
-    expect((await handleStateRequest(put(other, "{}"), hub, memoryBucket(), "ns")).status).toBe(409);
-    expect((await handleStateRequest(get(other), hub, memoryBucket(), "ns")).status).toBe(409);
-    expect(await hub.readDocument("auth")).toBe("{\"xai\":{}}");
+    expect((await send(hub, put(other, "{}", 2))).status).toBe(409);
+    expect((await send(hub, get(other))).status).toBe(409);
+    expect(await hub.readDocument("auth")).toEqual({ body: "{\"xai\":{}}", seq: 1 });
     await hub.discardSnapshot();
     expect(await hub.readDocument("auth")).toBeUndefined();
   });
 
-  test("refuses unknown names, non-objects, and oversized bodies", async () => {
+  test("a write that is not newer is refused and names the stored sequence", async () => {
     const hub = new LeaseState(memoryStorage(), () => 0);
     await hub.acquireLease(holder);
-    expect((await handleStateRequest(get(holder, "config"), hub, memoryBucket(), "ns")).status).toBe(404);
-    expect((await handleStateRequest(put(holder, "[]"), hub, memoryBucket(), "ns")).status).toBe(400);
-    expect((await handleStateRequest(put(holder, "not json"), hub, memoryBucket(), "ns")).status).toBe(400);
-    expect((await handleStateRequest(put(holder, `{"x":"${"y".repeat(1024 * 1024)}"}`), hub, memoryBucket(), "ns")).status).toBe(413);
+    expect((await send(hub, put(holder, "{\"v\":3}", 3))).status).toBe(204);
+    // A retry of an older commit that lands late must not replace the later one.
+    for (const seq of [2, 3]) {
+      const stale = await send(hub, put(holder, "{\"v\":\"late\"}", seq));
+      expect(stale.status).toBe(412);
+      expect(stale.headers.get(DOCUMENT_SEQUENCE_HEADER)).toBe("3");
+    }
+    expect(await hub.readDocument("auth")).toEqual({ body: "{\"v\":3}", seq: 3 });
+  });
+
+  test("refuses unknown names, missing sequences, non-objects, and oversized bodies", async () => {
+    const hub = new LeaseState(memoryStorage(), () => 0);
+    await hub.acquireLease(holder);
+    expect((await send(hub, get(holder, "config"))).status).toBe(404);
+    expect((await send(hub, put(holder, "{}", null))).status).toBe(400);
+    expect((await send(hub, put(holder, "{}", 0))).status).toBe(400);
+    expect((await send(hub, put(holder, "[]"))).status).toBe(400);
+    expect((await send(hub, put(holder, "not json"))).status).toBe(400);
+    expect((await send(hub, put(holder, `{"x":"${"y".repeat(1024 * 1024)}"}`))).status).toBe(413);
     expect(await hub.readDocument("auth")).toBeUndefined();
   });
 
-  test("the supervisor restores it over the snapshot's copy and hands ocx the boot id", async () => {
-    const saved = "{\"xai\":{\"accounts\":[]}}";
-    const state = fakeStateServer({ "GET /documents/auth": () => new Response(saved) });
-    const home = scratch();
-    writeFileSync(join(home, "auth.json"), "{\"stale\":true}");
+  async function bootWith(document: Response, home: string): Promise<string> {
+    const state = fakeStateServer({ "GET /documents/auth": () => document });
     const seen = join(home, "boot-id");
     const { code, exit } = recordingExit();
     const supervisor = new Supervisor({ roots: [{ prefix: "opencodex", dir: home }], intervalMs: 60_000, port: 0, stateOrigin: state.origin, exit, handleSignals: false });
     void supervisor.main(["bun", "-e", `require("node:fs").writeFileSync(${JSON.stringify(seen)}, process.env.OCX_STATE_BOOT_ID ?? ""); setInterval(() => {}, 1000)`]);
     try {
       await until(() => existsSync(seen) && readFileSync(seen, "utf8").length > 0);
-      expect(readFileSync(join(home, "auth.json"), "utf8")).toBe(saved);
-      if (process.platform !== "win32") expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
-      expect(readFileSync(seen, "utf8")).toMatch(/^[0-9a-f]{32}$/);
       void supervisor.shutdown("SIGTERM");
       expect(await code).toBe(0);
+      return readFileSync(seen, "utf8");
     } finally {
       state.stop();
     }
+  }
+
+  test("the supervisor restores it over an older snapshot copy and hands ocx the boot id", async () => {
+    const saved = "{\"xai\":{\"accounts\":[]}}";
+    const home = scratch();
+    writeFileSync(join(home, "auth.json"), "{\"stale\":true}");
+    writeFileSync(join(home, "auth.json.seq"), "{\"seq\":4,\"mirrored\":true}");
+    const bootId = await bootWith(new Response(saved, { headers: { [DOCUMENT_SEQUENCE_HEADER]: "5" } }), home);
+    expect(bootId).toMatch(/^[0-9a-f]{32}$/);
+    expect(readFileSync(join(home, "auth.json"), "utf8")).toBe(saved);
+    if (process.platform !== "win32") expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(join(home, "auth.json.seq"), "utf8"))).toEqual({ seq: 5, mirrored: true });
+  });
+
+  test("a snapshot holding a commit the Durable Object missed keeps its own copy", async () => {
+    const home = scratch();
+    writeFileSync(join(home, "auth.json"), "{\"newer\":true}");
+    writeFileSync(join(home, "auth.json.seq"), "{\"seq\":6,\"mirrored\":false}");
+    await bootWith(new Response("{\"older\":true}", { headers: { [DOCUMENT_SEQUENCE_HEADER]: "5" } }), home);
+    expect(readFileSync(join(home, "auth.json"), "utf8")).toBe("{\"newer\":true}");
+    expect(JSON.parse(readFileSync(join(home, "auth.json.seq"), "utf8"))).toEqual({ seq: 6, mirrored: false });
   });
 
   test("an unreadable durable copy stops the boot instead of starting on older credentials", async () => {

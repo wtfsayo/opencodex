@@ -177,20 +177,35 @@ interval can grow.
 ## 3a progress (2026-09-27): OAuth `auth.json` written through
 
 Smaller than the seam in the table: the file stays the store every reader uses, and the Durable
-Object gets a whole-document copy before each local write.
+Object gets a whole-document copy on each commit. The first version failed the commit when the
+Durable Object was unreachable; both adversarial reviewers showed that discards a refresh token the
+provider had already rotated, which is worse than no mirror. The shipped rule is that the local
+write always happens (except after a lost lease), and a sequence number decides which copy is newer.
 
-- `mutateStore` (`src/oauth/store.ts`) is the only writer of `auth.json` and is already async. It
-  now awaits `mirrorAuthStore` (`src/oauth/durable-mirror.ts`) before `persist`, so the durable copy
-  is never older than the file. A failure after three attempts rejects the mutation before the file
-  is touched, which callers already handle as a failed disk write. A 409 (lease lost) is not retried.
-- Nothing runs unless `OCX_STATE_BOOT_ID` is set, which only the supervisor does for its child.
-  The origin is fixed to the intercepted `state.ocx.internal`.
-- The Durable Object stores the document under the lease: a non-holder can neither write nor read
-  it. `OCX_DISCARD_SAVED_STATE` deletes it with the snapshot pointer.
-- The supervisor restores it over the snapshot's `auth.json` after the snapshot restore; a failed
-  read stops the boot like a failed snapshot restore.
-- The ~106 synchronous readers are untouched.
+- `mutateStore` (`src/oauth/store.ts`) is the only writer of `auth.json`. With a boot id it awaits
+  `mirrorAuthStore` (`src/oauth/durable-mirror.ts`) before `persist`, re-runs `assertBeforePersist`
+  after that await, then records `{seq, mirrored}` in `auth.json.seq`. Without a boot id nothing is
+  awaited, so local installs keep their synchronous check-then-write.
+- Two attempts of 5 s each keep a commit under the 30 s mutation-queue wait and lock staleness. A
+  failure schedules a catch-up retry of that same document and sequence; a newer commit cancels it.
+- The Durable Object stores `{body, seq}` under the lease and answers 412 with its sequence to any
+  write that is not newer, so a timed-out attempt that lands late cannot replace a later commit. A
+  commit (never a catch-up) told of a higher stored sequence moves past it, because the committing
+  process holds the lease and the newest store.
+- The supervisor restores the Durable Object copy unless the snapshot's `auth.json.seq` says
+  `mirrored: false` with a higher sequence. `OCX_DISCARD_SAVED_STATE` deletes the document.
+- `OCX_STATE_BOOT_ID` is inherited by the container's whole `ocx` process tree, not only `ocx`;
+  nothing else there reads it.
+
+Known gaps, all narrower than the snapshot-only behavior they replace:
+- A login rejected by `assertBeforePersist` after its mirror succeeded leaves that document in the
+  Durable Object until the next commit; a restart in between restores it.
+- `auth.json` and `auth.json.seq` are staged into the snapshot one after the other. If a commit
+  lands between them while the Durable Object is unreachable and the container then dies without
+  `SIGTERM`, the next boot can prefer the Durable Object's older copy.
+- Writes from a separate `ocx` process in the container (for example `ocx login` over a shell)
+  have no boot id and are not mirrored; the next boot restores the Durable Object copy over them.
 
 Still riding the snapshot: refresh intents (`auth.refresh.*.lock.json`, Nous intents), the
 `pre-multiauth` backup, and `codex-accounts.json`, whose writers are synchronous and belong to the
-Codex pool. Losing an intent in a crash is the same outcome as the crash itself today.
+Codex pool.

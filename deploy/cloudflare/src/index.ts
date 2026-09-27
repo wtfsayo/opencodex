@@ -158,7 +158,7 @@ export class OpencodexHub extends Container<Env> {
   currentSnapshot() { return this.leases.currentSnapshot(); }
   commitSnapshot(bootId: string, key: string) { return this.leases.commitSnapshot(bootId, key); }
   readDocument(name: DurableDocument) { return this.leases.readDocument(name); }
-  commitDocument(bootId: string, name: DurableDocument, body: string) { return this.leases.commitDocument(bootId, name, body); }
+  commitDocument(bootId: string, name: DurableDocument, body: string, seq: number) { return this.leases.commitDocument(bootId, name, body, seq); }
 }
 
 async function handleState(req: Request, env: Env): Promise<Response> {

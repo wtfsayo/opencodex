@@ -34,7 +34,7 @@ import {
 } from "../lib/state-store-sweeper";
 import { validateCopilotApiBaseUrl } from "./github-copilot";
 import { validateDevinApiBaseUrl } from "./devin/api-base";
-import { mirrorAuthStore } from "./durable-mirror";
+import { AUTH_STORE_SEQUENCE_FILE, durableMirrorEnabled, mirrorAuthStore } from "./durable-mirror";
 import type { OAuthAccountSelection, OAuthCredentialSource, OAuthCredentials, ProviderAccount, ProviderAccountSet } from "./types";
 
 export type AuthStore = Record<string, ProviderAccountSet>;
@@ -68,6 +68,9 @@ export function resetOAuthReauthReconcileStateForTests(): void {
 /** Providers whose account set is pinned to a single slot (see module doc). */
 const SINGLE_SLOT_PROVIDERS = new Set(["chatgpt"]);
 
+function getAuthStoreSequencePath(): string {
+  return join(getConfigDir(), AUTH_STORE_SEQUENCE_FILE);
+}
 export function getAuthStorePath(): string {
   return join(getConfigDir(), "auth.json");
 }
@@ -824,8 +827,11 @@ export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValue
     // provisional value visible inside their callback. Finalization cannot await or mutate disk.
     options?.finalizeResult?.(result, store);
     const bytes = authStoreBytes(store);
-    await mirrorAuthStore(bytes);
+    const mirror = durableMirrorEnabled() ? await mirrorAuthStore(bytes, getAuthStoreSequencePath()) : null;
+    // The mirror awaited the network; a login superseded meanwhile must still not be written.
+    if (mirror) options?.assertBeforePersist?.();
     persist(bytes);
+    try { mirror?.settle(); } catch (error) { console.warn(`[oauth] Could not record the auth store sequence: ${error instanceof Error ? error.message : String(error)}`); }
     if (scrubbedProviders.length > 0) scrubLegacyBackup(scrubbedProviders);
     for (const provider of changedProviders) publishAccountSelection(provider, "oauth");
     return result;

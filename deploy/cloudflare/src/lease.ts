@@ -40,6 +40,8 @@ export const DURABLE_DOCUMENTS = ["auth"] as const;
 export type DurableDocument = (typeof DURABLE_DOCUMENTS)[number];
 // SQLite-backed Durable Objects cap a stored value at 2 MiB; an auth store is a few KiB.
 export const MAX_DOCUMENT_BYTES = 1024 * 1024;
+export type StoredDocument = { body: string; seq: number };
+export type DocumentCommit = { kind: "committed" } | { kind: "lease-lost" } | { kind: "stale"; storedSeq: number };
 
 /** The Durable Object's state. Awaiting DO storage keeps the input gate closed, so these read-modify-writes need no CAS. */
 export class LeaseState {
@@ -91,14 +93,19 @@ export class LeaseState {
     return { replaced: replaced === key ? undefined : replaced };
   }
 
-  readDocument(name: DurableDocument): Promise<string | undefined> {
-    return this.storage.get<string>(DOCUMENT_KEY_PREFIX + name);
+  readDocument(name: DurableDocument): Promise<StoredDocument | undefined> {
+    return this.storage.get<StoredDocument>(DOCUMENT_KEY_PREFIX + name);
   }
 
-  /** False when the caller lost the lease: a fenced container must not overwrite the holder's credentials. */
-  async commitDocument(bootId: string, name: DurableDocument, body: string): Promise<boolean> {
-    if (!(await this.holdsLease(bootId))) return false;
-    await this.storage.put(DOCUMENT_KEY_PREFIX + name, body);
-    return true;
+  /**
+   * Stores `body` only if `seq` is newer than what is held: a retry that lands late must not replace
+   * a later commit. A fenced container must not overwrite the holder's credentials at all.
+   */
+  async commitDocument(bootId: string, name: DurableDocument, body: string, seq: number): Promise<DocumentCommit> {
+    if (!(await this.holdsLease(bootId))) return { kind: "lease-lost" };
+    const current = await this.readDocument(name);
+    if (current && current.seq >= seq) return { kind: "stale", storedSeq: current.seq };
+    await this.storage.put<StoredDocument>(DOCUMENT_KEY_PREFIX + name, { body, seq });
+    return { kind: "committed" };
   }
 }

@@ -8,7 +8,9 @@ export type NativeChatDeps = {
   /** Upstream hosts answered inside the Worker (the Workers AI binding), by host name. */
   localHosts?: Record<string, (request: Request) => Promise<Response>>;
   fetch(request: Request): Promise<Response>;
+  /** Why a request went to the container. Reasons name config keys and fields, never values. */
+  onDecline?(reason: string): void;
 };
 
 /** Serves the turn, or returns null to hand the request (with `bodyText`) to the container. */
-export type ServeNativeChat = (bodyText: string, signal: AbortSignal, deps: NativeChatDeps) => Promise<Response | null>;
+export type ServeNativeChat = (bodyText: string, headers: Headers, signal: AbortSignal, deps: NativeChatDeps) => Promise<Response | null>;

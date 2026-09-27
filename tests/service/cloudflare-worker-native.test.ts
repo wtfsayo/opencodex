@@ -74,8 +74,11 @@ describe("Worker-native chat import boundary", () => {
 });
 
 const provider = { adapter: "openai-chat", baseUrl: "https://api.example.test/v1", apiKey: "sk-literal", models: ["m-1", "vendor/m-2"] };
-const config = (extra: Record<string, unknown> = {}, providerExtra: Record<string, unknown> = {}) =>
-  ({ port: 10100, hostname: "0.0.0.0", defaultProvider: "p", providers: { p: { ...provider, ...providerExtra } }, ...extra });
+// runtimeRole, hub and fastRows are what a Cloudflare hub's own config.json carries.
+const config = (extra: Record<string, unknown> = {}, providerExtra: Record<string, unknown> = {}) => ({
+  port: 10100, hostname: "0.0.0.0", runtimeRole: "hub", hub: { dataPublicOrigin: "https://hub.example.test" }, fastRows: true,
+  defaultProvider: "p", providers: { p: { ...provider, ...providerExtra } }, ...extra,
+});
 
 describe("Worker-native chat routing", () => {
   test("agrees with ocx's router whenever it resolves a route", () => {
@@ -124,6 +127,8 @@ describe("Worker-native chat routing", () => {
       [config({}, { baseUrl: "https://ai.ocx.internal/v1" }), "p/m-1"],
       [config({}, { baseUrl: "https://user:pw@api.example.test/v1" }), "p/m-1"],
       [config({}, { baseUrl: "https://localhost./v1" }), "p/m-1"],
+      // Synthetic Fast and effort rows are resolved by ocx before routing.
+      [config({}, { models: ["m-1", "m-1--fast"] }), "p/m-1--fast"],
       [config({}, { baseUrl: "https://metadata.google.internal./v1" }), "p/m-1"],
       [config({}, { baseUrl: "https://2130706433/v1" }), "p/m-1"],
     ];
@@ -155,7 +160,7 @@ describe("Worker-native chat serving", () => {
       seen.push({ model, messages: input.messages });
       return sse(["data: {\"response\":\"Po\"}\n\n", "data: {\"response\":\"ng\"}\n\n", "data: [DONE]\n\n"]).body!;
     } };
-    const response = await serveNativeChat(turn, new AbortController().signal, {
+    const response = await serveNativeChat(turn, new Headers(), new AbortController().signal, {
       readConfig: async () => workersAiConfig,
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, ai) },
       fetch: async () => { throw new Error("no network in this test"); },
@@ -172,23 +177,27 @@ describe("Worker-native chat serving", () => {
   test("hands the turn to the container when it cannot serve it, before sending anything", async () => {
     const neverCalled = { readConfig: async () => workersAiConfig, fetch: async () => { throw new Error("unexpected upstream call"); } };
     const signal = new AbortController().signal;
-    expect(await serveNativeChat("not json", signal, neverCalled)).toBeNull();
-    expect(await serveNativeChat(JSON.stringify({ ...JSON.parse(turn), stream: false }), signal, neverCalled)).toBeNull();
-    expect(await serveNativeChat(turn, signal, { ...neverCalled, readConfig: async () => undefined })).toBeNull();
+    expect(await serveNativeChat("not json", new Headers(), signal, neverCalled)).toBeNull();
+    expect(await serveNativeChat(JSON.stringify({ ...JSON.parse(turn), stream: false }), new Headers(), signal, neverCalled)).toBeNull();
+    expect(await serveNativeChat(turn, new Headers(), signal, { ...neverCalled, readConfig: async () => undefined })).toBeNull();
     // An upstream error is left to the container, which owns retries and error shaping.
-    const failing = await serveNativeChat(turn, signal, {
+    const failing = await serveNativeChat(turn, new Headers(), signal, {
       readConfig: async () => workersAiConfig,
       localHosts: { [WORKERS_AI_HOST]: async () => Response.json({ error: { message: "busy" } }, { status: 503 }) },
       fetch: neverCalled.fetch,
     });
     expect(failing).toBeNull();
+    // Collaboration turns get ocx's reasoning-effort cap, which this path does not apply.
+    const spawn = JSON.stringify({ ...JSON.parse(turn), tools: [{ type: "function", function: { name: "spawn_agent" } }] });
+    expect(await serveNativeChat(spawn, new Headers(), signal, neverCalled)).toBeNull();
+    expect(await serveNativeChat(turn, new Headers({ "x-openai-subagent": "collab_spawn" }), signal, neverCalled)).toBeNull();
   });
 
   test("an external provider is called with its literal key", async () => {
     const config = JSON.stringify({ providers: { p: { ...provider } } });
     let authorization: string | null = null;
     let url = "";
-    const response = await serveNativeChat(JSON.stringify({ model: "p/m-1", stream: true, messages: [{ role: "user", content: "hi" }] }), new AbortController().signal, {
+    const response = await serveNativeChat(JSON.stringify({ model: "p/m-1", stream: true, messages: [{ role: "user", content: "hi" }] }), new Headers(), new AbortController().signal, {
       readConfig: async () => config,
       fetch: async request => {
         authorization = request.headers.get("authorization");

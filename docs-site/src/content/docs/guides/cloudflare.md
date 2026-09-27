@@ -168,6 +168,12 @@ The Worker serves a request only when all of these hold, and otherwise passes it
   optionally `authMode: "key"`. Workers AI qualifies as shown above.
 - The config has nothing beyond basic settings: any routing, redirect, limit, or surface section
   sends every request to `ocx`.
+- The turn is not a multi-agent collaboration turn (a `spawn_agent` tool, or a spawned child's
+  headers), which `ocx` gives a reasoning-effort cap, and the model id has no `--`, which `ocx`
+  reads as a Fast or effort row.
+
+When the Worker passes a request on, it logs why once per reason (for example
+`Worker-native chat declined: config-keys:<names>`); `npx wrangler tail` shows it.
 
 If the provider returns an error, or answers without streaming, the Worker sends the request to
 `ocx` instead, which retries and reports it as usual. The provider then sees that request twice.

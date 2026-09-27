@@ -200,6 +200,14 @@ async function serveDashboard(req: Request, assets: Fetcher): Promise<Response> 
   return new Response(page.body, { status: page.status, headers });
 }
 
+// One line per reason per isolate: enough to see why the Worker is not serving, without a line per request.
+const loggedDeclines = new Set<string>();
+function logDeclineOnce(reason: string): void {
+  if (loggedDeclines.has(reason) || loggedDeclines.size >= 64) return;
+  loggedDeclines.add(reason);
+  console.log(`Worker-native chat declined: ${reason}`);
+}
+
 // Larger bodies stream to the container untouched: reading them here costs Worker memory (128 MB)
 // and a text-only turn this path would serve is far smaller.
 const NATIVE_MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -221,10 +229,11 @@ async function tryWorkerNative(req: Request, env: Env): Promise<Response | { for
   const bodyBytes = await req.arrayBuffer();
   const hub = getContainer(env.HUB, HUB_NAME);
   try {
-    const served = await serveNativeChat(new TextDecoder().decode(bodyBytes), req.signal, {
+    const served = await serveNativeChat(new TextDecoder().decode(bodyBytes), req.headers, req.signal, {
       readConfig: async () => (await hub.readDocument("config"))?.body,
       localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
       fetch: request => fetch(request),
+      onDecline: logDeclineOnce,
     });
     if (served) return served;
   } catch (error) {

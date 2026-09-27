@@ -25,6 +25,7 @@ import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { atomicWriteFileAsync, getConfigDir } from "../config";
 import type { OcxProviderOpaqueToolCallMetadata, OcxReasoningReplayScopeRef } from "../types";
+import { registerThoughtSignatureStore } from "./thought-signature-slot";
 import { isCarryableSignature, responsesExtraContentFromProviderMetadata } from "./provider-opaque-metadata";
 
 const STORE_FILE_NAME = "thought-signature-replay.json";
@@ -247,51 +248,10 @@ export function rememberThoughtSignatureForReplay(
   return { result: "stored", durable: persist() };
 }
 
-/**
- * Serialize provider metadata onto an outbound Responses function_call item AND remember the
- * signature server-side, so a client that replays the call without echoing extra_content can
- * still be served from the store.
- */
-export function rememberAndSerializeExtraContent(
-  callId: string,
-  metadata: OcxProviderOpaqueToolCallMetadata | undefined,
-  scope: OcxReasoningReplayScopeRef | undefined,
-): {
-  extra?: { extra_content: { google: { thought_signature: string } } };
-  durable: Promise<void>;
-} {
-  const extra = responsesExtraContentFromProviderMetadata(metadata);
-  if (!extra) return { durable: Promise.resolve() };
-  const { durable } = rememberThoughtSignatureForReplay(
-    callId,
-    extra.extra_content.google.thought_signature,
-    scope,
-  );
-  return { extra, durable };
-}
 
-/**
- * Remember the signature without serializing it onto the item. Used for freeform tools, whose
- * Responses items are custom_tool_call blocks that cannot carry extra_content — the signature
- * still must be stored so the replayed call (which comes back as custom_tool_call and never
- * echoes metadata) can be re-signed server-side.
- */
-export function rememberExtraContentForReplay(
-  callId: string,
-  metadata: OcxProviderOpaqueToolCallMetadata | undefined,
-  scope: OcxReasoningReplayScopeRef | undefined,
-): Promise<void> {
-  const extra = responsesExtraContentFromProviderMetadata(metadata);
-  if (!extra) return Promise.resolve();
-  return rememberThoughtSignatureForReplay(
-    callId,
-    extra.extra_content.google.thought_signature,
-    scope,
-  ).durable;
-}
 
 /** Look up a signature previously handed out for this call in THIS scope, if still fresh. */
-export function lookupReplayThoughtSignature(
+function lookupStoredThoughtSignature(
   callId: string,
   scope: OcxReasoningReplayScopeRef | undefined,
 ): string | undefined {
@@ -353,7 +313,7 @@ export function flushThoughtSignatureReplayForTests(): Promise<void> {
  * in-memory map is updated synchronously at remember() time, so within one process
  * lifetime replay never races this barrier at all.
  */
-export function awaitThoughtSignatureDurability(capMs = 250): Promise<void> {
+function awaitStoreDurability(capMs = 250): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const cap = new Promise<void>(resolve => {
     timer = setTimeout(resolve, capMs);
@@ -362,3 +322,18 @@ export function awaitThoughtSignatureDurability(capMs = 250): Promise<void> {
     if (timer !== undefined) clearTimeout(timer);
   });
 }
+
+// The disk-backed store takes the slot as soon as anything in the process loads this module; in
+// the proxy, the Responses delivery and replay modules do so at startup.
+registerThoughtSignatureStore({
+  remember: rememberThoughtSignatureForReplay,
+  lookup: lookupStoredThoughtSignature,
+  awaitDurability: awaitStoreDurability,
+});
+
+export {
+  awaitThoughtSignatureDurability,
+  lookupReplayThoughtSignature,
+  rememberAndSerializeExtraContent,
+  rememberExtraContentForReplay,
+} from "./thought-signature-slot";

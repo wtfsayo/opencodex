@@ -14,9 +14,9 @@ import type {
 import { createToolChoiceResolver, namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
 import { providerMetadataFromResponsesFunctionCall } from "./provider-opaque-metadata";
-import { lookupReplayThoughtSignature } from "./thought-signature-replay";
+import { lookupReplayThoughtSignature } from "./thought-signature-slot";
 import { compactionItemToText, isCompactionItemType } from "./compaction";
-import { previousResponseReplayPrefixLength } from "./state";
+import { previousResponseReplayPrefixLength } from "./replay-provenance";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
 import { hasRoutedIdentity, nameRoutedIdentity } from "../adapters/identity";
 import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synthetic-tool";

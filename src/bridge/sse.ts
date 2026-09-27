@@ -32,7 +32,7 @@ import {
   rememberAndSerializeExtraContent,
   rememberExtraContentForReplay,
   awaitThoughtSignatureDurability,
-} from "../responses/thought-signature-replay";
+} from "../responses/thought-signature-slot";
 import { resolveStallTimeoutSec } from "../stall-timeout";
 import {
   createCitationMarkerFilter,

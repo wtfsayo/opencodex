@@ -1,4 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { previousResponseReplayPrefixLength, replayedInputPrefixLengths } from "./replay-provenance";
 import { dirname, join } from "node:path";
 import { atomicWriteFileAsync, getConfigDir, resolveWriteTarget } from "../config";
 import { enforceAppOwnedMemoryBudget, type RetainedStoreSnapshot } from "../lib/app-owned-memory";
@@ -595,7 +596,6 @@ bindSpillQueueStore({
 // upstream. The parser uses this boundary to acknowledge historical compaction markers exactly
 // once. It records the boundary whether the proxy prepended the history or the client already
 // carried it — the boundary is the same either way, and only its provenance differs.
-const replayedInputPrefixLengths = new WeakMap<object, number>();
 const replayFailures = new WeakMap<object, PreviousResponseReplayFailure>();
 let loaded = false;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1122,11 +1122,6 @@ export function previousResponseReplayFailure(body: unknown): PreviousResponseRe
   return replayFailures.get(body);
 }
 
-/** Number of leading input items restored from previous_response_id state for this exact body. */
-export function previousResponseReplayPrefixLength(body: unknown): number {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return 0;
-  return replayedInputPrefixLengths.get(body) ?? 0;
-}
 
 /** Copy proxy-private replay provenance to an internal clone with the same materialized input. */
 export function copyPreviousResponseReplayProvenance(source: unknown, target: unknown): void {
@@ -1367,3 +1362,5 @@ export function clearResponseStateForTests(): void {
   }
   try { rmSync(responseSpillDirectory(), { recursive: true, force: true }); } catch { /* no spill directory */ }
 }
+
+export { previousResponseReplayPrefixLength };

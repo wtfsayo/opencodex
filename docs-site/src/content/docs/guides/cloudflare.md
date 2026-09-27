@@ -201,7 +201,13 @@ The container's entrypoint is `docker/cloudflare-supervisor.ts`. It:
    stops the old container before starting the new one.
 
 SQLite databases are copied with `VACUUM INTO`, so a snapshot never holds a half-written database.
-Lock databases and the generated management token are left out. Other files are copied as they
+Lock databases, the generated management token, and `routing-history.sqlite` (rebuilt from
+`usage.jsonl` at startup) are left out.
+
+Every snapshot carries the whole usage ledger, so the first boot caps it: the seeded config sets
+`usageLedgerMaxBytes` to 32 MiB unless `OCX_BOOTSTRAP_CONFIG_JSON` sets its own (at least 1 MiB).
+The oldest rows are dropped past the cap. Usage rows written after the last snapshot are lost if
+the container dies without `SIGTERM`; on a normal stop the final snapshot includes them. Other files are copied as they
 are; the final snapshot is taken after `ocx` has exited, so it cannot catch a file mid-write.
 
 OAuth logins and refreshed tokens, including Codex pool tokens, do not wait for a snapshot. Each

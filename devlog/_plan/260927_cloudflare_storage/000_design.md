@@ -227,3 +227,19 @@ size warning per write.
 Still riding the snapshot: refresh intents (`auth.refresh.*.lock.json`, Codex refresh locks, Nous
 intents) and the `pre-multiauth` backup. Losing an intent in a crash is the same outcome as the
 crash itself today.
+
+## 3b (2026-09-28): usage ledger stays in the snapshot, bounded
+
+Moving `usage.jsonl` into the Durable Object would add a network hop per request (its only writer,
+`appendUsageEntry`, is a synchronous append at request end) and rewrite every reader that assumes a
+local file with byte offsets (`routing-history` indexer, retention, the management snapshot reader).
+Losing up to one snapshot interval of usage rows is acceptable where losing a credential is not, so
+3b only stops the ledger from growing every upload:
+
+- `seedBootstrapConfig` seeds `usageLedgerMaxBytes: 32 MiB` unless the operator's bootstrap config
+  sets one. The existing retention trims to the newest rows and resets derived readers.
+- `routing-history.sqlite` is skipped by `classifyFile`; it records the ledger's identity and
+  offset and rebuilds when they do not match.
+
+Not done: a delta upload (append-only rows keyed by boot id and offset) instead of re-sending the
+capped ledger each interval. Worth it only if snapshot bandwidth shows up in real use.

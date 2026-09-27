@@ -8,8 +8,10 @@ import { decideLease, DURABLE_DOCUMENTS, isHolder, LEASE_STALE_MS, LeaseState, t
 import { DOCUMENT_SEQUENCE_HEADER, handleStateRequest, snapshotPrefix, sweepOrphans, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
 import { documentDigest, DOCUMENT_SEQUENCE_HEADER as MIRROR_SEQUENCE_HEADER, DURABLE_DOCUMENT_FILES } from "../../src/lib/durable-mirror";
 import { containerEnv, dashboardEnabled, isAnonymousHealthCheck, DASHBOARD_BOOTSTRAP_META, edgeDecision, envFingerprint, isSupersededBy, forwardableRequest, servedByHub } from "../../deploy/cloudflare/src/container-env";
-import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, sequenceFilesFirst, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
+import { applySnapshot, classifyFile, copySqlite, DEFAULT_USAGE_LEDGER_MAX_BYTES, seedBootstrapConfig, sequenceFilesFirst, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { HISTORY_DB_FILENAME } from "../../src/routing/history/schema";
+import { MIN_USAGE_LEDGER_MAX_BYTES } from "../../src/usage/retention-contract";
 import { repoPath } from "../helpers/repo-root";
 import { handleWorkersAi, toChatCompletionStream, toWorkersAiRequest, workersAiModel } from "../../deploy/cloudflare/src/workers-ai";
 
@@ -54,6 +56,8 @@ describe("cloudflare supervisor snapshots", () => {
     expect(classifyFile("config-mutation.sqlite", SQLITE)).toBe("skip");
     expect(classifyFile(".opencodex-native-main.claim.sqlite", SQLITE)).toBe("skip");
     expect(classifyFile("admin-api-token", "0123")).toBe("skip");
+    expect(classifyFile("routing-history.sqlite", SQLITE)).toBe("skip");
+    expect(HISTORY_DB_FILENAME).toBe("routing-history.sqlite");
   });
 
   test("round-trips a live WAL database, files, modes, and symlinks, skipping locks", async () => {
@@ -131,7 +135,11 @@ describe("cloudflare supervisor snapshots", () => {
     expect(() => seedBootstrapConfig(home, { OCX_BOOTSTRAP_CONFIG_JSON: "[1]" })).toThrow("JSON object");
     // ocx defaults to 127.0.0.1, which the Worker cannot reach: an omitted bind address is filled in.
     expect(seedBootstrapConfig(home, { OCX_BOOTSTRAP_CONFIG_JSON: "{\"defaultProvider\":\"demo\"}" })).toBe(true);
-    expect(JSON.parse(readFileSync(join(home, "config.json"), "utf8"))).toEqual({ defaultProvider: "demo", hostname: "0.0.0.0", port: 10100 });
+    expect(JSON.parse(readFileSync(join(home, "config.json"), "utf8"))).toEqual({ usageLedgerMaxBytes: DEFAULT_USAGE_LEDGER_MAX_BYTES, defaultProvider: "demo", hostname: "0.0.0.0", port: 10100 });
+    // The operator's cap wins; the schema would silently drop a default below its minimum.
+    expect(seedBootstrapConfig(home, { OCX_BOOTSTRAP_CONFIG_JSON: "{\"usageLedgerMaxBytes\":2097152}" })).toBe(true);
+    expect(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).usageLedgerMaxBytes).toBe(2097152);
+    expect(DEFAULT_USAGE_LEDGER_MAX_BYTES).toBeGreaterThanOrEqual(MIN_USAGE_LEDGER_MAX_BYTES);
     expect(statSync(join(home, "config.json")).mode & 0o777).toBe(0o600);
     expect(() => seedBootstrapConfig(home, { OCX_BOOTSTRAP_CONFIG_JSON: "{\"hostname\":\"127.0.0.1\"}" })).toThrow("0.0.0.0");
     expect(() => seedBootstrapConfig(home, { OCX_BOOTSTRAP_CONFIG_JSON: "{\"port\":10200}" })).toThrow("10100");

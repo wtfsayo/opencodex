@@ -19,12 +19,18 @@ const LOCK_DATABASE = /(lock|mutation|owner|claim|serialization|publication|life
 const SQLITE_SIDECAR = /-(wal|shm|journal)$/;
 // Regenerated at startup when absent. Leaving it out keeps a working management credential out of R2.
 const REGENERATED_SECRETS = new Set(["admin-api-token"]);
+// Projections ocx rebuilds from files the snapshot keeps (routing-history.sqlite from usage.jsonl).
+// Copying them grows every upload with the ledger for nothing.
+const REBUILT_PROJECTIONS = new Set(["routing-history.sqlite"]);
+// Seeded when the operator's bootstrap config sets none. Every snapshot uploads the whole ledger,
+// and without a cap it grows for as long as the hub serves requests.
+export const DEFAULT_USAGE_LEDGER_MAX_BYTES = 32 * 1024 * 1024;
 
 export type StateRoot = { prefix: string; dir: string };
 export type FileClass = "copy" | "sqlite" | "skip";
 
 export function classifyFile(name: string, header: string): FileClass {
-  if (SQLITE_SIDECAR.test(name) || REGENERATED_SECRETS.has(name)) return "skip";
+  if (SQLITE_SIDECAR.test(name) || REGENERATED_SECRETS.has(name) || REBUILT_PROJECTIONS.has(name)) return "skip";
   if (header === SQLITE_HEADER) return LOCK_DATABASE.test(name) ? "skip" : "sqlite";
   return "copy";
 }
@@ -465,7 +471,7 @@ export function seedBootstrapConfig(
     throw new Error(`OCX_BOOTSTRAP_CONFIG_JSON must use "port": ${port} (or omit it)`);
   }
   mkdirSync(home, { recursive: true, mode: 0o700 });
-  const seeded = { ...config, hostname: "0.0.0.0", port };
+  const seeded = { usageLedgerMaxBytes: DEFAULT_USAGE_LEDGER_MAX_BYTES, ...config, hostname: "0.0.0.0", port };
   writeFileSync(join(home, "config.json"), `${JSON.stringify(seeded, null, 2)}\n`, { mode: 0o600 });
   return true;
 }

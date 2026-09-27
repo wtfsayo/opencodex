@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { flushConfigDirHardeningForTests } from "../../src/config/paths";
-import { DOCUMENT_SEQUENCE_HEADER, sequenceFileFor, DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/lib/durable-mirror";
+import { DOCUMENT_SEQUENCE_HEADER, documentDigest, sequenceFileFor, DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/lib/durable-mirror";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
 import { getAuthStorePath, getCredential, mutateStore, resetOAuthReauthReconcileStateForTests, saveCredential } from "../../src/oauth/store";
 import { resetHardenedStateForTests, setAsyncIcaclsRunnerForTests, setIcaclsRunnerForTests } from "../../src/lib/windows-secret-acl";
@@ -99,7 +99,7 @@ describe("auth store durable mirror", () => {
     expect(calls[0]!.fileAtCall).toBeNull();
     expect(calls[1]!.fileAtCall).toBe(calls[0]!.body);
     expect(readFileSync(getAuthStorePath(), "utf8")).toBe(calls[1]!.body);
-    expect(sequenceFile()).toEqual({ seq: 2, mirrored: true });
+    expect(sequenceFile()).toMatchObject({ seq: 2, mirrored: true });
   });
 
   test("a lost lease fails the commit at once and leaves the file untouched", async () => {
@@ -120,17 +120,17 @@ describe("auth store durable mirror", () => {
     // A refresh token the provider already rotated must reach the disk regardless.
     await saveCredential("xai", cred("rotated"));
     expect(getCredential("xai")?.access).toBe("rotated");
-    expect(sequenceFile()).toEqual({ seq: 1, mirrored: false });
+    expect(sequenceFile()).toMatchObject({ seq: 1, mirrored: false });
     expect(calls).toHaveLength(2);
 
     scheduled.shift()!();
     await flush();
-    expect(sequenceFile()).toEqual({ seq: 1, mirrored: false });
+    expect(sequenceFile()).toMatchObject({ seq: 1, mirrored: false });
     scheduled.shift()!();
     await flush();
     expect(calls.map(call => call.seq)).toEqual([1, 1, 1, 1, 1]);
     expect(calls[4]!.body).toBe(readFileSync(getAuthStorePath(), "utf8"));
-    expect(sequenceFile()).toEqual({ seq: 1, mirrored: true });
+    expect(sequenceFile()).toMatchObject({ seq: 1, mirrored: true });
     expect(scheduled).toEqual([]);
   });
 
@@ -142,7 +142,7 @@ describe("auth store durable mirror", () => {
     await saveCredential("xai", cred("two"));
     expect(scheduled).toEqual([]);
     expect(calls.map(call => call.seq)).toEqual([1, 1, 2]);
-    expect(sequenceFile()).toEqual({ seq: 2, mirrored: true });
+    expect(sequenceFile()).toMatchObject({ seq: 2, mirrored: true });
   });
 
   test("a stale answer is success when it names this write, and moves past a sequence file that fell behind", async () => {
@@ -151,13 +151,13 @@ describe("auth store durable mirror", () => {
     const landed = recordingTransport(["network", { status: 412, storedSeq: 1 }]);
     await saveCredential("xai", cred("one"));
     expect(landed.map(call => call.seq)).toEqual([1, 1]);
-    expect(sequenceFile()).toEqual({ seq: 1, mirrored: true });
+    expect(sequenceFile()).toMatchObject({ seq: 1, mirrored: true });
 
     setDurableMirrorTransportForTests(null);
     const behind = recordingTransport([{ status: 412, storedSeq: 9 }, 204]);
     await saveCredential("xai", cred("two"));
     expect(behind.map(call => call.seq)).toEqual([2, 10]);
-    expect(sequenceFile()).toEqual({ seq: 10, mirrored: true });
+    expect(sequenceFile()).toMatchObject({ seq: 10, mirrored: true });
   });
 
   test("a login superseded while the mirror was in flight is written nowhere", async () => {
@@ -174,7 +174,7 @@ describe("auth store durable mirror", () => {
     // The rejected store reached the Durable Object as sequence 2; the unchanged one replaces it as 3.
     expect(calls.map(call => call.seq)).toEqual([1, 2, 3]);
     expect(calls[2]!.body).toBe(kept);
-    expect(sequenceFile()).toEqual({ seq: 3, mirrored: true });
+    expect(sequenceFile()).toMatchObject({ seq: 3, mirrored: true });
   });
 });
 
@@ -217,8 +217,8 @@ describe("codex account store durable mirror", () => {
     await flush();
     expect(calls.map(call => [call.url, call.seq])).toEqual([["http://state.test/documents/codex-accounts", 1]]);
     expect(calls[0]!.body).toBe(readFileSync(codexFile(), "utf8"));
-    expect(sequences).toEqual([{ seq: 1, mirrored: false }]);
-    expect(codexSequence()).toEqual({ seq: 1, mirrored: true });
+    expect(sequences).toMatchObject([{ seq: 1, mirrored: false }]);
+    expect(codexSequence()).toEqual({ seq: 1, mirrored: true, digest: documentDigest(readFileSync(codexFile(), "utf8")) });
   });
 
   test("a failed background mirror is retried, and a newer write takes its place", async () => {
@@ -226,13 +226,13 @@ describe("codex account store durable mirror", () => {
     saveCodexAccountCredential("acct", codexCred("one"));
     await flush();
     expect(scheduled).toHaveLength(1);
-    expect(codexSequence()).toEqual({ seq: 1, mirrored: false });
+    expect(codexSequence()).toMatchObject({ seq: 1, mirrored: false });
     saveCodexAccountCredential("acct", codexCred("two"));
     expect(scheduled).toEqual([]);
     await flush();
     expect(calls.map(call => call.seq)).toEqual([1, 1, 2]);
     expect(calls[2]!.body).toBe(readFileSync(codexFile(), "utf8"));
-    expect(codexSequence()).toEqual({ seq: 2, mirrored: true });
+    expect(codexSequence()).toMatchObject({ seq: 2, mirrored: true });
   });
 
   test("a late answer for a superseded write does not mark the newer one mirrored", async () => {
@@ -257,7 +257,7 @@ describe("codex account store durable mirror", () => {
     await flush();
     await flush();
     expect(seqs).toEqual([1, 2, 2]);
-    expect(codexSequence()).toEqual({ seq: 2, mirrored: false });
+    expect(codexSequence()).toMatchObject({ seq: 2, mirrored: false });
   });
 });
 

@@ -201,12 +201,13 @@ Known gaps, all narrower than the snapshot-only behavior they replace:
 - A login rejected by the second `assertBeforePersist` has already been mirrored; the unchanged
   local store is committed over it as the next sequence. If that revert cannot reach the Durable
   Object, the sequence file records the local store as newer and unmirrored, so restore keeps it.
-- `auth.json` and `auth.json.seq` are staged into the snapshot one after the other. Commits landing
-  between the two copies, with the last one unmirrored, followed by a death without `SIGTERM`, can
-  make the next boot keep a local copy older than the Durable Object's. Carrying the sequence inside
-  the staged pair would close it.
+- The sequence file also records a digest of the content its sequence names, and snapshots stage
+  each sequence file before its document. A local file that no longer matches its digest was
+  changed by something that did not record it, so restore keeps it. That closes the staging race
+  noted earlier and the rollback of writes made by an older image.
 - Writes from a separate `ocx` process in the container (for example `ocx login` over a shell)
-  have no boot id and are not mirrored; the next boot restores the Durable Object copy over them.
+  have no boot id and are not mirrored; the digest check keeps them at restore, but they reach the
+  Durable Object only with the next mirrored commit.
 
 `codex-accounts.json` followed (same day). Its writers are synchronous and run inside the SQLite
 config-mutation lock, so they cannot await the network. `writeCodexAccountsFile` in

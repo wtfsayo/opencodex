@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decideLease, DURABLE_DOCUMENTS, isHolder, LEASE_STALE_MS, LeaseState, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
 import { DOCUMENT_SEQUENCE_HEADER, handleStateRequest, snapshotPrefix, sweepOrphans, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
-import { DOCUMENT_SEQUENCE_HEADER as MIRROR_SEQUENCE_HEADER, DURABLE_DOCUMENT_FILES } from "../../src/lib/durable-mirror";
+import { documentDigest, DOCUMENT_SEQUENCE_HEADER as MIRROR_SEQUENCE_HEADER, DURABLE_DOCUMENT_FILES } from "../../src/lib/durable-mirror";
 import { containerEnv, dashboardEnabled, isAnonymousHealthCheck, DASHBOARD_BOOTSTRAP_META, edgeDecision, envFingerprint, isSupersededBy, forwardableRequest, servedByHub } from "../../deploy/cloudflare/src/container-env";
-import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
+import { applySnapshot, classifyFile, copySqlite, seedBootstrapConfig, sequenceFilesFirst, stageSnapshot, Supervisor, type StateRoot } from "../../docker/cloudflare-supervisor";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
 import { handleWorkersAi, toChatCompletionStream, toWorkersAiRequest, workersAiModel } from "../../deploy/cloudflare/src/workers-ai";
@@ -719,7 +719,7 @@ describe("cloudflare durable auth store", () => {
     expect(bootId).toMatch(/^[0-9a-f]{32}$/);
     expect(readFileSync(join(home, "auth.json"), "utf8")).toBe(saved);
     if (process.platform !== "win32") expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
-    expect(JSON.parse(readFileSync(join(home, "auth.json.seq"), "utf8"))).toEqual({ seq: 5, mirrored: true });
+    expect(JSON.parse(readFileSync(join(home, "auth.json.seq"), "utf8"))).toEqual({ seq: 5, mirrored: true, digest: documentDigest(saved) });
   });
 
   test("the Codex account store is restored the same way", async () => {
@@ -734,7 +734,7 @@ describe("cloudflare durable auth store", () => {
     try {
       await until(() => existsSync(seen));
       expect(readFileSync(join(home, "codex-accounts.json"), "utf8")).toBe(saved);
-      expect(JSON.parse(readFileSync(join(home, "codex-accounts.json.seq"), "utf8"))).toEqual({ seq: 7, mirrored: true });
+      expect(JSON.parse(readFileSync(join(home, "codex-accounts.json.seq"), "utf8"))).toMatchObject({ seq: 7, mirrored: true });
       expect(state.events).toContain("GET /documents/auth");
       void supervisor.shutdown("SIGTERM");
       expect(await code).toBe(0);
@@ -750,6 +750,20 @@ describe("cloudflare durable auth store", () => {
     await bootWith(new Response("{\"older\":true}", { headers: { [DOCUMENT_SEQUENCE_HEADER]: "5" } }), home);
     expect(readFileSync(join(home, "auth.json"), "utf8")).toBe("{\"newer\":true}");
     expect(JSON.parse(readFileSync(join(home, "auth.json.seq"), "utf8"))).toEqual({ seq: 6, mirrored: false });
+  });
+
+  test("a local file changed without a recorded sequence keeps its own copy", async () => {
+    const home = scratch();
+    // Recorded as mirrored, but the file was since rewritten by a writer without the boot id.
+    writeFileSync(join(home, "auth.json"), "{\"rewritten\":true}");
+    writeFileSync(join(home, "auth.json.seq"), JSON.stringify({ seq: 5, mirrored: true, digest: documentDigest("{\"recorded\":true}") }));
+    await bootWith(new Response("{\"recorded\":true}", { headers: { [DOCUMENT_SEQUENCE_HEADER]: "5" } }), home);
+    expect(readFileSync(join(home, "auth.json"), "utf8")).toBe("{\"rewritten\":true}");
+  });
+
+  test("a snapshot stages each sequence file before its document", () => {
+    expect(["config.json", "auth.json", "codex-accounts.json.seq", "auth.json.seq", "codex-accounts.json"].sort(sequenceFilesFirst))
+      .toEqual(["auth.json.seq", "codex-accounts.json.seq", "auth.json", "codex-accounts.json", "config.json"]);
   });
 
   test("an unreadable durable copy stops the boot instead of starting on older credentials", async () => {

@@ -143,10 +143,10 @@ export function writeCodexAccountsFile(bytes: string | null): void {
   const dir = getConfigDir();
   assertNotRealHomeUnderTest(dir);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const pending = beginLocalWrite("codex-accounts", join(dir, sequenceFileFor("codex-accounts")));
+  const pending = beginLocalWrite("codex-accounts", join(dir, sequenceFileFor("codex-accounts")), bytes ?? "{}\n");
   if (bytes === null) unlinkSync(codexAccountsPath());
   else atomicWriteFile(codexAccountsPath(), bytes);
-  pending?.written(bytes ?? "{}\n");
+  pending?.written();
 }
 
 function persistCredentialMutation(store: CodexAccountStore): void {

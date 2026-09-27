@@ -2,11 +2,11 @@
 // wiped whenever the instance sleeps or rolls out, so this process restores both state homes from
 // R2 before starting ocx and uploads them again while it runs and on SIGTERM.
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { copyFile, cp, lstat, mkdir, mkdtemp, open, readdir, readlink, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { DOCUMENT_SEQUENCE_HEADER, DURABLE_DOCUMENT_FILES, DURABLE_STATE_BOOT_ID_ENV, type DurableDocumentName, readSequenceState, sequenceFileFor, writeSequenceState } from "../src/lib/durable-mirror";
+import { DOCUMENT_SEQUENCE_HEADER, documentDigest, DURABLE_DOCUMENT_FILES, DURABLE_STATE_BOOT_ID_ENV, type DurableDocumentName, readSequenceState, sequenceFileFor, writeSequenceState } from "../src/lib/durable-mirror";
 
 // Intercepted by OpencodexHub.outboundByHost in deploy/cloudflare/src/index.ts; never reaches DNS.
 const STATE_ORIGIN = "http://state.ocx.internal";
@@ -84,12 +84,18 @@ export async function copySqlite(source: string, target: string): Promise<boolea
  * Asynchronous on purpose: a synchronous walk of a large home would starve the lease heartbeat
  * past LEASE_STALE_MS and let a second container take over while this one still serves.
  */
+export function sequenceFilesFirst(a: string, b: string): number {
+  return Number(b.endsWith(".seq")) - Number(a.endsWith(".seq")) || (a < b ? -1 : a > b ? 1 : 0);
+}
+
 export async function stageSnapshot(roots: StateRoot[], staging: string): Promise<string> {
   const hasher = new Bun.CryptoHasher("sha256");
   for (const root of roots) {
     if (!existsSync(root.dir)) continue;
     const walk = async (dir: string): Promise<void> => {
-      for (const name of (await readdir(dir)).sort()) {
+      // A mirrored document's sequence file is copied before the document. The copy of the document is
+      // then at least as new as the sequence says, so restore reads a mismatch as a local change.
+      for (const name of (await readdir(dir)).sort(sequenceFilesFirst)) {
         // Skipped by name before any stat: SQLite deletes and recreates these while we walk.
         if (SQLITE_SIDECAR.test(name)) continue;
         const source = join(dir, name);
@@ -290,15 +296,20 @@ export class Supervisor {
     const target = join(home, DURABLE_DOCUMENT_FILES[name]);
     const sequencePath = join(home, sequenceFileFor(name));
     const local = readSequenceState(sequencePath);
-    if (existsSync(target) && !local.mirrored && local.seq > seq) {
-      console.log(`Kept the snapshot's ${DURABLE_DOCUMENT_FILES[name]}: it holds a change the Durable Object never received.`);
-      return;
+    if (existsSync(target)) {
+      // The local file was changed by something that did not record it (an older image, an ocx
+      // process without the boot id), so the Durable Object cannot vouch for being newer.
+      const unrecorded = local.digest !== undefined && local.digest !== documentDigest(readFileSync(target, "utf8"));
+      if (unrecorded || (!local.mirrored && local.seq > seq)) {
+        console.log(`Kept the snapshot's ${DURABLE_DOCUMENT_FILES[name]}: it holds a change the Durable Object never received.`);
+        return;
+      }
     }
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const temporary = `${target}.${this.bootId}.tmp`;
     writeFileSync(temporary, body, { mode: 0o600 });
     renameSync(temporary, target);
-    writeSequenceState(sequencePath, { seq, mirrored: true });
+    writeSequenceState(sequencePath, { seq, mirrored: true, digest: documentDigest(body) });
     console.log(`Restored ${DURABLE_DOCUMENT_FILES[name]} from the Durable Object (${body.length} bytes).`);
   }
 

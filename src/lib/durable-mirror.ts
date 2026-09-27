@@ -9,6 +9,7 @@
 // that is not newer than what it holds, so a slow retry can never replace a later commit.
 //
 // Dependency-free on purpose: the supervisor imports it before ocx starts.
+import { createHash } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 
 export const DURABLE_STATE_BOOT_ID_ENV = "OCX_STATE_BOOT_ID";
@@ -38,13 +39,18 @@ export class DurableMirrorError extends Error {
   }
 }
 
-export type SequenceState = { seq: number; mirrored: boolean };
+/** `digest` is of the content `seq` names; a file that no longer matches it was changed unrecorded. */
+export type SequenceState = { seq: number; mirrored: boolean; digest?: string };
+
+export function documentDigest(body: string): string {
+  return createHash("sha256").update(body).digest("hex");
+}
 
 export function readSequenceState(path: string): SequenceState {
   try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as { seq?: unknown; mirrored?: unknown };
+    const value = JSON.parse(readFileSync(path, "utf8")) as { seq?: unknown; mirrored?: unknown; digest?: unknown };
     if (typeof value.seq === "number" && Number.isSafeInteger(value.seq) && value.seq >= 0) {
-      return { seq: value.seq, mirrored: value.mirrored !== false };
+      return { seq: value.seq, mirrored: value.mirrored !== false, ...(typeof value.digest === "string" ? { digest: value.digest } : {}) };
     }
   } catch { /* absent or unreadable: nothing was ever mirrored from this home */ }
   return { seq: 0, mirrored: true };
@@ -54,6 +60,15 @@ export function writeSequenceState(path: string, state: SequenceState): void {
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
   renameSync(temporary, path);
+}
+
+/** Never lets bookkeeping stop a credential write: the provider may already have rotated the token. */
+function recordSequence(path: string, state: SequenceState): void {
+  try {
+    writeSequenceState(path, state);
+  } catch (error) {
+    console.warn(`[state] Could not record the document sequence: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 type MirrorTransport = {
@@ -121,13 +136,15 @@ async function put(name: DurableDocumentName, body: string, seq: number): Promis
     if (response?.status === 409) throw new DurableMirrorError("the state lease moved to another container; not saving credentials");
     if (response?.status === 412) {
       const stored = Number(response.headers.get(DOCUMENT_SEQUENCE_HEADER));
+      if (!Number.isSafeInteger(stored)) return { durable: false, seq, retry: false };
       // An earlier attempt of this same write already landed.
       if (stored === seq) return { durable: true, seq };
       // A newer local write superseded this one and mirrors itself.
       if (state.lastSeq !== seq) return { durable: false, seq, retry: false };
       // This is the newest local write and this process holds the lease, so a stored sequence ahead
-      // of it means only that the local sequence file was behind.
-      if (Number.isSafeInteger(stored) && stored > seq) {
+      // of it means only that the local sequence file was behind. That rests on one process per
+      // container writing these stores: the supervisor's ocx, the only one given the boot id.
+      if (stored > seq) {
         seq = state.lastSeq = stored + 1;
         continue;
       }
@@ -147,7 +164,7 @@ function mirrorUntilDurable(name: DurableDocumentName, body: string, seq: number
     const state = stateOf(name);
     if (state.lastSeq !== result.seq) return;
     if (result.durable) {
-      writeSequenceState(statePath, { seq: result.seq, mirrored: true });
+      recordSequence(statePath, { seq: result.seq, mirrored: true, digest: documentDigest(body) });
     } else if (result.retry) {
       state.catchUp = transport.schedule(() => {
         state.catchUp = undefined;
@@ -175,13 +192,13 @@ export async function mirrorBeforeWrite(name: DurableDocumentName, body: string,
   if (!durableMirrorEnabled()) return null;
   const result = await put(name, body, nextSequence(name, statePath));
   if (!result.durable) {
-    writeSequenceState(statePath, { seq: result.seq, mirrored: false });
+    recordSequence(statePath, { seq: result.seq, mirrored: false, digest: documentDigest(body) });
     console.warn(`[state] Could not reach the Durable Object; ${name} was saved locally and will be retried.`);
   }
   return {
     durable: result.durable,
     settle() {
-      if (result.durable) writeSequenceState(statePath, { seq: result.seq, mirrored: true });
+      if (result.durable) recordSequence(statePath, { seq: result.seq, mirrored: true, digest: documentDigest(body) });
       else if (result.retry) {
         const state = stateOf(name);
         state.catchUp = transport.schedule(() => {
@@ -194,8 +211,8 @@ export async function mirrorBeforeWrite(name: DurableDocumentName, body: string,
 }
 
 export type PendingLocalWrite = {
-  /** Call once the local file holds `body`; the mirror then runs in the background. */
-  written(body: string): void;
+  /** Call once the local file holds the body; the mirror then runs in the background. */
+  written(): void;
 };
 
 /**
@@ -203,9 +220,9 @@ export type PendingLocalWrite = {
  * sequence file is marked unmirrored before the write, so a crash anywhere between here and the
  * Durable Object accepting the copy leaves the next boot preferring the local file.
  */
-export function beginLocalWrite(name: DurableDocumentName, statePath: string): PendingLocalWrite | null {
+export function beginLocalWrite(name: DurableDocumentName, statePath: string, body: string): PendingLocalWrite | null {
   if (!durableMirrorEnabled()) return null;
   const seq = nextSequence(name, statePath);
-  writeSequenceState(statePath, { seq, mirrored: false });
-  return { written: body => mirrorUntilDurable(name, body, seq, statePath, CATCH_UP_MIN_MS) };
+  recordSequence(statePath, { seq, mirrored: false, digest: documentDigest(body) });
+  return { written: () => mirrorUntilDurable(name, body, seq, statePath, CATCH_UP_MIN_MS) };
 }

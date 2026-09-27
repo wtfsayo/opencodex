@@ -37,6 +37,9 @@ const COLLABORATION_TOOLS = new Set([
   "spawn_agent", "send_input", "resume_agent", "close_agent", "send_message", "followup_task", "interrupt_agent", "list_agents",
 ]);
 const SKILLS_BLOCK = "<skills_instructions>";
+// What Codex CLI 0.157 sends: {"type":"web_search","external_web_access":false}. Without the sidecar
+// ocx drops the tool whatever its options; other options stay with the container.
+const WEB_SEARCH_FIELDS = new Set(["type", "external_web_access"]);
 
 function hasHostedWebSearch(body: Rec): boolean {
   return Array.isArray(body.tools) && body.tools.some(tool => isRec(tool) && tool.type === "web_search");
@@ -67,7 +70,7 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
       if (!isRec(tool)) return "tool-type";
       // Hosted web search is dropped from the upstream request unless ocx can run its search
       // sidecar; serveNativeResponses checks that against the config.
-      if (tool.type === "web_search" && Object.keys(tool).length === 1) continue;
+      if (tool.type === "web_search" && Object.keys(tool).every(key => WEB_SEARCH_FIELDS.has(key))) continue;
       // Namespaced function groups (Codex's multi_agent_v1, MCP servers) flatten and restore purely.
       const members = tool.type === "namespace" && typeof tool.name === "string" && Array.isArray(tool.tools) ? tool.tools : [tool];
       for (const member of members) {

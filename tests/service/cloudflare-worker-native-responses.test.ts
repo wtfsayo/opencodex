@@ -155,7 +155,7 @@ const codexCliTools = [
   fn("exec_command"), fn("write_stdin"), fn("request_user_input"), fn("view_image"),
   { type: "namespace", name: "multi_agent_v1", description: "agents", tools: [fn("spawn_agent"), fn("send_input"), fn("wait_agent"), fn("close_agent")] },
   fn("get_goal"), fn("create_goal"), fn("update_goal"),
-  { type: "web_search" },
+  { type: "web_search", external_web_access: false },
 ];
 
 describe("Worker-native Responses with Codex CLI's real tool list", () => {

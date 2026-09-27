@@ -186,3 +186,14 @@ Branch `feat/cloudflare-worker-only`, stacked on `feat/cloudflare-worker-native`
   turns (terminal: provider opt-in; empty completion: config opt-in).
 - Not reproduced, by design: `/v1/models` (upstream discovery and the Codex catalog template),
   `/v1/messages`, WebSocket Responses. Those still start the container.
+
+Exit criterion met (2026-09-28): a fresh deployment (`opencodex-worker-only-test`, configured only
+by secrets: data token, a bootstrap config with the Workers AI provider, `OCX_WORKER_NATIVE=1`)
+served streamed and non-streamed chat and streamed Responses turns, 9 of 9 with status 200, and
+refused a wrong token with 401. The Worker log showed only `readDocument` and `enqueueUsage`
+calls into the Durable Object, no container fetch and no state-host traffic (which a booting
+supervisor makes at once), and the deployment's R2 bucket held 0 objects (a running container
+uploads a snapshot within 30 s). `wrangler containers instances` lists the `hub` object as
+inactive with no location or version. The first deploy of the Responses path failed at upload:
+`reasoning-replay-cache.ts` drew `randomBytes(32)` at module scope, which Workers refuse; the key is
+now created on first use, and the import guard flags module-scope random, timers and I/O.

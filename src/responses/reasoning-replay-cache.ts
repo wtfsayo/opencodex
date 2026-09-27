@@ -30,7 +30,10 @@ const MAX_ENTRIES = 64;
 const MAX_TOTAL_BYTES = 256 * 1024;
 const TTL_MS = 60 * 60 * 1000;
 const OPAQUE_BLOB_REJECTION_TTL_MS = 5 * 60 * 1000;
-const replayIdentityKey = randomBytes(32);
+// Created on first use, not at load: the Cloudflare Worker bundles this module, and Workers refuse
+// random generation outside a request.
+let replayIdentityKeyBytes: Buffer | undefined;
+const replayIdentityKey = (): Buffer => replayIdentityKeyBytes ??= randomBytes(32);
 const CREDENTIAL_HEADER_NAMES = new Set([
   "authorization",
   "api-key",
@@ -303,7 +306,7 @@ export function rememberReasoningReplayOpaqueBlobRejection(
 }
 
 function processLocalIdentity(domain: string, material: string): string {
-  return createHmac("sha256", replayIdentityKey)
+  return createHmac("sha256", replayIdentityKey())
     .update(domain)
     .update("\0")
     .update(material)

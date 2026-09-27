@@ -46,6 +46,14 @@ function closure(entry: string) {
     const source = readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
     if (/\bBun\b/.test(source) && !LAZY_BUN.has(relative(root, file))) problems.push(`Bun in ${chain(file)}`);
     if (/\brequire\s*\(|\bimport\s+\w+\s*=\s*require\b|\bimport\s*\(\s*`/.test(source)) problems.push(`require() or a computed import in ${chain(file)}`);
+    // Workers refuse random values, timers and I/O outside a request, and fail the whole deploy on
+    // it (a module-scope randomBytes(32) in reasoning-replay-cache.ts did). Top-level statements only.
+    for (const line of source.split("\n")) {
+      if (/^(export\s+)?(const|let|var)\s[^=]*=[^>]*\b(randomBytes|randomUUID|getRandomValues|random|setTimeout|setInterval|fetch)\s*\(/.test(line)
+        || /^(setTimeout|setInterval|queueMicrotask|fetch)\s*\(/.test(line)) {
+        problems.push(`module-scope random, timer or I/O in ${chain(file)}: ${line.trim().slice(0, 80)}`);
+      }
+    }
     for (const match of source.matchAll(IMPORT_RE)) {
       const spec = match[1] ?? match[2] ?? match[3] ?? match[4]!;
       // Every package, bare built-in ("fs") and node: module is refused unless listed: the Worker

@@ -1,0 +1,151 @@
+# Cloudflare storage — design (Phase 3 of Cloudflare-native hosting)
+
+Status: design only, no code. Branch `feat/cloudflare-storage` off `dev` at `24b2f39b7`.
+Depends on: the Cloudflare Containers deployment (PR #6077) for the Durable Object, the lease,
+and the container-to-Worker state channel (`http://state.ocx.internal`).
+
+## Problem
+
+On Cloudflare the hub's disk disappears whenever the container sleeps or restarts. Phase 1 covers
+this with whole-home tar snapshots every 30 seconds, plus one on `SIGTERM`. That leaves three gaps:
+
+1. A crash loses up to 30 seconds of writes. For most state that is an inconvenience. For the
+   spend ledger it breaks an invariant: a reservation must be durable before the request is
+   admitted (`src/lib/spend-reservation-ledger.ts:1026`), so a crash can let a restarted hub
+   overspend a budget it had already reserved against.
+2. Every interval copies and hashes both homes whole. `usage.jsonl` is unbounded by default, so
+   the cost grows without limit.
+3. Nothing is queryable outside the container. Usage and routing history live in files inside a
+   tarball.
+
+The goal is to move the state a hub actually needs behind seams that can be backed by Durable
+Object SQLite (or D1 and R2 where they fit better), store by store. Local installs keep their
+files and see no behavior change.
+
+## What a hub persists
+
+From a full read of `src/` at `24b2f39b7`. Line references are to that tree.
+
+| Store | Owner | Write | Read | Coordination today | Growth |
+|---|---|---|---|---|---|
+| `config.json` | `src/config.ts`, `config/persisted-mutation.ts` | `atomicWriteFile` under `withConfigMutationLockSync`; compare-and-swap retry | Loaded at startup, held in memory | `config-mutation.sqlite` `BEGIN IMMEDIATE` mutex and a generation counter | Bounded |
+| `auth.json` (OAuth, all but the Codex pool) | `oauth/store.ts` | In-process FIFO, then an O_EXCL lock file, re-read, mutate, `atomicWriteFile` | **Re-read and parsed on every lookup** (`:829`) | Lock file with stale-steal after 120 s; dev/ino/mtime check before release | Bounded |
+| Refresh intents `auth.refresh.*.lock{,.json}` | `oauth/store.ts:195-345` | O_EXCL lock; intent written before the upstream refresh, cleared by compare-and-swap | Per refresh | Stops two processes spending one rotating refresh token | One per account |
+| `codex-accounts.json` (Codex pool) | `codex/account-store.ts` | Config mutation lock, `atomicWriteFile`, generation bump, tombstones | **Re-read per lookup** (`:278`) | Generation fence and the SQLite mutex | Bounded, keeps tombstones |
+| `spend-ledger.jsonl` + `.salt` | `lib/spend-reservation-ledger.ts` | `appendFileSync` per record; compaction by rename | Replayed at startup, then in memory | One writer per home, proven by a process-lifetime SQLite lease (`spend-ledger-owner.sqlite`) | Bounded by compaction |
+| `usage.jsonl` | `usage/log.ts` | `appendFileSync` per request, no lock | Tail readers keyed by inode and mtime | O_APPEND | **Unbounded by default** |
+| `routing-history.sqlite` | `routing/history/*` | Incremental projection of `usage.jsonl` | Analytics | Tied to the source file's inode | Grows with usage |
+| `responses-state.json` + `responses-state-spill/` | `responses/state.ts`, `spill-store.ts` | Debounced snapshot; spills via `linkSync` | Startup and continuations | One process | Capped (1,000 entries, 1 GiB) |
+| Runtime caches (quota, reasoning metadata, replay) | various | Debounced `atomicWriteFile` | Warmed at startup | One writer; loss tolerated | Capped |
+| `admin-api-token`, `service-api-token` | `server/management-auth.ts`, `lib/service-secrets.ts` | Written once (`linkSync` / atomic) | Startup | — | Tiny |
+
+Local-only state (Codex shim and native profiles, tray, service manager, client links, Claude
+intercept CA, desktop lifecycle locks) is out of scope: a Cloudflare hub never runs those paths,
+and Phase 1 already leaves their lock databases out of snapshots.
+
+## Constraints that shape the design
+
+- **Everything is synchronous.** `withConfigMutationLockSync` forbids async callbacks; the
+  reset-credit ledger asserts `Synchronous<T>`; OAuth and account lookups are synchronous file
+  reads. A remote backend is asynchronous. Converting every caller to async is a repository-wide
+  change on the core request path.
+- **Coordination is built from filesystem semantics:** hard links as no-replace publication,
+  rename atomicity, O_EXCL lock files with stale stealing, SQLite `BEGIN IMMEDIATE` as a mutex,
+  inode and mtime as revision keys. None of these exist in a key-value or SQL service.
+- **On Cloudflare there is exactly one process.** `max_instances: 1` and the Phase 1 lease
+  guarantee a single writer per deployment. Almost all of the cross-process coordination above
+  exists for a desktop machine running a service, a CLI, and a tray against one home. In the
+  container it guards against a second process that cannot exist.
+
+The third point is what makes this tractable.
+
+## Approach: single-writer stores with durable write-through
+
+Rather than a generic key-value layer under `atomicWrite*` (207 call sites, synchronous
+semantics, filesystem tricks), each hub store gets a narrow backend interface, and a Cloudflare
+backend that:
+
+1. **Loads once at startup** from the Durable Object into memory, while the Phase 1 lease is held.
+2. **Serves reads from memory.** This is safe because the lease makes this process the only
+   writer. It also removes the per-lookup file re-reads of `auth.json` and `codex-accounts.json`.
+3. **Writes through to the Durable Object.** Each store picks one of two durability classes:
+   - *Must be durable before proceeding* (spend reservations; OAuth refresh-token rotation;
+     account generation bumps): the write is awaited. The call sites that need this already sit in
+     asynchronous request handlers, so the await is added at the handler boundary, not inside the
+     synchronous helpers.
+   - *May be written behind* (usage entries, caches, responses state): queued and flushed in
+     order, with the queue drained on `SIGTERM` before the lease is released.
+
+The file backend stays the default and keeps every existing lock, fence, and file format. The
+backend is chosen once at startup (for example `OCX_STORAGE_BACKEND=cloudflare-do`, set only by
+the Cloudflare supervisor), never per call.
+
+Where Durable Object single-threading replaces a filesystem mechanism:
+
+| Filesystem mechanism | Cloudflare equivalent |
+|---|---|
+| `spend-ledger-owner.sqlite` process-lifetime lease | The Phase 1 lease (one boot id holds the home) |
+| `config-mutation.sqlite` mutex + generation | A Durable Object transaction that checks and bumps the generation |
+| OAuth O_EXCL store lock and refresh-intent locks | Durable Object calls are serialized; the intent becomes a row written in the same transaction as the credential read |
+| Hard-link no-replace publication | `INSERT` that fails on conflict |
+| Inode/mtime revision keys for `usage.jsonl` tails | A monotonically increasing row id |
+
+## Order of work
+
+Each step is independently shippable and shrinks what the snapshot must carry. Items not yet
+migrated keep riding in the Phase 1 snapshot.
+
+| Step | Store | Why this order | Backend | Seam |
+|---|---|---|---|---|
+| 3a | Spend ledger | Only store with a correctness invariant the snapshot breaks | Durable Object SQLite, one row per journal record | Existing `SpendJournal { read; append; rewrite }` (`spend-reservation-ledger.ts:367`); add an async `appendDurable` used at admission |
+| 3b | OAuth `auth.json` + refresh intents, `codex-accounts.json` | Credential loss on crash forces re-login; per-lookup file reads are the hottest I/O | Durable Object SQLite, one row per provider account set / pool record, with the existing generation fields as the fence | New `CredentialStoreBackend` behind `oauth/store.ts` `loadStore`/`persist` and `account-store.ts` load/persist |
+| 3c | `usage.jsonl` | Unbounded; biggest snapshot cost | Durable Object SQLite table (append rows, row id as revision), or D1 if cross-deployment queries are wanted | `appendUsageEntry` / `readRecentUsageEntries` in `usage/log.ts`; `routing-history` becomes a query, not a projection |
+| 3d | `config.json` | Rarely written; snapshot already handles it well | Durable Object row + generation | `persisted-mutation.ts` commit path |
+| — | Caches, responses state, tokens | Loss is tolerated or they are regenerated | Stay in the snapshot, or are simply not persisted | none |
+
+After 3a–3c the snapshot carries only config and small caches, which removes gap 2, and the
+interval can grow.
+
+## Invariants each step must keep (and test)
+
+- **Spend:** a send id is fully known or fully forgotten; under an enforced limit the reserve is
+  durable before admission (`reserve-not-durable` otherwise); replay fails closed on corruption
+  except a torn final record; the salt is stored with the ledger (losing it equals a reset).
+- **OAuth:** `selectionRevision` rotates when an account set is replaced, so a rollback cannot
+  restore an older generation; writes are fenced on `expectedGeneration`; a refresh intent is
+  durable before the upstream refresh and cleared by compare-and-swap, so a rotating refresh token
+  is never spent twice, including across a crash between refresh and write.
+- **Codex pool:** `record.generation === dispatched.generation` for live checks; tombstones are kept.
+- **Usage:** entries are append-only and ordered; readers resume from a revision key.
+- **Fencing:** a container that has lost the lease must not commit to any store. Every Durable
+  Object write carries the boot id, and the object rejects writes from a non-holder, as the
+  Phase 1 snapshot commit already does.
+
+## Testing
+
+- Each backend interface gets a shared conformance suite run against both the file backend and an
+  in-memory fake of the Durable Object backend (the pattern Phase 1 used for `LeaseState`).
+- Crash tests: kill between upstream refresh and credential write; between reserve and admission;
+  mid-flush of the write-behind queue.
+- Fencing tests: a fenced boot's writes are rejected by every store.
+- A `wrangler dev` end-to-end run per step, and one production-account run before calling a step
+  done, as Phase 1 did.
+
+## Risks and open questions
+
+- **Scope creep into async conversion.** The design only adds awaits at request-handler
+  boundaries. If a store's durable write turns out to sit under a synchronous helper with no
+  async caller, that store is deferred rather than forcing an async cascade.
+- **Latency.** A durable spend reservation adds a Worker-to-Durable-Object round trip on every
+  admitted request under an enforced limit. It needs measuring; unlimited users skip it.
+- **Durable Object limits.** 2 MB per row and 10 GB per object. Credentials and ledgers are far
+  below this; usage needs retention (the existing `usageLedgerMaxBytes`) or D1.
+- **Two sources of truth during migration.** A store is either fully on the Durable Object or
+  fully in the snapshot, never both; the snapshot excludes migrated files explicitly.
+- **Maintainer questions:**
+  1. Is a startup-selected backend acceptable, or should the seams be introduced without any
+     Cloudflare backend first, as a pure refactor?
+  2. Should usage go to D1 (queryable across deployments, extra binding) or stay per-hub in the
+     Durable Object?
+  3. Is the spend-ledger latency cost acceptable, or should Cloudflare hubs with enforced limits
+     keep a local durable append plus asynchronous replication?

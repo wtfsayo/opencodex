@@ -123,6 +123,9 @@ describe("Worker-native chat routing", () => {
       [config({}, { baseUrl: "https://localhost/v1" }), "p/m-1"],
       [config({}, { baseUrl: "https://ai.ocx.internal/v1" }), "p/m-1"],
       [config({}, { baseUrl: "https://user:pw@api.example.test/v1" }), "p/m-1"],
+      [config({}, { baseUrl: "https://localhost./v1" }), "p/m-1"],
+      [config({}, { baseUrl: "https://metadata.google.internal./v1" }), "p/m-1"],
+      [config({}, { baseUrl: "https://2130706433/v1" }), "p/m-1"],
     ];
     for (const [cfg, model] of declined) expect([model, resolveNativeChatRoute(cfg, model)]).toEqual([model, null]);
   });

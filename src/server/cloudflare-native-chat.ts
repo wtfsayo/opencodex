@@ -42,7 +42,10 @@ function destinationAllowed(baseUrl: string, localHosts: ReadonlySet<string>): b
   let url: URL;
   try { url = new URL(baseUrl); } catch { return false; }
   if (localHosts.has(url.host)) return true;
-  return url.protocol === "https:" && !url.username && !url.password && !PRIVATE_HOST.test(url.hostname) && !IP_LITERAL.test(url.hostname);
+  // ocx strips trailing dots before judging a host name (src/lib/destination-policy.ts), and
+  // `localhost.` is still localhost.
+  const hostname = url.hostname.replace(/\.+$/, "");
+  return url.protocol === "https:" && !url.username && !url.password && !PRIVATE_HOST.test(hostname) && !IP_LITERAL.test(hostname);
 }
 
 export type NativeChatRoute = { providerName: string; provider: OcxProviderConfig; modelId: string; requestedModel: string };

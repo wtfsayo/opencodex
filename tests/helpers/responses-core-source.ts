@@ -33,6 +33,8 @@ export const RESPONSES_CORE_MODULES = [
   "skills-snapshot.ts",
   "skills-catalog.ts",
   "native-steering-availability.ts",
+  "upstream-error-text.ts",
+  "routed-upstream-error.ts",
   "shadow-target-availability.ts",
   "compaction-routing.ts",
   "compaction-recovery.ts",

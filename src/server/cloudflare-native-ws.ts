@@ -15,6 +15,9 @@ import { resolveInboundBodyLimitBytes } from "./inbound-body-limit";
 import { BoundedSseFrameBuffer } from "./sse-frame-buffer";
 import { buildWarmupCompletionFrames, buildWsErrorFrame } from "./ws-frames";
 import { createTranslatorBudget } from "../lib/translator-budget";
+import { runNativeOpenAiTurn } from "./cloudflare-native-openai";
+import { expandWithReplayEntry, replayEntryFor, type ReplayEntryItems } from "../responses/state/replay-expansion";
+import { replayedInputPrefixLengths } from "../responses/replay-provenance";
 
 type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
@@ -27,6 +30,8 @@ export const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
  */
 export const MAX_WORKER_FRAME_BYTES = 4 * 1024 * 1024;
 const TERMINAL_TYPES = new Set(["response.completed", "response.failed", "response.incomplete"]);
+// Codex chains each frame to the one before; a few are kept in case it reaches further back.
+const MAX_SOCKET_CONTINUATIONS = 8;
 
 /** ws-bridge.ts's selectForwardHeaders: the upgrade headers each frame's turn carries. */
 function selectForwardHeaders(headers: Headers): Headers {
@@ -56,6 +61,12 @@ function payloadType(payload: string): string | null {
   } catch {
     return null;
   }
+}
+
+function withoutKey(record: Rec, key: string): Rec {
+  const copy = { ...record };
+  delete copy[key];
+  return copy;
 }
 
 const protocolError = (message: string) => ({ type: "protocol_error", code: "websocket_protocol_error", message });
@@ -130,6 +141,11 @@ async function pumpSseToFrames(sse: ReadableStream<Uint8Array>, send: (text: str
  */
 export function createNativeWsSession(link: NativeWsLink, upgradeHeaders: Headers, deps: NativeChatDeps): NativeWsSession {
   const headers = selectForwardHeaders(upgradeHeaders);
+  // How the upgrade was admitted decides whose login a native turn uses (auth-context.ts): the hub key
+  // in its dedicated header leaves the bearer the caller's own. Checked, never forwarded.
+  const nativeHeaders = new Headers(headers);
+  const dedicatedKey = upgradeHeaders.get("x-opencodex-api-key");
+  if (dedicatedKey) nativeHeaders.set("x-opencodex-api-key", dedicatedKey);
   // Set by the first frame relayed to ocx; every later frame follows it.
   let container: ReturnType<NativeWsLink["openContainer"]> | undefined;
   let steeringUnavailable: string | undefined;
@@ -137,6 +153,16 @@ export function createNativeWsSession(link: NativeWsLink, upgradeHeaders: Header
   let abortTurn: AbortController | undefined;
   let queue: Promise<void> = Promise.resolve();
   let closed = false;
+  // state.ts's continuation cache for the native responses this socket's turns completed here: ocx
+  // never saw them, so the Worker expands the frames that continue them as ocx would have.
+  const continuations = new Map<string, ReplayEntryItems>();
+  const rememberContinuation = (request: Record<string, unknown>, response: Rec) => {
+    const entry = replayEntryFor(request, response);
+    if (!entry) return;
+    continuations.delete(entry.id);
+    continuations.set(entry.id, entry);
+    while (continuations.size > MAX_SOCKET_CONTINUATIONS) continuations.delete(continuations.keys().next().value!);
+  };
 
   const sendJson = (payload: Rec) => link.send(JSON.stringify(payload));
   /** Runs `step` after every earlier frame's step, so frames reach ocx in arrival order. */
@@ -152,12 +178,48 @@ export function createNativeWsSession(link: NativeWsLink, upgradeHeaders: Header
     container.send(raw);
   };
 
+  /** A bare native model: the ChatGPT passthrough, continuing this socket's own responses. */
+  const serveNativeOrRelay = async (payload: Rec, raw: string, signal: AbortSignal, isCurrent: () => boolean) => {
+    const no = (reason: string) => { deps.onDecline?.(`responses-ws:${reason}`); return null; };
+    const previous = typeof payload.previous_response_id === "string" ? continuations.get(payload.previous_response_id) : undefined;
+    let body = payload;
+    if (previous) {
+      const expansion = expandWithReplayEntry(payload, previous);
+      if (expansion.kind === "scope-mismatch") { relay(raw); return; }
+      body = expansion.body;
+      replayedInputPrefixLengths.set(body, expansion.prefixLength);
+    }
+    let turn;
+    try {
+      turn = await runNativeOpenAiTurn({ ...body, stream: true }, nativeHeaders, signal, deps, no, Date.now(), {
+        continued: previous !== undefined,
+        onCompletedResponse: rememberContinuation,
+      });
+    } catch {
+      turn = null;
+    }
+    if (!isCurrent()) {
+      await turn?.response.body?.cancel().catch(() => {});
+      return;
+    }
+    if (!turn || !turn.response.body) {
+      // ocx never saw the response this frame continues, so it gets the history already expanded.
+      relay(previous ? JSON.stringify({ ...withoutKey(body, "previous_response_id"), type: "response.create" }) : raw);
+      return;
+    }
+    await pumpSseToFrames(turn.response.body, link.send, isCurrent).catch(() => {});
+  };
+
   const serveOrRelay = async (frame: Rec, raw: string, id: number, signal: AbortSignal) => {
     const isCurrent = () => turnId === id && !closed;
     if (!isCurrent()) return; // superseded before its turn came
     if (container) { relay(raw); return; }
     const payload: Rec = { ...frame };
     delete payload.type;
+    if (typeof payload.model === "string" && !payload.model.includes("/")) {
+      await serveNativeOrRelay(payload, raw, signal, isCurrent);
+      return;
+    }
     const startedAt = Date.now();
     const translatorBudget = createTranslatorBudget();
     const no = (reason: string) => { deps.onDecline?.(`responses-ws:${reason}`); return null; };

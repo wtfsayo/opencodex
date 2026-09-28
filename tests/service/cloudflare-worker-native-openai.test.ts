@@ -6,6 +6,7 @@ import { getDefaultConfig, saveConfig } from "../../src/config";
 import { startServer } from "../../src/server";
 import { readRecentUsageEntries } from "../../src/usage/log";
 import { serveNativeResponses } from "../../src/server/cloudflare-native-responses";
+import { createNativeWsSession } from "../../src/server/cloudflare-native-ws";
 import { bunSupportsBoundedCodexWsRelay } from "../../src/server/responses/ws-upstream";
 import type { NativeOpenAiFacts, WorkerUsageRow } from "../../src/server/cloudflare-native-chat-api";
 import { DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/lib/durable-mirror";
@@ -19,8 +20,11 @@ import { removeTreeWithRetry } from "../helpers/remove-tree";
 type Rec = Record<string, unknown>;
 type Listener = (event: unknown) => void;
 
-// The ChatGPT backend over its WebSocket: each response.create frame is answered with `events`.
+// The ChatGPT backend over its WebSocket: each response.create frame is answered with the next
+// queued reply, else `events`.
 let events: Rec[] = [];
+let replyQueue: Rec[][] = [];
+const nextReply = () => replyQueue.shift() ?? events;
 class FakeWebSocket {
   static dials: { url: string; headers: Rec; frames: string[] }[] = [];
   readyState = 0;
@@ -36,13 +40,13 @@ class FakeWebSocket {
   private emit(type: string, event: unknown = {}) { for (const l of this.listeners.get(type) ?? []) l(event); }
   send(data: string) {
     this.dial.frames.push(data);
-    const answer = events;
+    const answer = nextReply();
     queueMicrotask(() => { for (const event of answer) this.emit("message", { data: JSON.stringify(event) }); });
   }
   close() { this.readyState = 3; }
 }
 // The same backend over HTTP SSE, for a runtime ocx does not dial the WebSocket from.
-const sseReply = () => new Response(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(""), {
+const sseReply = () => new Response(nextReply().map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(""), {
   headers: { "content-type": "text/event-stream" },
 });
 
@@ -220,6 +224,112 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
       }
     });
   }
+
+  test("over Codex's WebSocket: a chained turn expanded from the socket's own response, as ocx does", async () => {
+    const second = (): Rec[] => textTurn().map(event => JSON.parse(JSON.stringify(event).replaceAll("resp_up1", "resp_up2").replaceAll("msg_up1", "msg_up2")) as Rec);
+    const frames: Rec[] = [
+      { type: "response.create", ...codexTurn() },
+      { type: "response.create", ...codexTurn({ previous_response_id: "resp_up1", input: [{ type: "function_call_output", call_id: "call_1", output: "a\nb" }] }) },
+    ];
+    const terminal = (text: string) => /"type":"response\.(completed|failed|incomplete)"/.test(text);
+    const turnsDone = (received: string[]) => received.filter(terminal).length;
+
+    // ocx's own socket.
+    replyQueue = [toolTurn(), second()];
+    FakeWebSocket.dials = [];
+    const ocxHttp: Rec[] = [];
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input as RequestInfo, init);
+      if (request.url.startsWith("https://chatgpt.com/")) { ocxHttp.push(await request.json() as Rec); return sseReply(); }
+      return saved.fetch(input, init);
+    }) as typeof fetch;
+    saveConfig({ ...(getDefaultConfig() as unknown as Rec), port: 0, websockets: true } as never);
+    const config = readFileSync(join(home, "config.json"), "utf8");
+    const server = startServer(0);
+    const proxyReceived: string[] = [];
+    try {
+      const socket = new saved.ws(`ws://127.0.0.1:${server.port}/v1/responses`, { headers: callerHeaders() } as never);
+      socket.addEventListener("message", event => proxyReceived.push(String(event.data)));
+      await new Promise((resolve, reject) => { socket.addEventListener("open", resolve); socket.addEventListener("error", reject); });
+      for (const [index, frame] of frames.entries()) {
+        socket.send(JSON.stringify(frame));
+        const end = Date.now() + 3_000;
+        while (turnsDone(proxyReceived) <= index && Date.now() < end) await Bun.sleep(5);
+      }
+      socket.close();
+    } finally {
+      await server.stop(true);
+      globalThis.WebSocket = saved.ws;
+      globalThis.fetch = saved.fetch;
+    }
+    const proxyUpstream = FakeWebSocket.dials.length > 0 ? FakeWebSocket.dials.map(dial => JSON.parse(dial.frames[0]!) as Rec) : ocxHttp;
+
+    // The Worker's session.
+    replyQueue = [toolTurn(), second()];
+    FakeWebSocket.dials = [];
+    const workerHttp: Rec[] = [];
+    const workerReceived: string[] = [];
+    const relayed: string[] = [];
+    const declines: string[] = [];
+    const session = createNativeWsSession({
+      send: text => workerReceived.push(text),
+      close: () => {},
+      openContainer: () => ({ send: text => relayed.push(text), close: () => {} }),
+    }, new Headers(callerHeaders()), {
+      readConfig: async () => config,
+      readCodexAccounts: async () => undefined,
+      nativeOpenAiFacts: async () => facts(),
+      openUpstreamSocket: (url, headers) => new FakeWebSocket(url, { headers }) as unknown as WebSocket,
+      fetch: async request => { workerHttp.push(await request.json() as Rec); return sseReply(); },
+      onDecline: reason => declines.push(reason),
+    });
+    for (const [index, frame] of frames.entries()) {
+      session.receive(JSON.stringify(frame));
+      const end = Date.now() + 3_000;
+      while (turnsDone(workerReceived) <= index && Date.now() < end) await Bun.sleep(5);
+    }
+    const workerUpstream = FakeWebSocket.dials.length > 0 ? FakeWebSocket.dials.map(dial => JSON.parse(dial.frames[0]!) as Rec) : workerHttp;
+
+    expect(declines).toEqual([]);
+    expect(relayed).toEqual([]);
+    expect(proxyUpstream).toHaveLength(2);
+    // The second request carries the first turn's input and output ahead of the new tool result.
+    expect((proxyUpstream[1]!.input as unknown[]).length).toBe(4);
+    expect(workerUpstream).toEqual(proxyUpstream);
+    expect(workerReceived.map(normalize)).toEqual(proxyReceived.map(normalize));
+  }, 20_000);
+
+  test("a chained frame the Worker cannot serve reaches ocx with the history ocx never saw", async () => {
+    replyQueue = [textTurn()];
+    const relayed: string[] = [];
+    const received: string[] = [];
+    const session = createNativeWsSession({
+      send: text => received.push(text),
+      close: () => {},
+      openContainer: () => ({ send: text => relayed.push(text), close: () => {} }),
+    }, new Headers(callerHeaders()), {
+      readConfig: async () => JSON.stringify({ ...(getDefaultConfig() as unknown as Rec), port: 0, websockets: true }),
+      readCodexAccounts: async () => undefined,
+      nativeOpenAiFacts: async () => facts(),
+      openUpstreamSocket: (url, headers) => new FakeWebSocket(url, { headers }) as unknown as WebSocket,
+      fetch: async () => sseReply(),
+    });
+    session.receive(JSON.stringify({ type: "response.create", ...codexTurn() }));
+    const end = Date.now() + 3_000;
+    while (!received.some(frame => frame.includes("\"response.completed\"")) && Date.now() < end) await Bun.sleep(5);
+    // Max effort is clamped by ocx's catalog, so this frame goes to ocx.
+    const next = { type: "response.create", ...codexTurn({ previous_response_id: "resp_up1", reasoning: { effort: "max" }, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Again." }] }] }) };
+    session.receive(JSON.stringify(next));
+    while (relayed.length === 0 && Date.now() < end) await Bun.sleep(5);
+    const sent = JSON.parse(relayed[0]!) as Rec;
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.type).toBe("response.create");
+    const input = sent.input as Rec[];
+    // The first turn's input and output, then the new message.
+    expect(input.map(item => item.type ?? item.role)).toEqual(["message", "message", "message"]);
+    expect((input[1] as { id?: string }).id).toBe("msg_up1");
+  });
 
   test("leaves to ocx what its own state decides, before anything is sent", async () => {
     events = textTurn();

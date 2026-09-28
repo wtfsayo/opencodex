@@ -372,7 +372,8 @@ Native passthrough SSE has TWO shapes, selected per request in
   a future threshold bump. One eager reader + byte-bounded
   client queue + post-cancel bounded discard-drain replaces the tee and goes
   directly to the response without a JS rewrite wrapper, preserving the full
-  inspection side-effect set (shared `createSseInspector` factory in `relay.ts`)
+  inspection side-effect set (shared `createSseInspector` factory in `relay.ts` over
+  `sse-inspector.ts`)
   including the #44 late-terminal semantics.
 
 Both client readers also retain a bounded, redacted message from a bare upstream

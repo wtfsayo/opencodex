@@ -21,7 +21,7 @@ import {
 } from "./spill-store";
 import { collectReferencedSpillFileNames, snapshotReferencedSpillFileNames } from "./state/spill-inspect";
 import { selectSnapshotEntries } from "./state/snapshot-select";
-import { clientCarriedPrefixLength, providerIssuedIdentity } from "./state/replay-fingerprint";
+import { expandWithReplayEntry, inputItems, normalizedClientThreadId, replayEntryFor } from "./state/replay-expansion";
 export type { ResponseStateTempRecoveryResult, ResponseStateTempRecoveryOptions } from "./state/temp-recovery";
 export type { ResponseSpillDirInspection } from "./spill-store";
 export { recoverStaleResponseStateTemps, reclaimAbandonedResponseStateTemps, inspectAbandonedResponseStateTemps, sweepAbandonedResponseStateTemps } from "./state/temp-recovery";
@@ -833,12 +833,7 @@ export async function flushResponseState(): Promise<void> {
   if (failures.length > 1) throw new AggregateError(failures, "Response state shutdown flush incomplete");
 }
 
-function inputItems(input: unknown): unknown[] {
-  if (input === undefined) return [];
-  if (Array.isArray(input)) return input;
-  if (typeof input === "string") return [{ role: "user", content: input }];
-  return [input];
-}
+
 
 let replayOverlapSkips = 0;
 
@@ -1049,9 +1044,7 @@ function materializeEntry(
   return { ok: true, state };
 }
 
-function normalizedClientThreadId(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
-}
+
 
 export function expandPreviousResponseInput(body: unknown, clientThreadId?: string): unknown {
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
@@ -1067,54 +1060,17 @@ export function expandPreviousResponseInput(body: unknown, clientThreadId?: stri
     replayFailures.set(request, materialized.failure);
     return body;
   }
-  const requestThreadId = normalizedClientThreadId(clientThreadId);
-  const storedThreadId = normalizedClientThreadId(materialized.state.clientThreadId);
-  // A Codex task must never inherit another task's continuation, nor a legacy unscoped entry.
-  // Unscoped callers retain backward-compatible replay only with other unscoped entries.
-  if (requestThreadId !== storedThreadId) {
+  const expansion = expandWithReplayEntry(request, materialized.state, clientThreadId);
+  if (expansion.kind === "scope-mismatch") {
     replayFailures.set(request, { code: "previous_response_not_found", reason: "scope_mismatch" });
     replayScopeMismatchDrops += 1;
     return body;
   }
-  // The client already replayed this history verbatim. Prepending the stored copy would
-  // double it, and the doubled turn is stored again, so the next turn triples (#1412 saw
-  // 127k of real context reach 1.3M tokens this way).
-  //
-  // Three conditions, all required. The run must cover the whole stored entry; it must reach
-  // the provider-output region; and some matched item in that region must carry a
-  // provider-issued id. The last one is the load-bearing part: content equality alone proves
-  // two items look alike, not that they are the same occurrence, so a client that merely
-  // repeats its own message would otherwise authorize a skip that deletes real history.
-  // There is no invariant that provider output always carries ids, so an entry whose output
-  // has none simply never skips.
-  {
-    const clientInput = inputItems(request.input);
-    const stored = materialized.state.items;
-    const anchor = materialized.state.providerOutputStart;
-    const carried = clientCarriedPrefixLength(stored, clientInput);
-    if (
-      carried === stored.length
-      && anchor !== undefined
-      && carried > anchor
-      && stored.slice(anchor, carried).some(item => providerIssuedIdentity(item) !== null)
-    ) {
-      replayOverlapSkips += 1;
-      // Keep previous_response_id: Kiro and Cursor recover their conversation ids from it
-      // (kiro-wire.ts, cursor/request-builder.ts). Only the concatenation is skipped.
-      const unchanged = { ...request };
-      // Same provenance boundary a real expansion would record, so the replayed prefix does
-      // not re-acknowledge historical compaction markers (parser.ts) and stays visible to
-      // guidance de-duplication (collaboration.ts).
-      replayedInputPrefixLengths.set(unchanged, carried);
-      return unchanged;
-    }
-  }
-  const expanded = {
-    ...request,
-    input: [...materialized.state.items, ...inputItems(request.input)],
-  };
-  replayedInputPrefixLengths.set(expanded, materialized.state.items.length);
-  return expanded;
+  // Same provenance boundary either way, so the replayed prefix does not re-acknowledge historical
+  // compaction markers (parser.ts) and stays visible to guidance de-duplication (collaboration.ts).
+  if (expansion.kind === "carried") replayOverlapSkips += 1;
+  replayedInputPrefixLengths.set(expansion.body, expansion.prefixLength);
+  return expansion.body;
 }
 
 export function previousResponseReplayFailure(body: unknown): PreviousResponseReplayFailure | undefined {
@@ -1278,18 +1234,15 @@ export function rememberResponseState(
       return !!item && typeof item === "object" && (item as { type?: unknown }).type === "function_call";
     });
   }
-  const clientThreadId = normalizedClientThreadId(opts?.clientThreadId);
-  // Compute the normalized array once and reuse it for both fields, so the recorded
-  // boundary can never disagree with the items it indexes.
-  const requestItems = inputItems(request.input);
+  const entry = replayEntryFor(request, response, opts?.clientThreadId)!;
   setResidentEntry(response.id, {
     createdAt: now(),
-    ...(clientThreadId ? { clientThreadId } : {}),
-    items: [...requestItems, ...response.output],
+    ...(entry.clientThreadId ? { clientThreadId: entry.clientThreadId } : {}),
+    items: entry.items,
     // Where response.output begins. A replay skip requires a matched item at or past this
     // index that also carries a provider-issued id — position alone proves only that an item
     // sits on the provider side, not that the provider authored it.
-    providerOutputStart: requestItems.length,
+    providerOutputStart: entry.providerOutputStart,
     // Always preserve the Cursor conversation id so the next tool-result turn can continue the SAME
     // Cursor conversation (multi-turn continuation). Separately track whether Cursor's own
     // checkpoint/cache is safe to reuse: a turn that ended with a pending client tool call produced an

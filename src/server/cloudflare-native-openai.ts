@@ -25,9 +25,9 @@ import { codexWsExchange } from "./responses/codex-ws-exchange";
 import { CodexWsSession } from "./responses/codex-ws-session";
 import { codexWsCreateFrameExceedsLimit } from "./responses/codex-ws-wire";
 import { relaySseEagerBounded } from "./relay-eager";
-import { isFirstOutputSsePayload, sanitizePassthroughHeaders, terminalStatusFromParsed } from "./relay-frames";
-import { BoundedSseFrameBuffer } from "./sse-frame-buffer";
-import { composeSseBlockRewrites, composeSsePayloadRewrites, payloadRewriteAsBlockRewrite, sseDataPayload } from "./sse-payload-rewrite";
+import { sanitizePassthroughHeaders } from "./relay-frames";
+import { createSseInspectorCore } from "./sse-inspector";
+import { composeSseBlockRewrites, composeSsePayloadRewrites, payloadRewriteAsBlockRewrite } from "./sse-payload-rewrite";
 import { collectSelfNamedNamespaceScrubAuthorization, createSelfNamedToolCallNamespaceScrubRewrite } from "./responses-self-named-namespace-scrub";
 import { currentTurnWireToolCatalogBody } from "./responses-undeclared-tool-guard";
 import { createRoutedNamespaceCallRestoreRewrite, type RoutedNamespaceToolAliases } from "../responses/namespace-tool-compat";
@@ -59,8 +59,8 @@ const PLAIN_NATIVE_MODEL = /^gpt-\d+(?:\.\d+)?(?:-[a-z0-9]+)*$/;
 const GATED_NATIVE_MODEL = /daybreak|astra|reserve/;
 
 /** Why this turn is not one the Worker can serve exactly as ocx would, or undefined when it is. */
-export function nativeOpenAiDeclineReason(body: Rec, headers: Headers): string | undefined {
-  const unknown = Object.keys(body).filter(key => !BODY_FIELDS.has(key)).sort();
+export function nativeOpenAiDeclineReason(body: Rec, headers: Headers, continued = false): string | undefined {
+  const unknown = Object.keys(body).filter(key => !BODY_FIELDS.has(key) && !(continued && key === "previous_response_id")).sort();
   if (unknown.length > 0) return `body-fields:${unknown.join(",")}`;
   if (typeof body.model !== "string" || !PLAIN_NATIVE_MODEL.test(body.model) || GATED_NATIVE_MODEL.test(body.model)) return "native-model";
   if (body.stream !== true) return "not-streamed";
@@ -152,35 +152,29 @@ function workerCodexWsFetch(
 }
 
 /**
- * passthrough-delivery.ts's createSseInspector, for what the usage row needs: the first output,
- * the terminal status, and the usage the terminal response reports.
+ * ocx's own inspector (passthrough-delivery.ts), with the request log's part reduced to what the
+ * usage row takes (request-log.ts's applyResponseLogMetadata): the latest usage a payload reports
+ * until the terminal, the first output, and the terminal status.
  */
-function createUsageInspector() {
-  const framer = new BoundedSseFrameBuffer();
-  const decoder = new TextDecoder();
+function createTurnInspector(onCompletedResponse?: (response: Rec) => void) {
   let terminal: "completed" | "failed" | "incomplete" | null = null;
   let usage: OcxUsage | undefined;
   let firstOutputAt: number | undefined;
-  const handle = (block: string) => {
-    const payload = sseDataPayload(block);
-    if (payload === null) return;
-    if (firstOutputAt === undefined && isFirstOutputSsePayload(payload)) firstOutputAt = Date.now();
-    let parsed: unknown;
-    try { parsed = JSON.parse(payload); } catch { return; }
-    const status = terminalStatusFromParsed(parsed);
-    if (status && !terminal) {
-      terminal = status;
-      const response = isRec(parsed) && isRec(parsed.response) ? parsed.response : undefined;
-      usage = usageFromResponsesPayload(response?.usage);
-    }
-  };
-  return {
-    feed(chunk: Uint8Array) { for (const frame of framer.feed(chunk)) handle(decoder.decode(frame.block)); },
-    finish() {
-      const tail = framer.finish();
-      if (tail.byteLength > 0) handle(decoder.decode(tail));
+  const inspector = createSseInspectorCore({
+    onTerminal: status => { terminal ??= status === "completed" || status === "failed" || status === "incomplete" ? status : null; },
+    inspectLogPayload: (_payload, parsed) => {
+      if (!isRec(parsed)) return;
+      const source = isRec(parsed.response) ? parsed.response : parsed;
+      usage = usageFromResponsesPayload(source.usage) ?? usage;
     },
-    dispose() { framer.dispose(); },
+    onFirstOutput: () => { firstOutputAt ??= Date.now(); },
+    ...(onCompletedResponse ? { onCompletedResponse: (response: Rec) => onCompletedResponse(response) } : {}),
+  });
+  return {
+    feed: (chunk: Uint8Array) => inspector.feed(chunk),
+    finish: () => inspector.finish(),
+    dispose: () => inspector.dispose(),
+    terminalSeen: () => inspector.terminalSeen(),
     get terminal() { return terminal; },
     get usage() { return usage; },
     get firstOutputAt() { return firstOutputAt; },
@@ -189,12 +183,22 @@ function createUsageInspector() {
 
 export type NativeOpenAiTurn = { response: Response };
 
+export type NativeOpenAiTurnOptions = {
+  /**
+   * The body was expanded from a stored response (state.ts's expandPreviousResponseInput, which the
+   * WebSocket session reproduces for its own responses) and keeps its previous_response_id.
+   */
+  continued?: boolean;
+  /** passthrough-dispatch.ts's rememberPassthroughResponse: the request and its completed response. */
+  onCompletedResponse?: (request: Record<string, unknown>, response: Rec) => void;
+};
+
 /** The turn, or null (after `no`) when ocx would serve it differently or its state decides it. */
 export async function runNativeOpenAiTurn(
   body: Rec, headers: Headers, signal: AbortSignal, deps: NativeChatDeps,
-  no: (reason: string) => null, startedAt: number,
+  no: (reason: string) => null, startedAt: number, options: NativeOpenAiTurnOptions = {},
 ): Promise<NativeOpenAiTurn | null> {
-  const declined = nativeOpenAiDeclineReason(body, headers);
+  const declined = nativeOpenAiDeclineReason(body, headers, options.continued);
   if (declined) return no(declined);
   const loaded = await loadNativeConfig(deps);
   if ("decline" in loaded) return no(loaded.decline);
@@ -215,7 +219,8 @@ export async function runNativeOpenAiTurn(
 
   let parsed;
   try { parsed = parseRequest(body); } catch { return no("parse"); }
-  if (parsed.previousResponseId || parsed._compactionRequest === true) return no("continuation");
+  if ((parsed.previousResponseId && !options.continued) || parsed._compactionRequest === true) return no("continuation");
+  if (options.continued) parsed._previousResponseInputExpanded = true;
   // collaboration.ts: guidance for these surfaces reads the catalog and config on disk.
   if (collabSurface(parsed) !== null) return no("collaboration-turn");
   // core-normalize.ts: an omitted store is sent as false to this backend.
@@ -281,7 +286,8 @@ export async function runNativeOpenAiTurn(
     payloadRewriteAsBlockRewrite(composeSsePayloadRewrites(...payloadRewrites)),
     createResponsesFieldBackfillBlockRewrite(),
   );
-  const inspector = createUsageInspector();
+  const rawBody = parsed._rawBody as Record<string, unknown>;
+  const inspector = createTurnInspector(options.onCompletedResponse ? response => options.onCompletedResponse!(rawBody, response) : undefined);
   const turnAc = new AbortController();
   turnAc.signal.addEventListener("abort", () => upstreamAbort.abort(), { once: true });
   let recorded = false;
@@ -313,7 +319,7 @@ export async function runNativeOpenAiTurn(
     inspectChunk: chunk => inspector.feed(chunk),
     finishInspection: () => inspector.finish(),
     disposeInspection: () => inspector.dispose(),
-    sawTerminal: () => inspector.terminal !== null,
+    sawTerminal: () => inspector.terminalSeen(),
     rewriteBlocks,
     onSynthetic: kind => { synthetic ??= kind; },
     onClientCancel: () => record(499),

@@ -34,8 +34,9 @@ const FORBIDDEN_MODULES = [
 // adapter and the layers every registered adapter gets, eleven more; a built-in provider's routed
 // config (model policy, registry merge) and ocx's usage labels, eight more; a ChatGPT passthrough
 // turn (the Responses passthrough adapter, the ChatGPT WebSocket exchange, the eager relay and the
-// passthrough client rewrites), 38 more.
-const MAX_CLOSURE = 228;
+// passthrough client rewrites), 38 more; ocx's SSE inspector and the continuation replay a
+// WebSocket session keeps for its own native responses, three more.
+const MAX_CLOSURE = 231;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {

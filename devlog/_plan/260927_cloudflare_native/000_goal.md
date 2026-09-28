@@ -320,3 +320,26 @@ Still container-only: the dashboard and management API, Codex-pool and other OAu
 limits, and the web-search sidecar. Spend limits need the reservation ledger's authority moved into
 the Durable Object (its API is synchronous at every call site today); OAuth needs token refresh
 coordinated between the Worker and ocx, since refresh tokens rotate.
+
+Native OpenAI (branch `feat/cloudflare-worker-openai`): a Codex turn to a native model on Codex's
+own ChatGPT login, with the hub key in `x-opencodex-api-key`, the default `openai` row and no stored
+Codex accounts. A trace of ocx's path found that case (auth-context.ts's caller-owned "main"
+context) pure apart from process facts, and the stored-account pool not reducible to any exact
+subset: selection, quota and health live in ocx's memory and its tokens need refreshing. The
+Worker builds the body with the Responses passthrough adapter (now `passthrough-adapter.ts`, its
+disk lookups passed in, 68 modules instead of 609), dials the transport ocx would (the ChatGPT
+WebSocket through a fetch-upgrade shim in `deploy/cloudflare/src/upstream-websocket.ts`, or HTTP
+SSE), and relays through `relay-eager.ts` with the same rewrites and ocx's own inspector
+(`sse-inspector.ts`). A probe first showed ocx sends the client the same bytes over either upstream
+transport. What only the process knows is published by `worker-native-state.ts` and read only under
+the stamp while the publishing boot holds the lease: an observed main credential (republished the
+moment it changes, since a caller holding it is then subject to the hard lock and cooldowns), the
+ownership fence, the context relay, the transport, and the catalog's summary support. Over Codex's
+WebSocket every turn after the first carries `previous_response_id`; the session keeps the responses
+it served and expands them with the code state.ts now shares (`replay-expansion.ts`). Parity tests
+run each turn through ocx and the Worker under Bun 1.3.14 (HTTP upstream) and 1.4.0 (the container's,
+WebSocket upstream).
+
+Known divergence: a chained frame the Worker declines reaches ocx with the history expanded and no
+`previous_response_id`, so ocx's replay-prefix provenance (compaction-marker acknowledgement,
+guidance de-duplication) and its request log treat it as client input.

@@ -208,6 +208,17 @@ it sends, for four idle hours; the two keep separate copies (the Worker's in the
 `ocx`'s in memory, lost whenever the container sleeps), so a session whose catalog changes while its
 turns alternate between them can see both versions.
 
+It also answers a Codex turn to a native OpenAI model on Codex's own ChatGPT login (the second
+table under [Connect Codex](#connect-codex)): it forwards the login to the ChatGPT backend as `ocx`
+does, over the transport `ocx` would use, and relays the stream through the same rewrites. That
+needs the `openai` provider exactly as `ocx init` writes it and no Codex accounts added to the hub,
+and it goes to `ocx` for: a continuation of a stored response (`previous_response_id` over HTTP),
+compaction, sub-agent and collaboration turns, Fast (`service_tier`), `max` effort, account-gated
+models, and any turn before `ocx` has started once under the current deployment, since `ocx`
+publishes what its own process holds that such a turn depends on (whether a stored ChatGPT login is
+in use, and the transport it dials). A turn that uses the login stored in the hub always goes to
+`ocx`, which refreshes it.
+
 With `websockets` on in the config, Codex can hold a WebSocket to `/v1/responses` instead of
 sending each turn over HTTP. When the config has nothing beyond the settings listed above, the
 Worker holds that socket itself (same token rule, no `Origin`) and answers each `response.create`
@@ -219,6 +230,13 @@ container restart closes the client's socket, which Codex reopens. `ocx` refusin
 mid-session (for example because `websockets` was turned off meanwhile) also closes the client's
 socket; Codex falls back to HTTP only when the refusal comes at connect time, which is when `ocx`
 holds the socket itself.
+
+On that socket Codex continues each native turn from the last with `previous_response_id`. `ocx`
+keeps the responses it served to rebuild those turns; the Worker does the same for the responses it
+served on the socket. When it has to hand such a turn to `ocx`, which never saw those responses, it
+sends the rebuilt history instead of the reference, so the turn is complete; `ocx` then sees the full
+history as the client's own input rather than a continuation, which only changes what its request
+log records about the turn.
 
 And it answers `POST /v1/messages`, the API Claude Code uses, when `model` is one of the aliases
 `ocx` lists for Claude Code (`ocx-claude-<provider>--<model>`, or `ocx-claude2-…` for a model id
@@ -272,6 +290,21 @@ env_key = "OPENCODEX_API_AUTH_TOKEN"
 
 This is the table `ocx` itself writes for a remote hub. Export `OPENCODEX_API_AUTH_TOKEN` in the
 shell that starts Codex.
+
+With that table, native models such as `gpt-5.5` use the ChatGPT login stored in the hub. To use
+the ChatGPT login Codex itself is signed in with, send the data token in its own header instead,
+and Codex sends its login as the bearer:
+
+```toml
+[model_providers.opencodex]
+name = "opencodex"
+base_url = "https://opencodex.<your-subdomain>.workers.dev/v1"
+wire_api = "responses"
+requires_openai_auth = true
+env_http_headers = { "x-opencodex-api-key" = "OPENCODEX_API_AUTH_TOKEN" }
+```
+
+The Worker can serve those turns itself; see below.
 
 ## Dashboard
 

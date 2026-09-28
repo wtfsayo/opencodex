@@ -53,7 +53,7 @@ export async function sweepOrphans(hub: Pick<StateHub, "currentSnapshot">, bucke
 
 // A catalog's worth of model ids with a boolean each; far below this.
 const MAX_NATIVE_OPENAI_FACTS_BYTES = 256 * 1024;
-const FACT_FLAGS = ["codexAccountsStored", "nativeMainTrafficBlocked", "contextRelayActive"];
+const FACT_FLAGS = ["codexAccountsStored", "mainCodexLoginPresent", "nativeMainTrafficBlocked", "contextRelayActive"];
 
 /** NativeOpenAiFacts (src/server/cloudflare-native-chat-api.ts), exactly. */
 export function isNativeOpenAiFacts(value: unknown): boolean {

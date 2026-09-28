@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDefaultConfig, saveConfig } from "../../src/config";
@@ -16,6 +16,7 @@ import type { NativeOpenAiFacts, WorkerUsageRow } from "../../src/server/cloudfl
 import { DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/lib/durable-mirror";
 import { nativeOpenAiFacts, publishNativeOpenAiFactsForWorker } from "../../src/server/worker-native-state";
 import { observeMainQuotaCredential, observeMainQuotaIdentity, onMainQuotaCredentialChange, clearMainAccountInfoCache } from "../../src/codex/main-account-cache";
+import { resolveCodexHomeDir } from "../../src/codex/home";
 import { LeaseState, type LeaseStorage } from "../../deploy/cloudflare/src/lease";
 import { handleStateRequest, type StateBucket } from "../../deploy/cloudflare/src/state-routes";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
@@ -131,7 +132,7 @@ const callerHeaders = () => ({
 const transport: NativeOpenAiFacts["upstreamTransport"] = bunSupportsBoundedCodexWsRelay() ? "websocket" : "sse";
 // This process's own ceilings, as the container would publish them.
 const facts = (extra: Partial<NativeOpenAiFacts> = {}): NativeOpenAiFacts => ({
-  version: 1, mainAccountIdentityKey: null, codexAccountsStored: false, nativeMainTrafficBlocked: false, contextRelayActive: false,
+  version: 1, mainAccountIdentityKey: null, codexAccountsStored: false, mainCodexLoginPresent: false, nativeMainTrafficBlocked: false, contextRelayActive: false,
   upstreamTransport: transport, inputCeilings: nativeOpenAiFacts(true).inputCeilings, ...extra,
 });
 const isAdmissionSecret = async (value: string) => value === "hub-data-token";
@@ -416,6 +417,52 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     expect(JSON.parse(json.text!)).toEqual({ id: "resp_x", status: "completed" });
   });
 
+  test("a routed turn with hosted web search: ocx drops the tool without a stored login, and so does the Worker", async () => {
+    const chatReply = () => new Response([
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "ok" } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 9, completion_tokens: 1 } })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""), { headers: { "content-type": "text/event-stream" } });
+    const routedTurn = codexTurn({ model: "z/m-1", tools: [shell, { type: "web_search", external_web_access: false }], reasoning: undefined, include: undefined });
+    delete routedTurn.reasoning;
+    delete routedTurn.include;
+    const chat = { adapter: "openai-chat", apiKey: "sk-z", models: ["m-1"] };
+    // ocx, with the openai row `ocx init` writes and no Codex login in its CODEX_HOME.
+    let sent: Rec | undefined;
+    const upstream = Bun.serve({ port: 0, async fetch(req) { sent = await req.json() as Rec; return chatReply(); } });
+    const init = getDefaultConfig() as unknown as Rec;
+    saveConfig({ ...init, port: 0, providers: { ...(init.providers as Rec), z: { ...chat, baseUrl: `${upstream.url.toString().replace(/\/$/, "")}/v1`, allowPrivateNetwork: true } } } as never);
+    const server = startServer(0);
+    let proxyText = "";
+    try {
+      const res = await saved.fetch(`http://127.0.0.1:${server.port}/v1/responses`, { method: "POST", headers: callerHeaders(), body: JSON.stringify(routedTurn) });
+      proxyText = await res.text();
+    } finally {
+      await server.stop(true);
+      await upstream.stop(true);
+    }
+    const workerConfig = JSON.stringify({ ...init, port: 0, providers: { ...(init.providers as Rec), z: { ...chat, baseUrl: "https://api.example.test/v1" } } });
+    const run = async (published: NativeOpenAiFacts | undefined, accounts?: string) => {
+      let workerSent: Rec | undefined;
+      const declines: string[] = [];
+      const res = await serveNativeResponses(JSON.stringify(routedTurn), new Headers(callerHeaders()), new AbortController().signal, {
+        readConfig: async () => workerConfig, readCodexAccounts: async () => accounts, nativeOpenAiFacts: async () => published,
+        fetch: async request => { workerSent = await request.json() as Rec; return chatReply(); },
+        onDecline: reason => declines.push(reason),
+      });
+      return { declines, sent: workerSent, text: await res?.text() };
+    };
+    const worker = await run(facts());
+    expect(worker.declines).toEqual([]);
+    expect(worker.sent).toEqual(sent);
+    expect((sent!.tools as Rec[]).map(tool => (tool.function as Rec).name)).toEqual(["shell"]);
+    expect(normalize(worker.text!).replace(/"(resp|msg|fc|rs|item)_[A-Za-z0-9_-]+"/g, "\"$1_ID\"")).toBe(normalize(proxyText).replace(/"(resp|msg|fc|rs|item)_[A-Za-z0-9_-]+"/g, "\"$1_ID\""));
+    // With a login to search with, ocx runs the search on an account it selects.
+    expect((await run(facts({ mainCodexLoginPresent: true }))).declines).toEqual(["responses:web-search-sidecar"]);
+    expect((await run(facts(), JSON.stringify({ accounts: [{ id: "a1" }] }))).declines).toEqual(["responses:web-search-sidecar"]);
+    expect((await run(undefined)).declines).toEqual(["responses:web-search-facts-unpublished"]);
+  });
+
   test("every model ocx gates by account is declined by name", () => {
     for (const model of [...ACCOUNT_GATED_NATIVE_OPENAI_MODELS, ...CODEX_ACCOUNT_GATED_CANONICAL_WIRE_MODELS.keys()]) {
       expect([model, nativeOpenAiDeclineReason(codexTurn({ model }), new Headers(callerHeaders()))]).toEqual([model, "native-model"]);
@@ -489,6 +536,10 @@ describe("what a ChatGPT passthrough turn reads from ocx's process", () => {
   test("this process's answers, published under the stamp and read only while its boot holds the lease", async () => {
     expect(nativeOpenAiFacts()).toMatchObject({ mainAccountIdentityKey: null, codexAccountsStored: false, contextRelayActive: false, upstreamTransport: transport });
     expect(nativeOpenAiFacts().inputCeilings["gpt-5.5"]).toBeGreaterThan(0);
+    // A Codex login in CODEX_HOME is what ocx's web-search sidecar would search with.
+    expect(nativeOpenAiFacts().mainCodexLoginPresent).toBe(false);
+    writeFileSync(join(resolveCodexHomeDir(), "auth.json"), JSON.stringify({ tokens: { access_token: CALLER_TOKEN, refresh_token: "r", account_id: "acct-main" } }));
+    expect(nativeOpenAiFacts().mainCodexLoginPresent).toBe(true);
     const hub = new LeaseState(memoryStorage());
     await hub.acquireLease(BOOT_ID);
     process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;

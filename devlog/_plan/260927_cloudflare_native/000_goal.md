@@ -359,3 +359,12 @@ admission, its terminal-to-status mapping and its usage totals now apply to the 
 (ceilings published per native model, the mapping in `terminal-status.ts`). Hosted web search is
 served; the ChatGPT backend runs it. Still not verified live: the Worker's own path to chatgpt.com.
 
+Routed web search: a trace of ocx's sidecar found that under the default config it never searches
+with the caller's login; in pool mode it selects a stored Codex login (writing affinity, lineage,
+quota and health state later turns read, and possibly refreshing tokens), and without one it drops
+the hosted tool exactly as it does with no `openai` row. The Worker serves the second case: ocx now
+publishes whether a main Codex login exists in CODEX_HOME, watching auth.json since several owners
+write it, and the Worker declines when it does, when Codex accounts are stored, or in direct mode.
+Searching itself stays with ocx. Separately, the usage-inbox drain now books Worker turns in ocx's
+spend ledger (once per request id), so a limit configured later counts them.
+

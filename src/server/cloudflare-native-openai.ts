@@ -137,7 +137,7 @@ function canonicalOpenAiRow(config: unknown): OcxProviderConfig | undefined {
 }
 
 /** No stored Codex account: codex-accounts.json absent, or holding none. */
-async function noStoredCodexAccounts(deps: NativeChatDeps): Promise<boolean> {
+export async function noStoredCodexAccounts(deps: NativeChatDeps): Promise<boolean> {
   if (!deps.readCodexAccounts) return false;
   const text = await deps.readCodexAccounts();
   if (text === undefined) return true;

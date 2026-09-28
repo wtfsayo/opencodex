@@ -9,7 +9,9 @@ import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudfla
 import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, TURN_ADAPTERS, withOpenCodeGoSession, type NativeChatRoute } from "./cloudflare-native-chat";
 import { createAnthropicAdapterWith, isLikelyRealAnthropicThinkingSignature, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
 import { CLAUDE_CODE_HEADERS } from "../adapters/client-fingerprint";
-import { runNativeOpenAiTurn } from "./cloudflare-native-openai";
+import { noStoredCodexAccounts, runNativeOpenAiTurn } from "./cloudflare-native-openai";
+import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
+import { providerCodexAccountMode } from "../providers/registry";
 import { createInputAdmission } from "./responses/input-admission-core";
 import { finishRegisteredAdapter, wrapOpenAIChatAdapter } from "../adapters/registered-adapter";
 import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
@@ -27,7 +29,7 @@ import { metadataProviderKeyForBaseUrl } from "../providers/reasoning-metadata-d
 import { readResponseStreamWithInactivity, ResponseBodyInactivityError } from "../lib/response-body-inactivity";
 import { createTranslatorBudget, type TranslatorBudget } from "../lib/translator-budget";
 import { resolveStallTimeoutMs } from "../stall-timeout";
-import type { AdapterEvent, OcxConfig, OcxUsage } from "../types";
+import type { AdapterEvent, OcxConfig, OcxProviderConfig, OcxUsage } from "../types";
 
 type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
@@ -87,6 +89,25 @@ export async function freezeSkillsCatalog(body: Rec, headers: Headers, deps: Nat
     return undefined;
   }
   return () => skills.commit(scope, found.block);
+}
+
+/**
+ * web-search/index.ts's sidecar for a hosted web_search tool searches through the canonical `openai`
+ * row (openai-sidecar.ts): in pool mode with a stored Codex login, in direct mode with the caller's.
+ * Without one it drops the tool, as the Worker does; with one, its account selection and quota
+ * records are ocx's alone.
+ */
+async function webSearchSidecarDecline(openai: unknown, deps: NativeChatDeps): Promise<string | undefined> {
+  if (openai === undefined || (isRec(openai) && openai.disabled === true)) return undefined;
+  // Only the row as saved is visible here, not what ocx's config loading makes of it; any row
+  // but the canonical one is left to ocx.
+  const row = (isRec(openai) && openai.authMode === undefined ? { ...openai, authMode: "forward" } : openai) as unknown as OcxProviderConfig;
+  if (!isRec(openai) || !isCanonicalOpenAiForwardProvider(row)) return "web-search-sidecar";
+  if (providerCodexAccountMode("openai", row) !== "pool") return "web-search-sidecar";
+  if (!(await noStoredCodexAccounts(deps))) return "web-search-sidecar";
+  const facts = await deps.nativeOpenAiFacts?.();
+  if (!facts) return "web-search-facts-unpublished";
+  return facts.codexAccountsStored || facts.mainCodexLoginPresent ? "web-search-sidecar" : undefined;
 }
 
 function hasHostedWebSearch(body: Rec): boolean {
@@ -258,10 +279,10 @@ export async function runNativeResponsesTurn(
   }
   const config = loaded.config as Pick<OcxConfig, "stallTimeoutSec" | "cacheRetention">;
 
-  // ocx's web-search sidecar resolves through a configured OpenAI provider's accounts.
-  const providers = (loaded.config as { providers: Record<string, unknown> }).providers;
-  const openai = providers.openai;
-  if (hasHostedWebSearch(body) && openai !== undefined && !(isRec(openai) && openai.disabled === true)) return no("web-search-sidecar");
+  if (hasHostedWebSearch(body)) {
+    const sidecar = await webSearchSidecarDecline((loaded.config as { providers: Record<string, unknown> }).providers.openai, deps);
+    if (sidecar) return no(sidecar);
+  }
 
   // skills-snapshot.ts: a session's first catalog block is kept and substituted on later turns,
   // before the body is parsed. The Worker keeps its own copy; see skillsSnapshot.

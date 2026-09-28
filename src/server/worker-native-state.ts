@@ -5,7 +5,10 @@ import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 import { resolveProxyRoute } from "../lib/proxy-env";
 import { startWorkerUsageInbox } from "../usage/worker-usage-inbox";
 import { loadConfig } from "../config";
+import { watch } from "node:fs";
 import { listCodexAccountIds } from "../codex/account-store";
+import { getMainChatgptAccountId } from "../codex/auth-collision";
+import { resolveCodexHomeDir } from "../codex/home";
 import { NATIVE_OPENAI_CONTEXT_OVERRIDES, nativeContextLimits } from "../codex/catalog/metadata";
 import { NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS, NATIVE_OPENAI_MODELS } from "../codex/catalog/native-models";
 import { listModelMetadata } from "../generated/model-metadata";
@@ -74,6 +77,7 @@ let factsVersion = Date.now();
 // Computed on the publish cadence, off any request: the catalog tables and config read are not free.
 let cachedCeilings: Record<string, number | null> | undefined;
 let publishedMainKey: string | null | undefined;
+let publishedMainLoginPresent: boolean | undefined;
 let publishScheduled = false;
 
 export function nativeOpenAiFacts(refreshCeilings = false): NativeOpenAiFacts {
@@ -82,6 +86,7 @@ export function nativeOpenAiFacts(refreshCeilings = false): NativeOpenAiFacts {
     version: ++factsVersion,
     mainAccountIdentityKey: mainAccountIdentityKey(),
     codexAccountsStored: listCodexAccountIds().length > 0,
+    mainCodexLoginPresent: getMainChatgptAccountId() !== null,
     nativeMainTrafficBlocked: isNativeMainTrafficBlocked(),
     contextRelayActive: contextRelayActivated(),
     upstreamTransport: upstreamTransport(),
@@ -110,21 +115,45 @@ export function publishNativeOpenAiFactsForWorker(retrySoon = false, refreshCeil
     .then(ok => {
       // Only a stored answer counts as published; a main account the Worker has not heard of yet
       // is retried until it has, since a caller holding it would otherwise skip ocx's limits.
-      if (ok) publishedMainKey = facts.mainAccountIdentityKey;
+      if (ok) {
+        publishedMainKey = facts.mainAccountIdentityKey;
+        publishedMainLoginPresent = facts.mainCodexLoginPresent;
+      }
       else if (retrySoon || facts.mainAccountIdentityKey !== publishedMainKey) {
         setTimeout(() => void publishNativeOpenAiFactsForWorker(retrySoon), FIRST_RETRY_MS).unref?.();
       }
     });
 }
 
-/** A main-credential observation: republish, after the request that caused it, only if it changed. */
-function mainCredentialChanged(): void {
-  if (publishScheduled || mainAccountIdentityKey() === publishedMainKey) return;
+/** Republish once, after whatever triggered it, when `changed` still says the answer moved. */
+function scheduleRepublish(changed: () => boolean): void {
+  if (publishScheduled || !changed()) return;
   publishScheduled = true;
   setTimeout(() => {
     publishScheduled = false;
-    if (mainAccountIdentityKey() !== publishedMainKey) void publishNativeOpenAiFactsForWorker(true);
+    if (changed()) void publishNativeOpenAiFactsForWorker(true);
   }, 0).unref?.();
+}
+
+/** A main-credential observation: republish only if the observed account changed. */
+function mainCredentialChanged(): void {
+  scheduleRepublish(() => mainAccountIdentityKey() !== publishedMainKey);
+}
+
+/**
+ * The main Codex login is written by several owners (login, refresh, profile switches), so its
+ * file is watched rather than each writer: a login appearing must reach the Worker before it drops
+ * a web search ocx would now run with it.
+ */
+function watchMainCodexLogin(): void {
+  try {
+    const watcher = watch(resolveCodexHomeDir(), (_event, file) => {
+      if (file === "auth.json") scheduleRepublish(() => (getMainChatgptAccountId() !== null) !== publishedMainLoginPresent);
+    });
+    watcher.unref?.();
+  } catch {
+    // No CODEX_HOME to watch: the republish cadence still carries a login made later.
+  }
 }
 
 export function startWorkerNativeState(): void {
@@ -133,6 +162,7 @@ export function startWorkerNativeState(): void {
   void publishNativeOpenAiFactsForWorker(true, true);
   if (published && !republish) {
     onMainQuotaCredentialChange(mainCredentialChanged);
+    watchMainCodexLogin();
     republish = setInterval(() => {
       void publishClientRuntimeForWorker();
       void publishNativeOpenAiFactsForWorker(false, true);

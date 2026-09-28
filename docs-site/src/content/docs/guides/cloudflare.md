@@ -196,8 +196,9 @@ the runtime it reports in the Claude Code headers, which the Worker then sends a
 headers match; the connection itself (address, TLS, Cloudflare's own request headers) is the
 Worker's. That covers the turn when it is
 streamed, not stored (`"store": false`, as Codex sends it), and uses only
-`function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
-is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only
+`function` tools, grouped in namespaces or not, plus hosted `web_search` when `ocx` would drop it:
+with no enabled `openai` provider, or with the one `ocx init` writes while the hub holds no ChatGPT
+login or Codex accounts to search with (`ocx`'s search sidecar searches with those); no code-mode `exec` or custom tools; text-only
 messages; and no `<skills_instructions>` block outside the instructions and developer messages.
 That covers what Codex CLI sends on an ordinary turn. For OpenCode Zen and Go, whose reasoning
 levels `ocx` reads from models.dev and from the levels a provider has refused before, a turn with a

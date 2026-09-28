@@ -55,6 +55,11 @@ export type NativeOpenAiFacts = {
   mainAccountIdentityKey: string | null;
   /** Codex accounts in ocx's store: pool selection then decides whose login a turn uses. */
   codexAccountsStored: boolean;
+  /**
+   * A main Codex login in ocx's CODEX_HOME (auth-collision.ts's getMainChatgptAccountId): ocx's
+   * web-search sidecar then searches with it, where without one it drops a hosted web_search tool.
+   */
+  mainCodexLoginPresent: boolean;
   nativeMainTrafficBlocked: boolean;
   contextRelayActive: boolean;
   /** "proxied" when an egress proxy carries ocx's upstream traffic, which the Worker cannot use. */

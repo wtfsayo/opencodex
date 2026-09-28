@@ -103,6 +103,7 @@ import {
   withCors,
   withManagementCors,
 } from "../auth-cors";
+import { modelListReplay } from "../model-list-replay";
 import { managementSessionIssuance } from "../management-auth";
 import { resolveAdmissionModelScope, routeAllowedByScope } from "../admission-model-scope";
 import {
@@ -889,6 +890,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
         if (!isAllowedRequestOrigin(req, policy)) {
           return withCors(formatErrorResponse(403, "origin_rejected", "cross-origin data-plane request blocked"), req, policy);
         }
+        const replay = modelListReplay(req, url, admission, config);
         const wantsDesktopConfig = url.searchParams.get("format") === "desktop-config";
         if (wantsDesktopConfig && (url.searchParams.get("ids") === "cli" || url.searchParams.has("client_version"))) {
           return jsonResponse({ error: "Desktop config format cannot use CLI or client-version selectors" }, 400, req, policy);
@@ -1028,7 +1030,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             response.headers.set("Cache-Control", "no-store");
             return response;
           }
-          if (config.claudeCode?.enabled === false) return jsonResponse({ data: [] }, 200, req, policy);
+          if (config.claudeCode?.enabled === false) return replay(jsonResponse({ data: [] }, 200, req, policy));
           // Build Desktop 3P registry so inbound alias resolution works for subsequent requests.
           buildDesktop3pRegistry(
             desktopNativeSlugs,
@@ -1066,7 +1068,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
               : undefined,
             { modelPickerOrder: config.modelPickerOrder, featured: config.subagentModels },
           );
-          return jsonResponse({ data }, 200, req, policy);
+          return replay(jsonResponse({ data }, 200, req, policy));
         }
         if (url.searchParams.has("client_version")) {
           // Codex client → Codex catalog shape: native gpt + namespaced routed models,
@@ -1101,14 +1103,14 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             config.keepNativeChatGptOnV1 === true,
             config.modelPickerOrder,
           );
-          return jsonResponse({
+          return replay(jsonResponse({
             models: applyNativeVisibility(
               entries,
               disabledModels,
               accountSelectors.length > 0,
               new Set(accountNativeSlugs),
             ),
-          }, 200, req, policy);
+          }, 200, req, policy));
         }
         // OpenAI list shape: native gpt bare + routed models namespaced "<provider>/<id>"
         // (pure availability list — disabled natives are omitted entirely).
@@ -1292,7 +1294,7 @@ export function createServeOptions(ctx: ServeOptionsContext) {
             .flatMap(({ id, metadataId }) => expandedNativeModelRow(id, metadataId)),
           ...routedRows.flat(),
         ];
-        return jsonResponse({ object: "list", data }, 200, req, policy);
+        return replay(jsonResponse({ object: "list", data }, 200, req, policy));
       }
 
       // Remote compaction v1 (codex-rs with Feature::RemoteCompactionV2 off — the default).

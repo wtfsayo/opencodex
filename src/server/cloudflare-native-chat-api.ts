@@ -52,3 +52,5 @@ export type WorkerUsageRow = {
   totalTokens?: number;
 };
 
+/** The replay key for a GET /v1/models request, or undefined when its answer cannot be replayed. */
+export type ModelListReplayKey = (url: URL, headers: Headers) => Promise<string | undefined>;

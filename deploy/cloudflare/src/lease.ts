@@ -47,6 +47,18 @@ export const MAX_SKILLS_BLOCK_BYTES = 512 * 1024;
 export const MAX_SKILLS_SESSIONS = 1000;
 type SkillsMeta = { lastAccessed: number };
 
+// /v1/models answers ocx computed, replayed by the Worker while ocx's own model cache would still
+// hold them and the three documents are unchanged. See modelListRead.
+const MODEL_LIST_PREFIX = "ocx:model-list:";
+const MODEL_LIST_META_PREFIX = "ocx:model-list-meta:";
+export const MAX_MODEL_LISTS = 32;
+export const MAX_MODEL_LIST_BYTES = 1024 * 1024;
+// ocx's modelCacheTtlMs is honoured up to this; a longer one would let a list outlive a restart by hours.
+export const MAX_MODEL_LIST_TTL_MS = 60 * 60 * 1000;
+export type DocumentSeqs = Record<DurableDocument, number>;
+export type ModelList = { body: string; headers: [string, string][] };
+type ModelListMeta = { expiresAt: number; seqs: DocumentSeqs };
+
 const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
 const DOCUMENT_KEY_PREFIX = "ocx:document:";
@@ -111,6 +123,11 @@ export class LeaseState {
       const metas = await this.storage.list<SkillsMeta>({ prefix: SKILLS_META_PREFIX, limit: 1000 });
       if (metas.size === 0) break;
       for (const key of metas.keys()) await this.dropSkills(key.slice(SKILLS_META_PREFIX.length));
+    }
+    for (;;) {
+      const metas = await this.storage.list<ModelListMeta>({ prefix: MODEL_LIST_META_PREFIX, limit: 1000 });
+      if (metas.size === 0) break;
+      for (const key of metas.keys()) await this.dropModelList(key.slice(MODEL_LIST_META_PREFIX.length));
     }
     await this.storage.delete(LEASE_KEY);
     return discarded;
@@ -201,6 +218,43 @@ export class LeaseState {
     }
     live.sort((a, b) => a[1] - b[1]);
     while (live.length >= MAX_SKILLS_SESSIONS) await this.dropSkills(live.shift()![0]);
+  }
+
+  /**
+   * A /v1/models answer ocx computed for `key`, while it is younger than ocx's model cache TTL and
+   * every document still has the sequence it was computed under; else undefined.
+   */
+  async modelListRead(key: string): Promise<ModelList | undefined> {
+    const meta = await this.storage.get<ModelListMeta>(MODEL_LIST_META_PREFIX + key);
+    if (!meta || this.now() >= meta.expiresAt) return undefined;
+    for (const name of DURABLE_DOCUMENTS) {
+      if (((await this.readDocument(name))?.seq ?? 0) !== meta.seqs[name]) return undefined;
+    }
+    return this.storage.get<ModelList>(MODEL_LIST_PREFIX + key);
+  }
+
+  /** Stores an answer from the lease holder, dropping expired ones and then the soonest to expire. */
+  async modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number): Promise<boolean> {
+    if (!(await this.holdsLease(bootId))) return false;
+    const now = this.now();
+    const metas = await this.storage.list<ModelListMeta>({ prefix: MODEL_LIST_META_PREFIX, limit: MAX_MODEL_LISTS + 50 });
+    const live: [string, number][] = [];
+    for (const [metaKey, meta] of metas) {
+      const listKey = metaKey.slice(MODEL_LIST_META_PREFIX.length);
+      if (now >= meta.expiresAt) await this.dropModelList(listKey);
+      else if (listKey !== key) live.push([listKey, meta.expiresAt]);
+    }
+    live.sort((a, b) => a[1] - b[1]);
+    while (live.length >= MAX_MODEL_LISTS) await this.dropModelList(live.shift()![0]);
+    // Metadata first, as for skills: reset finds bodies only through it.
+    await this.storage.put<ModelListMeta>(MODEL_LIST_META_PREFIX + key, { expiresAt: now + Math.min(ttlMs, MAX_MODEL_LIST_TTL_MS), seqs });
+    await this.storage.put<ModelList>(MODEL_LIST_PREFIX + key, list);
+    return true;
+  }
+
+  private async dropModelList(key: string): Promise<void> {
+    await this.storage.delete(MODEL_LIST_META_PREFIX + key);
+    await this.storage.delete(MODEL_LIST_PREFIX + key);
   }
 
   private async dropSkills(scope: string): Promise<void> {

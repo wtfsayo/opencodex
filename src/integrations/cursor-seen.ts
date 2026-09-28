@@ -7,7 +7,7 @@
  * timestamp are kept, in memory, so a proxy restart forgets it and the card says so.
  */
 // Attacker-controlled header: accept only the shape Cursor sends and keep it short.
-const CURSOR_USER_AGENT = /^Cursor\/[\w.+-]{1,40}$/;
+export const CURSOR_USER_AGENT = /^Cursor\/[\w.+-]{1,40}$/;
 
 export interface CursorSeen {
   at: number;

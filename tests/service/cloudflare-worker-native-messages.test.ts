@@ -6,7 +6,7 @@ import { serveNativeMessages } from "../../src/server/cloudflare-native-messages
 import { handleClaudeMessages } from "../../src/server/claude-messages";
 import type { RequestLogContext } from "../../src/server/request-log";
 import type { OcxConfig } from "../../src/types";
-import { messagesAdmitsDataToken } from "../../deploy/cloudflare/src/container-env";
+import { apiAuthAdmitsDataToken } from "../../deploy/cloudflare/src/container-env";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
@@ -240,11 +240,11 @@ describe("Worker-native Messages", () => {
   test("admission follows ocx's /v1/messages header order", async () => {
     const env = { OPENCODEX_API_AUTH_TOKEN: "data-token" } as never;
     const req = (headers: Record<string, string>) => new Request("https://hub.example/v1/messages", { method: "POST", headers });
-    expect(await messagesAdmitsDataToken(req({ "x-api-key": "data-token" }), env)).toBe(true);
-    expect(await messagesAdmitsDataToken(req({ authorization: "Bearer data-token" }), env)).toBe(true);
-    expect(await messagesAdmitsDataToken(req({ "x-opencodex-api-key": "data-token" }), env)).toBe(true);
+    expect(await apiAuthAdmitsDataToken(req({ "x-api-key": "data-token" }), env)).toBe(true);
+    expect(await apiAuthAdmitsDataToken(req({ authorization: "Bearer data-token" }), env)).toBe(true);
+    expect(await apiAuthAdmitsDataToken(req({ "x-opencodex-api-key": "data-token" }), env)).toBe(true);
     // The first header present decides, as in resolveApiAuth.
-    expect(await messagesAdmitsDataToken(req({ authorization: "Bearer other", "x-api-key": "data-token" }), env)).toBe(false);
-    expect(await messagesAdmitsDataToken(req({}), env)).toBe(false);
+    expect(await apiAuthAdmitsDataToken(req({ authorization: "Bearer other", "x-api-key": "data-token" }), env)).toBe(false);
+    expect(await apiAuthAdmitsDataToken(req({}), env)).toBe(false);
   });
 });

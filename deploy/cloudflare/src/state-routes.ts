@@ -1,4 +1,4 @@
-import { BOOT_ID_PATTERN, type DocumentCommit, DURABLE_DOCUMENTS, type DurableDocument, MAX_DOCUMENT_BYTES, type StoredDocument } from "./lease";
+import { BOOT_ID_PATTERN, type DocumentCommit, type DocumentSeqs, DURABLE_DOCUMENTS, type DurableDocument, MAX_DOCUMENT_BYTES, MAX_MODEL_LIST_BYTES, type ModelList, type StoredDocument } from "./lease";
 
 // Mirrors DOCUMENT_SEQUENCE_HEADER in src/lib/durable-mirror.ts, which the Worker bundle cannot import.
 export const DOCUMENT_SEQUENCE_HEADER = "x-ocx-document-seq";
@@ -15,6 +15,7 @@ export interface StateHub {
   commitDocument(bootId: string, name: DurableDocument, body: string, seq: number): Promise<DocumentCommit>;
   peekUsage(bootId: string, limit: number): Promise<{ seq: number; row: unknown }[] | null>;
   ackUsage(bootId: string, seqs: readonly number[]): Promise<boolean>;
+  modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number): Promise<boolean>;
 }
 
 export interface StateBucket {
@@ -109,6 +110,16 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     if (!Array.isArray(seqs) || seqs.length > 500 || !seqs.every(seq => Number.isSafeInteger(seq))) return new Response("seqs required", { status: 400 });
     return (await hub.ackUsage(bootId, seqs as number[])) ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
   }
+  const modelListKey = /^\/model-lists\/([0-9a-f]{64})$/.exec(path)?.[1];
+  if (modelListKey !== undefined && req.method === "PUT") {
+    const text = await req.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_MODEL_LIST_BYTES) return new Response("model list too large", { status: 413 });
+    const entry = parseModelListEntry(text);
+    if (!entry) return new Response("model list, headers, seqs and ttlMs required", { status: 400 });
+    return (await hub.modelListCommit(bootId, modelListKey, entry.list, entry.seqs, entry.ttlMs))
+      ? new Response(null, { status: 204 })
+      : new Response("lease lost", { status: 409 });
+  }
   const document = /^\/documents\/([a-z-]+)$/.exec(path)?.[1];
   if (document !== undefined) {
     if (!(DURABLE_DOCUMENTS as readonly string[]).includes(document)) return new Response("unknown document", { status: 404 });
@@ -132,6 +143,20 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     }
   }
   return new Response("not found", { status: 404 });
+}
+
+function parseModelListEntry(text: string): { list: ModelList; seqs: DocumentSeqs; ttlMs: number } | undefined {
+  let value: { body?: unknown; headers?: unknown; seqs?: unknown; ttlMs?: unknown };
+  try { value = JSON.parse(text) as typeof value; } catch { return undefined; }
+  if (typeof value?.body !== "string" || !Number.isSafeInteger(value.ttlMs) || (value.ttlMs as number) <= 0) return undefined;
+  if (!Array.isArray(value.headers) || !value.headers.every(pair => Array.isArray(pair) && pair.length === 2 && pair.every(part => typeof part === "string"))) return undefined;
+  const seqs = value.seqs as Record<string, unknown> | undefined;
+  if (!seqs || typeof seqs !== "object" || !DURABLE_DOCUMENTS.every(name => Number.isSafeInteger(seqs[name]) && (seqs[name] as number) >= 0)) return undefined;
+  return {
+    list: { body: value.body, headers: value.headers as [string, string][] },
+    seqs: Object.fromEntries(DURABLE_DOCUMENTS.map(name => [name, seqs[name]])) as DocumentSeqs,
+    ttlMs: value.ttlMs as number,
+  };
 }
 
 function isJsonObject(body: string): boolean {

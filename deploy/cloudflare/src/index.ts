@@ -1,11 +1,11 @@
 import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
 import {
-  chatAdmitsDataToken, messagesAdmitsDataToken, containerEnv, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
+  chatAdmitsDataToken, apiAuthAdmitsDataToken, containerEnv, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
-import { type DurableDocument, LeaseState } from "./lease";
+import { type DocumentSeqs, type DurableDocument, LeaseState, type ModelList } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
-import { serveNativeChat, serveNativeMessages, serveNativeResponses } from "ocx-worker-native";
+import { modelListReplayKey, serveNativeChat, serveNativeMessages, serveNativeResponses } from "ocx-worker-native";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
@@ -167,6 +167,10 @@ export class OpencodexHub extends Container<Env> {
   enqueueUsage(row: unknown) { return this.leases.enqueueUsage(row); }
   skillsSnapshotRead(scope: string) { return this.leases.skillsSnapshotRead(scope); }
   skillsSnapshotCommit(scope: string, block: string) { return this.leases.skillsSnapshotCommit(scope, block); }
+  modelListRead(key: string) { return this.leases.modelListRead(key); }
+  modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number) {
+    return this.leases.modelListCommit(bootId, key, list, seqs, ttlMs);
+  }
   async nativeConfigSource(): Promise<{ config: string | undefined; hasSnapshot: boolean }> {
     return { config: (await this.leases.readDocument("config"))?.body, hasSnapshot: (await this.leases.currentSnapshot()) !== undefined };
   }
@@ -223,7 +227,7 @@ const NATIVE_MAX_BODY_BYTES = 4 * 1024 * 1024;
 /**
  * The Worker-native path runs only where the edge has matched the data token exactly: with
  * OCX_EDGE_KEY_CHECK=presence the key is verified by ocx, which this path would skip. It also
- * applies ocx's own header rule for each endpoint (chatAdmitsDataToken, messagesAdmitsDataToken).
+ * applies ocx's own header rule for each endpoint (chatAdmitsDataToken, apiAuthAdmitsDataToken).
  * Returns the response, or the request to forward when the body was read and declined, or null
  * when the request is untouched.
  */
@@ -243,7 +247,7 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   // ocx refuses cross-origin data-plane requests unless the origin is loopback, the hub itself, or
   // configured (isAllowedRequestOrigin); the Worker leaves every request with an Origin to it.
   if (req.headers.has("origin")) return null;
-  if (!(await (serve === serveNativeMessages ? messagesAdmitsDataToken : chatAdmitsDataToken)(req, env))) return null;
+  if (!(await (serve === serveNativeMessages ? apiAuthAdmitsDataToken : chatAdmitsDataToken)(req, env))) return null;
   const bodyBytes = await req.arrayBuffer();
   const hub = getContainer(env.HUB, HUB_NAME);
   try {
@@ -276,6 +280,22 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   return { forward: new Request(req, { body: bodyBytes }) };
 }
 
+/**
+ * Replays GET /v1/models from the answers ocx published to the Durable Object (model-list-replay.ts
+ * in src/server), under the same conditions as tryWorkerNative. A miss goes to ocx, which answers
+ * and publishes again.
+ */
+async function tryWorkerModelList(req: Request, env: Env): Promise<Response | null> {
+  if (env.OCX_WORKER_NATIVE?.trim() !== "1" || env.OCX_EDGE_KEY_CHECK?.trim() === "presence") return null;
+  const url = new URL(req.url);
+  if (req.method !== "GET" || url.pathname !== "/v1/models") return null;
+  if (!(await apiAuthAdmitsDataToken(req, env))) return null;
+  const key = await modelListReplayKey(url, req.headers);
+  if (!key) return null;
+  const list = await getContainer(env.HUB, HUB_NAME).modelListRead(key);
+  return list ? new Response(list.body, { headers: list.headers }) : null;
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // The dashboard's static files come from the Worker and never start the container; the admin
@@ -291,6 +311,11 @@ export default {
       if (decision.status === 204) return new Response(null, { status: 204 });
       return Response.json({ error: { message: decision.message, type: "invalid_request_error" } }, { status: decision.status });
     }
+    const replayed = await tryWorkerModelList(req, env).catch(error => {
+      console.error(`Model list replay failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+    if (replayed) return replayed;
     const native = await tryWorkerNative(req, env, ctx);
     if (native instanceof Response) return native;
     if (native) req = native.forward;

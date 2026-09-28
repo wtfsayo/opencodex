@@ -182,15 +182,69 @@ describe("Worker-native Messages", () => {
     expect(store.size).toBe(0);
   });
 
-  test("declines an OpenCode Go destination under any provider name, which ocx gives a session header", async () => {
-    const declines: string[] = [];
-    const response = await serveNativeMessages(JSON.stringify(claudeTurn({ model: "ocx-claude-g--m-1" })), new Headers(), new AbortController().signal, {
+  test("sends OpenCode Go the session header ocx sends, under any provider name", async () => {
+    const go = { ...provider, baseUrl: "https://opencode.ai/zen/go/v1" };
+    const goConfig = JSON.stringify({ providers: { g: go } });
+    const sessionHeader = (headers: Headers) => headers.get("x-opencode-session");
+    // What ocx sends, from its own handlers in this process, with fetch answered locally.
+    const proxySends: (string | null)[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).hostname !== "opencode.ai") return originalFetch(input, init);
+      proxySends.push(sessionHeader(request.headers));
+      return sse(textReply);
+    }) as typeof fetch;
+    const { saveConfig } = await import("../../src/config");
+    const { startServer } = await import("../../src/server");
+    saveConfig({ port: 0, providers: { g: go } } as unknown as OcxConfig);
+    const chat = { model: "g/m-1", stream: true, messages: [{ role: "user", content: "hi" }] };
+    const responses = { model: "g/m-1", input: "hi", store: false, stream: true };
+    // No effort: Go's effort ladder comes from models.dev, which the Worker declines.
+    const goTurn = (extra: Rec = {}) => claudeTurn({ model: "ocx-claude-g--m-1", output_config: undefined, thinking: undefined, ...extra });
+    const cases: [string, unknown, Record<string, string>][] = [
+      ["/v1/chat/completions", chat, { "session-id": "s-chat" }],
+      ["/v1/responses", responses, { "thread-id": "t-resp" }],
+      ["/v1/messages", goTurn(), {}],
+      ["/v1/messages", goTurn({ metadata: undefined }), { "session-id": "s-msg" }],
+      ["/v1/messages", goTurn({ metadata: undefined }), { "x-opencode-session": "caller-go" }],
+    ];
+    const server = startServer(0);
+    try {
+      for (const [path, body, headers] of cases) {
+        await originalFetch(`http://127.0.0.1:${server.port}${path}`, {
+          method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body),
+        }).then(response => response.text());
+      }
+    } finally {
+      await server.stop(true);
+      globalThis.fetch = originalFetch;
+    }
+    const workerSends: (string | null)[] = [];
+    const deps = { readConfig: async () => goConfig, fetch: async (request: Request) => { workerSends.push(sessionHeader(request.headers)); return sse(textReply); } };
+    const { serveNativeChat } = await import("../../src/server/cloudflare-native-chat");
+    const { serveNativeResponses } = await import("../../src/server/cloudflare-native-responses");
+    for (const [path, body, headers] of cases) {
+      const serve = path === "/v1/chat/completions" ? serveNativeChat : path === "/v1/responses" ? serveNativeResponses : serveNativeMessages;
+      await (await serve(JSON.stringify(body), new Headers(headers), new AbortController().signal, deps))!.text();
+    }
+    expect(proxySends).toHaveLength(cases.length);
+    expect(workerSends).toEqual(proxySends);
+    expect(proxySends.every(value => /^ocx_[0-9a-f]{32}$/.test(value ?? ""))).toBe(true);
+  });
+
+  test("a Go turn with no session identity gets a lane of its own, as in ocx", async () => {
+    const sends: (string | null)[] = [];
+    const deps = {
       readConfig: async () => JSON.stringify({ providers: { g: { ...provider, baseUrl: "https://opencode.ai/zen/go/v1" } } }),
-      fetch: async () => { throw new Error("must not send"); },
-      onDecline: reason => declines.push(reason),
-    });
-    expect(response).toBeNull();
-    expect(declines).toEqual(["messages:opencode-go-session"]);
+      fetch: async (request: Request) => { sends.push(request.headers.get("x-opencode-session")); return sse(textReply); },
+    };
+    for (let i = 0; i < 2; i++) {
+      const turn = claudeTurn({ model: "ocx-claude-g--m-1", metadata: undefined, output_config: undefined, thinking: undefined });
+      await (await serveNativeMessages(JSON.stringify(turn), new Headers(), new AbortController().signal, deps))!.text();
+    }
+    expect(sends.every(value => /^ocx_[0-9a-f]{32}$/.test(value ?? ""))).toBe(true);
+    expect(sends[0]).not.toBe(sends[1]);
   });
 
   test("releases its translation budgets whether it serves or declines", async () => {

@@ -3,7 +3,7 @@ import {
   chatAdmitsDataToken, apiAuthAdmitsDataToken, containerEnv, modelListStamp, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
-import { type DocumentSeqs, type DurableDocument, LeaseState, type ModelList } from "./lease";
+import { type DocumentSeqs, type DurableDocument, LeaseState, type ModelList, type ReasoningMetadataKind } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
 import { modelListReplayKey, serveNativeChat, serveNativeMessages, serveNativeResponses } from "ocx-worker-native";
 import { handleStateRequest } from "./state-routes";
@@ -168,6 +168,10 @@ export class OpencodexHub extends Container<Env> {
   skillsSnapshotRead(scope: string) { return this.leases.skillsSnapshotRead(scope); }
   skillsSnapshotCommit(scope: string, block: string) { return this.leases.skillsSnapshotCommit(scope, block); }
   modelListRead(key: string, stamp: string) { return this.leases.modelListRead(key, stamp); }
+  reasoningMetadataRead() { return this.leases.reasoningMetadataRead(); }
+  reasoningMetadataCommit(bootId: string, kind: ReasoningMetadataKind, body: string, version: number) {
+    return this.leases.reasoningMetadataCommit(bootId, kind, body, version);
+  }
   modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string) {
     return this.leases.modelListCommit(bootId, key, list, seqs, ttlMs, stamp);
   }
@@ -257,6 +261,7 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
         return nativeConfigText(source.config, source.hasSnapshot, env);
       },
       secrets: containerEnv(env),
+      reasoningMetadata: () => hub.reasoningMetadataRead(),
       skills: {
         read: scope => hub.skillsSnapshotRead(scope),
         commit: (scope, block) => { ctx.waitUntil(hub.skillsSnapshotCommit(scope, block).catch(() => {})); },

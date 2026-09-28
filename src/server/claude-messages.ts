@@ -47,6 +47,7 @@ import {
 } from "../claude/outbound";
 import { clearableDeadline, idleDeadline } from "../lib/abort";
 import { estimateClaudeRequestTokens } from "../claude/request-token-estimate";
+import { claudeNativeSessionId as claudeNativeSessionIdFor } from "../claude/native-session-id";
 export { estimateClaudeRequestTokens };
 import {
   CLAUDE_NATIVE_THINKING,
@@ -257,12 +258,6 @@ function shouldForwardNativeHeader(name: string, value: string, config: OcxConfi
   if (lowerName !== "authorization" && lowerName !== "x-api-key") return true;
   const token = singleCredentialToken(lowerName, value);
   return !!token && !isProxyAdmissionSecret(token, config);
-}
-
-/** Format a 32-hex cache key as a uuid-shaped session id (version/variant nibbles forced). */
-function uuidFromHex(hex32: string): string {
-  const h = (hex32 + "0".repeat(32)).slice(0, 32);
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
 export function anthropicUsageToOcx(usage: Rec | undefined): { inputTokens: number; outputTokens: number; cachedInputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number } | undefined {
@@ -1119,12 +1114,9 @@ async function handleClaudeMessagesWithBudget(
   }
   // Carry Go identity out of band: a combo's preflight target may differ from its
   // actual dispatch/fallback target. Never add Go-only identity to replay headers.
-  const claudeNativeSessionId = cacheKeySource === "metadata"
-    && typeof internalBody.prompt_cache_key === "string"
-    && isRec(anthropicBody)
-    && conversationIdFromClaudeMetadata(isRec(anthropicBody.metadata) ? anthropicBody.metadata : undefined) !== undefined
-    ? uuidFromHex(internalBody.prompt_cache_key)
-    : undefined;
+  const claudeNativeSessionId = claudeNativeSessionIdFor(
+    cacheKeySource, internalBody.prompt_cache_key, isRec(anthropicBody) ? anthropicBody.metadata : undefined,
+  );
   const metadataGoLane = normalizeLogConversationId(claudeNativeSessionId);
   // Without any valid conversation identity, fall back to the request-scoped lane
   // allocated on the admitted client request (#4172): stable across retries and

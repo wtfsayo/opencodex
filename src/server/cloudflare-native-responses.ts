@@ -6,7 +6,7 @@
 //
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
-import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, type NativeChatRoute } from "./cloudflare-native-chat";
+import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, withOpenCodeGoSession, type NativeChatRoute } from "./cloudflare-native-chat";
 import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { buildToolBridgeMaps } from "./responses/tool-bridge-maps";
 import { replaceSkillsBlock, singleSkillsBlock } from "./responses/skills-catalog";
@@ -15,7 +15,9 @@ import { createOpenAIChatAdapterWith, type OpenAIChatAdapterDeps } from "../adap
 import { renameRoutedIdentityInContext } from "../adapters/identity";
 import { bridgeToResponsesSSE } from "../bridge/sse";
 import { hasValidatedActiveReasoningEffort, parseRequest } from "../responses/parser";
-import { mapReasoningEffortWith, NO_REASONING_METADATA } from "../reasoning-effort-core";
+import { mapReasoningEffortWith, NO_REASONING_METADATA, type ReasoningMetadataAccess } from "../reasoning-effort-core";
+import { CACHE_TTL_MS, metadataAccessFrom, parseMetadataSnapshot, parseSupportRows } from "../providers/reasoning-metadata-core";
+import { createHash } from "node:crypto";
 import { metadataProviderKeyForBaseUrl } from "../providers/reasoning-metadata-destinations";
 import { readResponseStreamWithInactivity, ResponseBodyInactivityError } from "../lib/response-body-inactivity";
 import { createTranslatorBudget, type TranslatorBudget } from "../lib/translator-budget";
@@ -143,13 +145,44 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
   return undefined;
 }
 
-// Effort is mapped as ocx maps it for a destination without models.dev metadata (the only kind
-// resolveNativeChatRoute admits). Image-bearing turns are declined above, so those two are never reached.
-const WORKER_ADAPTER_DEPS: OpenAIChatAdapterDeps = {
-  mapReasoningEffort: (provider, modelId, requested) => mapReasoningEffortWith(provider, modelId, requested, NO_REASONING_METADATA),
-  hasShrinkableOpenAIChatImages: () => false,
-  normalizeOpenAIChatImages: async () => {},
-};
+// Effort is mapped with ocx's caches as it published them (or none, for a destination without
+// models.dev metadata). Image-bearing turns are declined above, so the image hooks are never reached.
+function workerAdapterDeps(metadata: ReasoningMetadataAccess): OpenAIChatAdapterDeps {
+  return {
+    mapReasoningEffort: (provider, modelId, requested) => mapReasoningEffortWith(provider, modelId, requested, metadata),
+    hasShrinkableOpenAIChatImages: () => false,
+    normalizeOpenAIChatImages: async () => {},
+  };
+}
+
+/** reasoning-metadata.ts's credentialIdentity on the request path: a digest of the key sent. */
+function credentialDigest(provider: { apiKey?: string }): string | undefined {
+  return typeof provider.apiKey === "string" && provider.apiKey.length > 0
+    ? createHash("sha256").update(provider.apiKey).digest("hex")
+    : undefined;
+}
+
+/**
+ * The metadata access ocx would map this effort with, or a decline reason. ocx reads its caches from
+ * memory; the Worker reads the copies ocx publishes, and declines until there are some.
+ */
+async function effortMetadataFor(deps: NativeChatDeps): Promise<ReasoningMetadataAccess | string> {
+  const cached = await deps.reasoningMetadata?.();
+  if (cached?.snapshot === undefined || cached.support === undefined) return "reasoning-metadata-unpublished";
+  const now = Date.now();
+  let snapshotJson: unknown;
+  let supportJson: unknown;
+  try {
+    snapshotJson = JSON.parse(cached.snapshot);
+    supportJson = JSON.parse(cached.support);
+  } catch {
+    return "reasoning-metadata-unreadable";
+  }
+  const snapshot = parseMetadataSnapshot(snapshotJson);
+  // ocx starts a refresh when it reads a ladder from a snapshot this old; its next turns see the new one.
+  if (snapshot && now - snapshot.fetchedAt > CACHE_TTL_MS) return "reasoning-metadata-stale";
+  return metadataAccessFrom(snapshot, parseSupportRows(supportJson, now), credentialDigest);
+}
 
 /** A turn sent upstream: its Responses SSE, and the callback that writes its usage row when it ends. */
 export type NativeResponsesTurn = {
@@ -171,6 +204,8 @@ type TurnOptions = {
    * prompt, and skills-snapshot.ts then keeps no snapshot for the turn.
    */
   sharedCacheCohort?: boolean;
+  /** OpenCode Go's session lane when the caller derives it (claude-messages.ts does). */
+  goSessionLane?: string;
   /** Runs once the route is known and before the send, so nothing after the send can throw. */
   beforeSend?(route: NativeChatRoute): void;
 };
@@ -188,13 +223,18 @@ export async function runNativeResponsesTurn(
   if (declined) return no(declined);
   const loaded = await loadNativeConfig(deps);
   if ("decline" in loaded) return no(loaded.decline);
-  const route = resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets);
-  if (!route) return null;
-  // ocx maps effort for these destinations from models.dev metadata and refusals it learned, both
-  // kept on disk (reasoning-metadata.ts); without an effort that state is never consulted.
+  const resolved = resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets);
+  if (!resolved) return null;
+  // core-normalize.ts, once the route is final.
+  const route = withOpenCodeGoSession(resolved, headers, options.goSessionLane);
+  // ocx maps effort for these destinations from models.dev metadata and refusals it learned
+  // (reasoning-metadata.ts); without an effort that state is never consulted.
   const effort = isRec(body.reasoning) ? body.reasoning.effort : undefined;
+  let metadata = NO_REASONING_METADATA;
   if (effort !== undefined && effort !== null && metadataProviderKeyForBaseUrl(route.provider.baseUrl) !== undefined) {
-    return no("reasoning-metadata-destination");
+    const access = await effortMetadataFor(deps);
+    if (typeof access === "string") return no(access);
+    metadata = access;
   }
   const config = loaded.config as Pick<OcxConfig, "stallTimeoutSec">;
 
@@ -230,7 +270,7 @@ export async function runNativeResponsesTurn(
   }
 
   const translatorBudget = options.translatorBudget;
-  const adapter = createOpenAIChatAdapterWith(route.provider, WORKER_ADAPTER_DEPS);
+  const adapter = createOpenAIChatAdapterWith(route.provider, workerAdapterDeps(metadata));
   const upstreamAbort = new AbortController();
   const upstreamSignal = AbortSignal.any([signal, upstreamAbort.signal]);
   const request = await adapter.buildRequest(parsed, { headers: new Headers(), translatorBudget, abortSignal: upstreamSignal });

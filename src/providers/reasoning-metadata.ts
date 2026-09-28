@@ -18,7 +18,13 @@
  * entitlement gap (muse-spark max needs an active Muse Code subscription) costs one rejected
  * request instead of failing every turn that selects that rung.
  */
-import { BASE_URL_TO_METADATA_PROVIDER, metadataProviderKeyForBaseUrl, normalizeDestinationUrl } from "./reasoning-metadata-destinations";
+import { BASE_URL_TO_METADATA_PROVIDER, normalizeDestinationUrl } from "./reasoning-metadata-destinations";
+import {
+  CACHE_TTL_MS, dropLearnedIn, learnedUnsupportedIn, metadataEffortValuesIn, metadataModelIn, metadataProviderKey,
+  parseMetadataSnapshot, parseSupportRows, reasoningEffortsFromMetadataIn, sanitizeLadder, supportKey, SUPPORT_TTL_MS,
+  type MetadataSnapshot, type ReasoningMetadataModel, type ReasoningMetadataOption, type SupportSnapshot,
+} from "./reasoning-metadata-core";
+export type { ReasoningMetadataModel, ReasoningMetadataOption };
 export { normalizeDestinationUrl };
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -27,6 +33,7 @@ import { join } from "node:path";
 // already imports. Going through the ../config barrel closes a cycle back into account-namespaces.ts
 // and leaves COMBO_NAMESPACE in its temporal dead zone for entry points that start at combos/types.ts.
 import { atomicWriteFile } from "../config/atomic-write";
+import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 import { getConfigDir } from "../config/paths";
 import type { OcxProviderConfig } from "../types";
 import { resolveProviderApiKey } from "./api-key-resolve";
@@ -35,44 +42,10 @@ const FILENAME = "reasoning-metadata-cache.json";
 const SUPPORT_FILENAME = "reasoning-support-cache.json";
 const SOURCE_URL = "https://models.dev/api.json";
 const USER_AGENT = "opencodex-reasoning-metadata/1.0 (+https://github.com/lidge-jun/opencodex)";
-/** Snapshot age that triggers a background refresh. Older snapshots still serve reads. */
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-/** A learned "this rung is refused" fact expires: entitlements change. */
-const SUPPORT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const PERSIST_DEBOUNCE_MS = 250;
 
-/** Canonical Codex ladder order; mirrors reasoning-effort.ts CODEX_REASONING_LEVELS. */
-const LADDER_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 /** Ranked rungs used for downgrade planning; ultra is client-only and folds to max. */
 const RANKED = ["low", "medium", "high", "xhigh", "max"];
-/** Mirror of registry.ts THINKING_TOGGLE_EFFORTS / THINKING_BUDGET_EFFORTS. */
-const CLASSIFIED_STYLE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
-
-/**
- * models.dev provider key for a provider config. OcxProviderConfig carries no id, so the
- * destination URL is the stable handle. Only destinations this patch has evidence for are
- * listed; an unlisted provider simply keeps its current behaviour.
- */
-
-export type ReasoningMetadataOption = { type: string; values?: string[] };
-export type ReasoningMetadataModel = { reasoning: boolean; options: ReasoningMetadataOption[] };
-
-interface MetadataSnapshot {
-  version: 1 | 2;
-  fetchedAt: number;
-  source: string;
-  providers: Record<string, Record<string, ReasoningMetadataModel>>;
-  /**
-   * v2: models.dev provider key -> that provider's published api URL (normalised). v1 snapshots
-   * predate the field and keep working through BASE_URL_TO_METADATA_PROVIDER.
-   */
-  apis?: Record<string, string>;
-}
-
-interface SupportSnapshot {
-  version: 2;
-  rows: Record<string, { effort: string; at: number; evidence?: string }>;
-}
 
 let snapshotMemo: MetadataSnapshot | null | undefined;
 let supportMemo: Map<string, number> | undefined;
@@ -90,6 +63,26 @@ export function resetReasoningMetadataCachesForTests(): void {
   refreshInFlight = null;
 }
 
+let publishVersion = Date.now();
+
+/**
+ * On a Cloudflare deployment, hands the Durable Object what this process now holds, so the Worker
+ * maps effort from the same caches (reasoning-metadata-core.ts). Refusal rows go without their
+ * evidence text; the Worker needs only the keys and times.
+ */
+function publishForWorker(kind: "snapshot" | "support", value: MetadataSnapshot | null | Map<string, number>): void {
+  if (!durableMirrorEnabled()) return;
+  const body = value instanceof Map
+    ? { version: 2, rows: Object.fromEntries([...value].map(([key, at]) => [key, { effort: JSON.parse(key)[3] ?? "", at }])) }
+    : value;
+  const version = ++publishVersion;
+  stateRequest(`/reasoning-metadata/${kind}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ version, value: body }),
+  })?.catch(() => { /* the Worker declines effort turns it has no copy for */ });
+}
+
 function readJsonFile<T>(filename: string): T | null {
   try {
     const path = join(getConfigDir(), filename);
@@ -99,18 +92,6 @@ function readJsonFile<T>(filename: string): T | null {
     // A corrupt cache must never break routing, the catalog, or the dashboard.
     return null;
   }
-}
-
-/** Canonical order + dedupe. Local mirror of sanitizeCodexReasoningEfforts (import cycle). */
-function sanitizeLadder(values: readonly string[] | undefined): string[] | undefined {
-  if (!Array.isArray(values)) return undefined;
-  const seen = new Set(values.filter((value): value is string => typeof value === "string"));
-  const ordered = LADDER_ORDER.filter(effort => seen.has(effort));
-  return ordered.length > 0 ? ordered : undefined;
-}
-
-function metadataProviderKey(provider: OcxProviderConfig): string | undefined {
-  return metadataProviderKeyForBaseUrl(typeof provider.baseUrl === "string" ? provider.baseUrl : undefined);
 }
 
 /** Whether catalog sync should bootstrap metadata for this destination. */
@@ -164,17 +145,10 @@ function credentialIdentity(provider: OcxProviderConfig): string | undefined {
   return createHash("sha256").update(resolved).digest("hex");
 }
 
-/** JSON encoding avoids delimiter ambiguity in provider, model, and effort identifiers. */
-function supportKey(providerKey: string, credential: string, modelId: string, effort: string): string {
-  return JSON.stringify([providerKey, credential, modelId, effort]);
-}
-
 function loadSnapshot(): MetadataSnapshot | null {
   if (snapshotMemo !== undefined) return snapshotMemo;
-  const parsed = readJsonFile<MetadataSnapshot>(FILENAME);
-  snapshotMemo = parsed && (parsed.version === 1 || parsed.version === 2) && parsed.providers && typeof parsed.providers === "object"
-    ? parsed
-    : null;
+  snapshotMemo = parseMetadataSnapshot(readJsonFile<MetadataSnapshot>(FILENAME));
+  publishForWorker("snapshot", snapshotMemo);
   return snapshotMemo;
 }
 
@@ -221,19 +195,11 @@ function loadSupport(): Map<string, number> {
     }
     return supportMemo;
   }
-  const rows = new Map<string, number>();
-  const parsed = readJsonFile<SupportSnapshot>(SUPPORT_FILENAME);
   // Version 1 rows had no credential identity and are deliberately invalidated: accepting them
   // would preserve destination-wide refusals written by a lower-entitlement account.
-  if (parsed && parsed.version === 2 && parsed.rows && typeof parsed.rows === "object") {
-    for (const [key, row] of Object.entries(parsed.rows)) {
-      if (!row || typeof row.at !== "number") continue;
-      if (nowMs - row.at > SUPPORT_TTL_MS) continue;
-      rows.set(key, row.at);
-    }
-  }
-  supportMemo = rows;
-  return rows;
+  supportMemo = parseSupportRows(readJsonFile<SupportSnapshot>(SUPPORT_FILENAME), nowMs);
+  publishForWorker("support", supportMemo);
+  return supportMemo;
 }
 
 /** Snapshot health for ocx status / diagnostics. */
@@ -247,25 +213,12 @@ export function reasoningMetadataStatus(): { fetchedAt?: number; ageMs?: number;
 }
 
 export function reasoningMetadataModel(provider: OcxProviderConfig, modelId: string): ReasoningMetadataModel | undefined {
-  const key = metadataProviderKey(provider);
-  if (!key) return undefined;
-  const models = loadSnapshot()?.providers?.[key];
-  if (!models) return undefined;
-  const model = models[modelId];
-  return model && typeof model === "object" ? model : undefined;
+  return metadataModelIn(loadSnapshot(), provider, modelId);
 }
 
 /** Raw models.dev effort values for a model, canonicalised; undefined when not published. */
 export function metadataEffortValues(provider: OcxProviderConfig, modelId: string): string[] | undefined {
-  const model = reasoningMetadataModel(provider, modelId);
-  if (!model) return undefined;
-  const options = Array.isArray(model.options) ? model.options : [];
-  const effort = options.find(option => option && option.type === "effort");
-  const ladder = sanitizeLadder(effort?.values);
-  // none/minimal are sentinels, not picker rungs (mapReasoningEffort folds minimal to low), and
-  // advertising them would trip the Codex runtime clamp for no user-visible gain.
-  const rungs = ladder?.filter(value => value !== "none" && value !== "minimal");
-  return rungs && rungs.length > 0 ? rungs : undefined;
+  return metadataEffortValuesIn(loadSnapshot(), provider, modelId);
 }
 
 /** True when models.dev publishes the named option type (toggle / budget_tokens) for a model. */
@@ -277,10 +230,8 @@ export function metadataDeclaresType(provider: OcxProviderConfig, modelId: strin
 }
 
 export function isReasoningEffortLearnedUnsupported(provider: OcxProviderConfig, modelId: string, effort: string): boolean {
-  const key = metadataProviderKey(provider);
-  const credential = credentialIdentity(provider);
-  if (!key || !credential) return false;
-  return loadSupport().has(supportKey(key, credential, modelId, effort));
+  if (!metadataProviderKey(provider)) return false;
+  return learnedUnsupportedIn(loadSupport(), credentialIdentity(provider), provider, modelId, effort);
 }
 
 /**
@@ -295,14 +246,8 @@ export function dropLearnedUnsupportedReasoningEfforts(
   modelId: string,
   efforts: readonly string[],
 ): string[] {
-  if (efforts.length === 0) return [...efforts];
-  const key = metadataProviderKey(provider);
-  const credential = credentialIdentity(provider);
-  if (!key || !credential) return [...efforts];
-  const support = loadSupport();
-  if (support.size === 0) return [...efforts];
-  const kept = efforts.filter(effort => !support.has(supportKey(key, credential, modelId, effort)));
-  return kept.length === 0 ? [...efforts] : kept;
+  if (efforts.length === 0 || !metadataProviderKey(provider)) return [...efforts];
+  return dropLearnedIn(loadSupport(), credentialIdentity(provider), provider, modelId, efforts);
 }
 
 /**
@@ -315,17 +260,8 @@ export function dropLearnedUnsupportedReasoningEfforts(
  *   returns undefined (status quo) rather than advertising "no effort control".
  */
 export function reasoningEffortsFromMetadata(provider: OcxProviderConfig, modelId: string): string[] | undefined {
-  const published = metadataEffortValues(provider, modelId);
-  let ladder = published;
-  if (!ladder) {
-    const classified = (provider.thinkingToggleModels ?? []).includes(modelId)
-      || (provider.thinkingBudgetModels ?? []).includes(modelId);
-    ladder = classified ? CLASSIFIED_STYLE_EFFORTS : undefined;
-  }
-  if (!ladder || ladder.length === 0) return undefined;
-  const kept = ladder.filter(effort => !isReasoningEffortLearnedUnsupported(provider, modelId, effort));
-  if (kept.length === 0) return undefined;
-  return kept;
+  const credential = metadataProviderKey(provider) ? credentialIdentity(provider) : undefined;
+  return reasoningEffortsFromMetadataIn(loadSnapshot(), loadSupport(), credential, provider, modelId);
 }
 
 const supportEvidence = new Map<string, string>();
@@ -362,6 +298,7 @@ export function recordUnsupportedReasoningEffort(
         };
       }
       atomicWriteFile(join(getConfigDir(), SUPPORT_FILENAME), JSON.stringify({ version: 2, rows: out }) + "\n");
+      publishForWorker("support", rows);
     } catch {
       // Best-effort persistence only.
     }
@@ -382,6 +319,7 @@ export function flushReasoningSupportCache(): void {
       out[rowKey] = { effort: JSON.parse(rowKey)[3] ?? "", at, ...(evidenceText ? { evidence: evidenceText } : {}) };
     }
     atomicWriteFile(join(getConfigDir(), SUPPORT_FILENAME), JSON.stringify({ version: 2, rows: out }) + "\n");
+    publishForWorker("support", rows);
   } catch {
     // Best-effort persistence only.
   }
@@ -543,6 +481,7 @@ export async function refreshReasoningMetadata(options: { force?: boolean; waitM
     const next: MetadataSnapshot = { version: 2, fetchedAt: Date.now(), source: SOURCE_URL, providers, apis };
     atomicWriteFile(join(getConfigDir(), FILENAME), JSON.stringify(next) + "\n");
     snapshotMemo = next;
+    publishForWorker("snapshot", next);
     return { ok: true, reason: "refreshed", providers: Object.keys(providers).length, models };
   })();
   refreshInFlight = job.catch(() => undefined).finally(() => { refreshInFlight = null; });

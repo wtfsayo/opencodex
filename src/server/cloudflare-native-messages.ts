@@ -18,7 +18,8 @@ import { anthropicErrorResponse, collectAnthropicMessage, responsesSseToAnthropi
 import { estimateClaudeRequestTokens } from "../claude/request-token-estimate";
 import { messagesToResponsesTranslation } from "../protocols/codecs/messages";
 import type { ClaudeInboundTranslation } from "../claude/inbound";
-import { conversationIdFromClaudeMetadata } from "./request-log-conversation";
+import { conversationIdFromClaudeMetadata, normalizeLogConversationId, sessionLaneIdFromRequest } from "./request-log-conversation";
+import { claudeNativeSessionId } from "../claude/native-session-id";
 import { jsonUtf8Bytes } from "../lib/json-byte-size";
 import { createTranslatorBudget, isTranslatorBudgetExceededError } from "../lib/translator-budget";
 
@@ -76,6 +77,11 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
     const value = headers.get(name);
     if (value) internalHeaders.set(name, value);
   }
+  // claude-messages.ts's Go lane: the forwarded session headers, the caller's own Go session, the
+  // Claude Code metadata session, and only then a lane for this request alone.
+  const goSessionLane = sessionLaneIdFromRequest(internalHeaders)
+    ?? normalizeLogConversationId(headers.get("x-opencode-session"))
+    ?? normalizeLogConversationId(claudeNativeSessionId(cacheKeySource, internal.prompt_cache_key, body.metadata));
   let inputTokenFloor = 0;
   const turn = await runNativeResponsesTurn(internal, internalHeaders, signal, deps, decline, {
     inbound: "anthropic",
@@ -84,6 +90,7 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
     surface: "claude",
     conversationId: conversationIdFromClaudeMetadata(isRec(body.metadata) ? body.metadata : undefined),
     sharedCacheCohort: cacheKeySource === "system",
+    ...(goSessionLane ? { goSessionLane } : {}),
     beforeSend: route => {
       inputTokenFloor = estimateClaudeRequestTokens(body, requestedModel, openAIChatSerializesThinking(route.provider, route.modelId));
     },

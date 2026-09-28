@@ -16,7 +16,9 @@ import { fastPolicyForModel } from "../providers/service-tier";
 import { chatCollabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { createTranslatorBudget } from "../lib/translator-budget";
 import type { OcxConfig, OcxProviderConfig, OcxUsage } from "../types";
-import { PROVIDER_REGISTRY, registryEntryForProviderDestination } from "../providers/registry";
+import { PROVIDER_REGISTRY } from "../providers/registry";
+import { resolveOpenCodeGoTransport } from "../providers/opencode-go-transport";
+import { getOrAllocateRequestSessionLane } from "./request-log-conversation";
 import { apiKeyAccountLogLabel } from "../codex/key-account-label";
 
 type Rec = Record<string, unknown>;
@@ -111,17 +113,22 @@ export function resolveNativeChatRoute(
   if (provider.adapter !== "openai-chat") return no("adapter");
   if (provider.authMode !== undefined && provider.authMode !== "key") return no("auth-mode");
   if (typeof provider.baseUrl !== "string" || !destinationAllowed(provider.baseUrl, localHosts)) return no("destination");
-  // ocx gives OpenCode Go a session header derived from the caller's session lane
-  // (opencode-go-transport.ts), recognised by destination whatever the provider is called.
-  if (registryEntryForProviderDestination({ baseUrl: provider.baseUrl, adapter: "openai-chat", authMode: provider.authMode as "key" | undefined })?.id === "opencode-go") {
-    return no("opencode-go-session");
-  }
   if (typeof provider.apiKey !== "string" || provider.apiKey.startsWith("keychain:")) return no("key-reference");
   const apiKey = resolveKeyReference(provider.apiKey, secrets);
   if (!apiKey) return no("key-reference-unset");
   const models = provider.models;
   if (!Array.isArray(models) || !models.includes(modelId) || models.includes(model)) return no("model-not-listed");
   return { providerName, provider: { ...provider, apiKey } as unknown as OcxProviderConfig, modelId, requestedModel: model, apiKeyReference: provider.apiKey };
+}
+
+/**
+ * The route with OpenCode Go's session header when its destination is Go, as ocx adds it
+ * (opencode-go-transport.ts). `lane` defaults to ocx's own choice for a request with these
+ * headers: the caller's session identity, else a value for this request alone.
+ */
+export function withOpenCodeGoSession(route: NativeChatRoute, headers: Headers, lane?: string): NativeChatRoute {
+  const sessionLane = lane ?? getOrAllocateRequestSessionLane(new Request("http://worker.invalid/", { headers }));
+  return { ...route, provider: resolveOpenCodeGoTransport(route.provider, sessionLane, route.provider) };
 }
 
 /** The usage-row fields ocx fills from the route (providers/label.ts labels the key). */
@@ -170,8 +177,9 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   if (!configText) return no("no-config-copy");
   let config: unknown;
   try { config = JSON.parse(configText); } catch { return no("config-not-json"); }
-  const route = resolveNativeChatRoute(config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets);
-  if (!route) return null;
+  const resolved = resolveNativeChatRoute(config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets);
+  if (!resolved) return null;
+  const route = withOpenCodeGoSession(resolved, headers);
 
   const requestedStream = body.stream === true;
   // The same Fast policy arguments chat-native.ts passes; a config with fastMode is declined.

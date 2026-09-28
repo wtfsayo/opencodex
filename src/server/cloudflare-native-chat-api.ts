@@ -16,6 +16,11 @@ export type NativeChatDeps = {
    * hex digests; `principal` is folded into them and never stored.
    */
   skills?: { read(scope: string): Promise<string | undefined>; commit(scope: string, block: string): void; principal: string };
+  /**
+   * ocx's reasoning-effort caches as it last published them (reasoning-metadata.ts): each the JSON
+   * of its file, "null" when ocx has none, absent when never published.
+   */
+  reasoningMetadata?(): Promise<{ snapshot?: string; support?: string }>;
   /** Called once per served turn, after its last byte; the Worker queues it for ocx's usage log. */
   recordUsage?(row: WorkerUsageRow): void;
   /** Why a request went to the container. Reasons name config keys and fields, never values. */

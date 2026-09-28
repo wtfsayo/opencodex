@@ -147,9 +147,9 @@ describe("Worker-native Responses", () => {
     expect(reason({}, new Headers({ "x-opencodex-grok": "1" }))).toBe("grok-surface");
   });
 
-  test("declines destinations whose effort ladders come from models.dev, and v1 guidance turns", async () => {
-    // OpenCode Go is declined at the route whatever the effort, for its session header.
-    for (const [baseUrl, declined] of [["https://opencode.ai/zen/v1", "reasoning-metadata-destination"], ["https://opencode.ai/zen/go/v1/", "opencode-go-session"]]) {
+  test("declines effort to models.dev destinations without published caches, and v1 guidance turns", async () => {
+    // Until ocx publishes its effort caches (cloudflare-worker-native-effort.test.ts covers the rest).
+    for (const [baseUrl, declined] of [["https://opencode.ai/zen/v1", "reasoning-metadata-unpublished"], ["https://opencode.ai/zen/go/v1/", "reasoning-metadata-unpublished"]]) {
       const reasons: string[] = [];
       const config = JSON.stringify({ providers: { p: { ...provider, baseUrl } } });
       const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1", { reasoning: { effort: "high" } })), new Headers(), new AbortController().signal, {

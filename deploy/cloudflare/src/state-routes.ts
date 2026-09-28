@@ -1,4 +1,4 @@
-import { BOOT_ID_PATTERN, type DocumentCommit, type DocumentSeqs, DURABLE_DOCUMENTS, type DurableDocument, MAX_DOCUMENT_BYTES, MAX_MODEL_LIST_BYTES, type ModelList, type StoredDocument } from "./lease";
+import { BOOT_ID_PATTERN, type DocumentCommit, type DocumentSeqs, DURABLE_DOCUMENTS, type DurableDocument, MAX_DOCUMENT_BYTES, MAX_MODEL_LIST_BYTES, type ModelList, REASONING_METADATA_KINDS, type ReasoningMetadataKind, type StoredDocument } from "./lease";
 
 // Mirrors DOCUMENT_SEQUENCE_HEADER in src/lib/durable-mirror.ts, which the Worker bundle cannot import.
 export const DOCUMENT_SEQUENCE_HEADER = "x-ocx-document-seq";
@@ -16,6 +16,7 @@ export interface StateHub {
   peekUsage(bootId: string, limit: number): Promise<{ seq: number; row: unknown }[] | null>;
   ackUsage(bootId: string, seqs: readonly number[]): Promise<boolean>;
   modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string): Promise<boolean>;
+  reasoningMetadataCommit(bootId: string, kind: ReasoningMetadataKind, body: string, version: number): Promise<boolean>;
 }
 
 export interface StateBucket {
@@ -124,6 +125,17 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     return (await hub.modelListCommit(bootId, modelListKey, entry.list, entry.seqs, entry.ttlMs, stamp))
       ? new Response(null, { status: 204 })
       : new Response("lease lost", { status: 409 });
+  }
+  const reasoningKind = /^\/reasoning-metadata\/([a-z]+)$/.exec(path)?.[1];
+  if (reasoningKind !== undefined && req.method === "PUT") {
+    if (!(REASONING_METADATA_KINDS as readonly string[]).includes(reasoningKind)) return new Response("unknown cache", { status: 404 });
+    const text = await req.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_DOCUMENT_BYTES) return new Response("cache too large", { status: 413 });
+    let parsed: { version?: unknown; value?: unknown };
+    try { parsed = JSON.parse(text) as typeof parsed; } catch { return new Response("JSON required", { status: 400 }); }
+    if (!Number.isSafeInteger(parsed?.version) || !("value" in parsed)) return new Response("version and value required", { status: 400 });
+    const committed = await hub.reasoningMetadataCommit(bootId, reasoningKind as ReasoningMetadataKind, JSON.stringify(parsed.value), parsed.version as number);
+    return committed ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
   }
   const document = /^\/documents\/([a-z-]+)$/.exec(path)?.[1];
   if (document !== undefined) {

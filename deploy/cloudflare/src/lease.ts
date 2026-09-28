@@ -62,6 +62,13 @@ export type ModelList = { body: string; headers: [string, string][] };
 type ModelListMeta = { expiresAt: number; seqs: DocumentSeqs; stamp: string };
 const DOCUMENT_SEQ_KEY_PREFIX = "ocx:document-seq:";
 
+// ocx's reasoning-effort caches (src/providers/reasoning-metadata.ts), as the running ocx last
+// published them, so the Worker maps effort as it would. Each kind keeps the newest version.
+const REASONING_METADATA_PREFIX = "ocx:reasoning-metadata:";
+export const REASONING_METADATA_KINDS = ["snapshot", "support"] as const;
+export type ReasoningMetadataKind = (typeof REASONING_METADATA_KINDS)[number];
+type StoredReasoningMetadata = { bootId: string; version: number; body: string };
+
 const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
 const DOCUMENT_KEY_PREFIX = "ocx:document:";
@@ -130,6 +137,7 @@ export class LeaseState {
       if (metas.size === 0) break;
       for (const key of metas.keys()) await this.dropSkills(key.slice(SKILLS_META_PREFIX.length));
     }
+    for (const kind of REASONING_METADATA_KINDS) await this.storage.delete(REASONING_METADATA_PREFIX + kind);
     for (;;) {
       const metas = await this.storage.list<ModelListMeta>({ prefix: MODEL_LIST_META_PREFIX, limit: 1000 });
       if (metas.size === 0) break;
@@ -262,6 +270,28 @@ export class LeaseState {
     await this.storage.put<ModelListMeta>(MODEL_LIST_META_PREFIX + key, { expiresAt: now + Math.min(ttlMs, MAX_MODEL_LIST_TTL_MS), seqs, stamp });
     await this.storage.put<ModelList>(MODEL_LIST_PREFIX + key, list);
     return true;
+  }
+
+  /**
+   * Stores what the lease holder's ocx now holds. Its publishes can land out of order, so an older
+   * version from the same process is ignored; a new process replaces whatever the last one held.
+   */
+  async reasoningMetadataCommit(bootId: string, kind: ReasoningMetadataKind, body: string, version: number): Promise<boolean> {
+    if (!(await this.holdsLease(bootId))) return false;
+    const stored = await this.storage.get<StoredReasoningMetadata>(REASONING_METADATA_PREFIX + kind);
+    if (stored?.bootId === bootId && stored.version >= version) return true;
+    await this.storage.put<StoredReasoningMetadata>(REASONING_METADATA_PREFIX + kind, { bootId, version, body });
+    return true;
+  }
+
+  /** Each cache's JSON as last published (the text "null" when ocx has none), or undefined if never. */
+  async reasoningMetadataRead(): Promise<Partial<Record<ReasoningMetadataKind, string>>> {
+    const out: Partial<Record<ReasoningMetadataKind, string>> = {};
+    for (const kind of REASONING_METADATA_KINDS) {
+      const stored = await this.storage.get<StoredReasoningMetadata>(REASONING_METADATA_PREFIX + kind);
+      if (typeof stored?.body === "string") out[kind] = stored.body;
+    }
+    return out;
   }
 
   private async dropModelList(key: string): Promise<void> {

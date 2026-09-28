@@ -169,9 +169,9 @@ The Worker serves a request only when all of these hold, and otherwise passes it
 - `model` is `<provider>/<model>` for a provider you added yourself (not a built-in provider name
   such as `openai` or `deepseek`), whose config has only `adapter: "openai-chat"`, an `https`
   `baseUrl` on a public host name, a literal `apiKey`, `models` (which must list the model), and
-  optionally `authMode: "key"`, and a `baseUrl` other than OpenCode Zen's, whose reasoning levels
-  `ocx` looks up in models.dev. The key can be a literal or a `${NAME}` reference to a secret listed
-  in `OCX_PASSTHROUGH_SECRETS`, as `ocx` would resolve it. Workers AI qualifies as shown above.
+  optionally `authMode: "key"`. The key can be a literal or a `${NAME}` reference to a secret
+  listed in `OCX_PASSTHROUGH_SECRETS`, as `ocx` would resolve it. Workers AI qualifies as shown
+  above. For OpenCode Go the Worker adds the session header `ocx` adds.
 - The config has nothing beyond basic settings: any routing, redirect, limit, or surface section
   sends every request to `ocx`.
 - The turn is not a multi-agent collaboration turn (a `spawn_agent` tool, or a spawned child's
@@ -186,7 +186,11 @@ streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
 is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only
 messages; and no `<skills_instructions>` block outside the instructions and developer messages.
-That covers what Codex CLI sends on an ordinary turn. Like `ocx`, the Worker freezes each session's `<skills_instructions>` catalog to the first one
+That covers what Codex CLI sends on an ordinary turn. For OpenCode Zen and Go, whose reasoning
+levels `ocx` reads from models.dev and from the levels a provider has refused before, a turn with a
+reasoning effort uses the copies of those two caches `ocx` keeps in the Durable Object; it goes to
+`ocx` until `ocx` has stored them, or when the models.dev copy is a day old, which `ocx` would
+refresh. Like `ocx`, the Worker freezes each session's `<skills_instructions>` catalog to the first one
 it sends, for four idle hours; the two keep separate copies (the Worker's in the Durable Object,
 `ocx`'s in memory, lost whenever the container sleeps), so a session whose catalog changes while its
 turns alternate between them can see both versions.
@@ -194,7 +198,7 @@ turns alternate between them can see both versions.
 And it answers `POST /v1/messages`, the API Claude Code uses, when `model` is one of the aliases
 `ocx` lists for Claude Code (`ocx-claude-<provider>--<model>`, or `ocx-claude2-…` for a model id
 with a `/`, and the older `claude-ocx-` spellings `ocx` still reads) and the provider qualifies as
-above; a provider whose `baseUrl` is OpenCode Go's goes to `ocx`, which adds Go's session header. The data token may also arrive in `x-api-key`, as `ocx` accepts it there. The turn is
+above. The data token may also arrive in `x-api-key`, as `ocx` accepts it there. The turn is
 translated and answered as `ocx` does it, streamed or not, when it has text-only messages and
 `ocx` would not treat it specially: a Claude model id (which may be passthrough on your own
 Anthropic credential, or a Claude Desktop alias), a config with a `claudeCode` section, an injected

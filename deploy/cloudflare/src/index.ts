@@ -5,7 +5,7 @@ import {
 } from "./container-env";
 import { type DocumentSeqs, type DurableDocument, LeaseState, type ModelList, type ReasoningMetadataKind } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
-import { modelListReplayKey, serveNativeChat, serveNativeMessages, serveNativeResponses } from "ocx-worker-native";
+import { createNativeWsSession, modelListReplayKey, serveNativeChat, serveNativeMessages, serveNativeResponses, type NativeChatDeps } from "ocx-worker-native";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
@@ -224,6 +224,31 @@ function logDeclineOnce(reason: string): void {
   console.log(`Worker-native chat declined: ${reason}`);
 }
 
+/** What the Worker-native paths need from the Worker: config, secrets, stores and the upstreams. */
+function nativeDeps(env: Env, ctx: ExecutionContext, hub: ReturnType<typeof getContainer<OpencodexHub>>): NativeChatDeps {
+  return {
+    readConfig: async () => {
+      const source = await hub.nativeConfigSource();
+      return nativeConfigText(source.config, source.hasSnapshot, env);
+    },
+    secrets: containerEnv(env),
+    reasoningMetadata: () => hub.reasoningMetadataRead(),
+    skills: {
+      read: scope => hub.skillsSnapshotRead(scope),
+      commit: (scope, block) => { ctx.waitUntil(hub.skillsSnapshotCommit(scope, block).catch(() => {})); },
+      // The data token is the only principal this path admits; rotating it starts fresh sessions,
+      // as ocx's principal-keyed snapshot does.
+      principal: env.OPENCODEX_API_AUTH_TOKEN ?? "",
+    },
+    localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
+    fetch: request => fetch(request),
+    onDecline: logDeclineOnce,
+    // Queued off the response path; ocx appends it to usage.jsonl when it next runs.
+    recordUsage: row => ctx.waitUntil(hub.enqueueUsage(row).catch(error =>
+      console.error(`Worker-native usage row not queued: ${error instanceof Error ? error.message : String(error)}`))),
+  };
+}
+
 // Larger bodies stream to the container untouched: reading them here costs Worker memory (128 MB)
 // and a text-only turn this path would serve is far smaller.
 const NATIVE_MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -255,27 +280,7 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   const bodyBytes = await req.arrayBuffer();
   const hub = getContainer(env.HUB, HUB_NAME);
   try {
-    const served = await serve(new TextDecoder().decode(bodyBytes), req.headers, req.signal, {
-      readConfig: async () => {
-        const source = await hub.nativeConfigSource();
-        return nativeConfigText(source.config, source.hasSnapshot, env);
-      },
-      secrets: containerEnv(env),
-      reasoningMetadata: () => hub.reasoningMetadataRead(),
-      skills: {
-        read: scope => hub.skillsSnapshotRead(scope),
-        commit: (scope, block) => { ctx.waitUntil(hub.skillsSnapshotCommit(scope, block).catch(() => {})); },
-        // The data token is the only principal this path admits; rotating it starts fresh sessions,
-        // as ocx's principal-keyed snapshot does.
-        principal: env.OPENCODEX_API_AUTH_TOKEN ?? "",
-      },
-      localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
-      fetch: request => fetch(request),
-      onDecline: logDeclineOnce,
-      // Queued off the response path; ocx appends it to usage.jsonl when it next runs.
-      recordUsage: row => ctx.waitUntil(hub.enqueueUsage(row).catch(error =>
-        console.error(`Worker-native usage row not queued: ${error instanceof Error ? error.message : String(error)}`))),
-    });
+    const served = await serve(new TextDecoder().decode(bodyBytes), req.headers, req.signal, nativeDeps(env, ctx, hub));
     if (served) return served;
   } catch (error) {
     console.error(`Worker-native request declined after an error: ${error instanceof Error ? error.message : String(error)}`);
@@ -283,6 +288,68 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   // Nobody is waiting for an answer, so do not wake the container to produce one.
   if (req.signal.aborted) return new Response(null, { status: 499 });
   return { forward: new Request(req, { body: bodyBytes }) };
+}
+
+// Close codes a socket may send (1005 and 1006 are only ever reported, never sent).
+const sendableCloseCode = (code: number) => (code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) || (code >= 3000 && code <= 4999);
+
+/**
+ * Holds a Responses WebSocket in the Worker (src/server/cloudflare-native-ws.ts), under the same
+ * conditions as tryWorkerNative and ocx's rules for the upgrade: the data token as ocx reads it for
+ * Responses, no Origin, and `websockets` on in a config the Worker can read (ocx refuses the upgrade
+ * otherwise). Frames the Worker cannot serve reach ocx on a socket of its own.
+ */
+async function tryWorkerWebSocket(req: Request, env: Env, ctx: ExecutionContext): Promise<Response | null> {
+  if (env.OCX_WORKER_NATIVE?.trim() !== "1" || env.OCX_EDGE_KEY_CHECK?.trim() === "presence") return null;
+  if (new URL(req.url).pathname !== "/v1/responses" || req.headers.get("upgrade")?.toLowerCase() !== "websocket") return null;
+  if (req.headers.has("origin") || !(await chatAdmitsDataToken(req, env))) return null;
+  const hub = getContainer(env.HUB, HUB_NAME);
+  const source = await hub.nativeConfigSource();
+  const configText = nativeConfigText(source.config, source.hasSnapshot, env);
+  let config: unknown;
+  try { config = configText ? JSON.parse(configText) : undefined; } catch { config = undefined; }
+  if (!config || typeof config !== "object" || (config as { websockets?: unknown }).websockets !== true) return null;
+
+  const pair = new WebSocketPair();
+  const [client, server] = [pair[0], pair[1]];
+  server.accept();
+  const upgradeUrl = req.url;
+  const upgradeHeaders = new Headers(req.headers);
+  const session = createNativeWsSession({
+    send: text => server.send(text),
+    close: (code, reason) => server.close(sendableCloseCode(code) ? code : 1011, reason),
+    openContainer: () => {
+      let socket: WebSocket | undefined;
+      let closing = false;
+      const pending: string[] = [];
+      const handle = {
+        send: (text: string) => { if (socket) socket.send(text); else pending.push(text); },
+        close: () => { closing = true; socket?.close(1000, "superseded"); },
+      };
+      void getContainer(env.HUB, HUB_NAME).fetch(forwardableRequest(new Request(upgradeUrl, { headers: upgradeHeaders })))
+        .then(response => {
+          const opened = response.webSocket;
+          if (!opened) {
+            session.containerClosed(handle, response.status === 503 ? 1013 : 1011, `opencodex refused the socket (HTTP ${response.status})`);
+            return;
+          }
+          opened.accept();
+          socket = opened;
+          opened.addEventListener("message", event => {
+            session.fromContainer(handle, typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer));
+          });
+          opened.addEventListener("close", event => session.containerClosed(handle, event.code, event.reason));
+          for (const text of pending.splice(0)) opened.send(text);
+          if (closing) opened.close(1000, "superseded");
+        })
+        .catch(() => session.containerClosed(handle, 1013, "opencodex is restarting; retry shortly."));
+      return handle;
+    },
+  }, req.headers, nativeDeps(env, ctx, hub));
+  server.addEventListener("message", event => session.receive(event.data as string | ArrayBuffer));
+  server.addEventListener("close", () => session.closed());
+  server.addEventListener("error", () => session.closed());
+  return new Response(null, { status: 101, webSocket: client });
 }
 
 /**
@@ -321,6 +388,11 @@ export default {
       return null;
     });
     if (replayed) return replayed;
+    const socket = await tryWorkerWebSocket(req, env, ctx).catch(error => {
+      console.error(`Worker-native WebSocket not held: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
+    if (socket) return socket;
     const native = await tryWorkerNative(req, env, ctx);
     if (native instanceof Response) return native;
     if (native) req = native.forward;

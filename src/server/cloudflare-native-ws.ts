@@ -1,0 +1,254 @@
+// The Responses WebSocket transport (what Codex uses when ocx enables `websockets`) held by the
+// Cloudflare Worker. ocx runs each response.create frame as a streamed Responses turn and sends
+// its events back as text frames (index/websocket-handler.ts, ws-bridge.ts). The Worker does the
+// same with its own Responses turn for every frame that turn can serve, and relays any other frame
+// to ocx over a WebSocket of its own to the container, opened when first needed, whose frames it
+// passes back. A socket can therefore mix turns from both, as ocx's own turns would.
+//
+// The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
+import type { NativeChatDeps, NativeWsLink, NativeWsSession } from "./cloudflare-native-chat-api";
+import { FORWARD_HEADERS } from "../adapters/openai-responses/forward-headers";
+import { runNativeResponsesTurn } from "./cloudflare-native-responses";
+import { nativeSteeringUnavailableReason } from "./responses/native-steering-availability";
+import { resolveInboundBodyLimitBytes } from "./inbound-body-limit";
+import { BoundedSseFrameBuffer } from "./sse-frame-buffer";
+import { buildWarmupCompletionFrames, buildWsErrorFrame } from "./ws-frames";
+import { createTranslatorBudget } from "../lib/translator-budget";
+
+type Rec = Record<string, unknown>;
+const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
+
+/** live-sideband.ts's MAX_WS_FRAME_BYTES: the largest frame ocx's socket takes. */
+export const MAX_WS_FRAME_BYTES = 50 * 1024 * 1024;
+const TERMINAL_TYPES = new Set(["response.completed", "response.failed", "response.incomplete"]);
+
+/** ws-bridge.ts's selectForwardHeaders: the upgrade headers each frame's turn carries. */
+function selectForwardHeaders(headers: Headers): Headers {
+  const selected = new Headers();
+  for (const name of FORWARD_HEADERS) {
+    const value = headers.get(name);
+    if (value) selected.set(name, value);
+  }
+  return selected;
+}
+
+function sseData(block: string): string | null {
+  const data: string[] = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("data:")) {
+      const value = line.slice(5);
+      data.push(value.startsWith(" ") ? value.slice(1) : value);
+    }
+  }
+  return data.length > 0 ? data.join("\n") : null;
+}
+
+function payloadType(payload: string): string | null {
+  try {
+    const json = JSON.parse(payload) as { type?: unknown };
+    return typeof json.type === "string" ? json.type : null;
+  } catch {
+    return null;
+  }
+}
+
+const protocolError = (message: string) => ({ type: "protocol_error", code: "websocket_protocol_error", message });
+
+/**
+ * ws-bridge.ts's pumpResponsesSseToWebSocket without native steering: each SSE payload becomes one
+ * text frame, and the turn ends at its first terminal event.
+ */
+async function pumpSseToFrames(sse: ReadableStream<Uint8Array>, send: (text: string) => void, isCurrent: () => boolean): Promise<void> {
+  const reader = sse.getReader();
+  const decoder = new TextDecoder();
+  const framer = new BoundedSseFrameBuffer();
+  let terminalSeen = false;
+  const handle = (payload: string): boolean => {
+    if (!isCurrent()) return true;
+    if (payload === "[DONE]") return false;
+    const type = payloadType(payload);
+    if (!type) {
+      send(JSON.stringify(buildWsErrorFrame(502, protocolError("Invalid JSON payload in upstream SSE frame"))));
+      terminalSeen = true;
+      return true;
+    }
+    if (terminalSeen) return true;
+    send(payload);
+    if (TERMINAL_TYPES.has(type)) {
+      terminalSeen = true;
+      return true;
+    }
+    return false;
+  };
+  try {
+    read: while (!terminalSeen) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const frame of framer.feed(value)) {
+        const payload = sseData(decoder.decode(frame.block));
+        if (payload && handle(payload)) break read;
+      }
+    }
+    const tail = framer.finish();
+    if (!terminalSeen && tail.byteLength > 0) {
+      const payload = sseData(decoder.decode(tail));
+      if (payload) handle(payload);
+    }
+    if (!terminalSeen && isCurrent()) {
+      send(JSON.stringify(buildWsErrorFrame(502, protocolError("Upstream stream ended before response terminal event"))));
+    }
+  } catch (error) {
+    if (!terminalSeen && isCurrent()) {
+      const code = error != null && typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        send(JSON.stringify(buildWsErrorFrame(502, code ? { type: "upstream_error", code, message } : protocolError(message))));
+      } catch { /* the client is gone */ }
+    }
+  } finally {
+    framer.dispose();
+    void reader.cancel().catch(() => {});
+  }
+}
+
+/**
+ * One client socket. `upgradeHeaders` are the headers of the client's upgrade request; each turn
+ * the Worker serves carries the same subset ocx's handler keeps.
+ */
+export function createNativeWsSession(link: NativeWsLink, upgradeHeaders: Headers, deps: NativeChatDeps): NativeWsSession {
+  const headers = selectForwardHeaders(upgradeHeaders);
+  let container: ReturnType<NativeWsLink["openContainer"]> | undefined;
+  // True from a frame relayed to ocx until its turn ends; ocx then owns the socket's current turn.
+  let containerTurn = false;
+  // Set when a new frame arrives while ocx owns the turn: ocx stops that turn's output at once, so
+  // its frames are dropped until the new frame is relayed to it or its socket is closed.
+  let containerMuted = false;
+  let steeringUnavailable: string | undefined;
+  let turnId = 0;
+  let abortTurn: AbortController | undefined;
+  let queue: Promise<void> = Promise.resolve();
+  let closed = false;
+
+  const sendJson = (payload: Rec) => link.send(JSON.stringify(payload));
+  const toContainer = (text: string) => {
+    container ??= link.openContainer();
+    containerMuted = false;
+    container.send(text);
+  };
+  /** The container's turn is superseded: closing its socket cancels it, as a new frame would in ocx. */
+  const supersedeContainerTurn = () => {
+    if (!containerTurn) return;
+    containerTurn = false;
+    containerMuted = false;
+    container?.close();
+    container = undefined;
+  };
+
+  const serveOrRelay = async (frame: Rec, raw: string, id: number, signal: AbortSignal) => {
+    const isCurrent = () => turnId === id && !closed;
+    const payload: Rec = { ...frame };
+    delete payload.type;
+    const startedAt = Date.now();
+    const translatorBudget = createTranslatorBudget();
+    const no = (reason: string) => { deps.onDecline?.(`responses-ws:${reason}`); return null; };
+    let turn;
+    try {
+      turn = await runNativeResponsesTurn({ ...payload, stream: true }, headers, signal, deps, no, {
+        inbound: "responses", translatorBudget, startedAt, responseId: "",
+      });
+    } catch {
+      turn = null;
+    }
+    if (!isCurrent()) {
+      translatorBudget.dispose();
+      turn?.finish("cancel");
+      await turn?.sse.cancel().catch(() => {});
+      return;
+    }
+    if (!turn) {
+      translatorBudget.dispose();
+      // Anything the Worker's turn does not reproduce goes to ocx, which answers it on its socket.
+      containerTurn = true;
+      toContainer(raw);
+      return;
+    }
+    supersedeContainerTurn();
+    let end: "end" | "error" | "cancel" = "end";
+    try {
+      await pumpSseToFrames(turn.sse, link.send, isCurrent);
+    } catch {
+      end = "error";
+    }
+    if (!isCurrent()) end = "cancel";
+    turn.finish(end);
+    translatorBudget.dispose();
+  };
+
+  return {
+    receive(data) {
+      if (closed) return;
+      const raw = typeof data === "string" ? data : new TextDecoder().decode(data);
+      const bytes = typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
+      if (bytes > MAX_WS_FRAME_BYTES) {
+        sendJson(buildWsErrorFrame(413, { type: "invalid_request_error", message: "WebSocket response.create frame is too large" }));
+        link.close(1009, "message too large");
+        return;
+      }
+      let frame: unknown;
+      try { frame = JSON.parse(raw); } catch { return; } // text-only contract; ignore unparseable frames
+      if (!isRec(frame)) return;
+      if ((frame.type === "response.inject" || frame.type === "response.steer") && bytes > resolveInboundBodyLimitBytes(undefined)) {
+        sendJson(buildWsErrorFrame(413, {
+          type: "invalid_request_error", code: "inbound_body_too_large", message: "Native response control frame exceeds the configured inbound body limit.",
+        }));
+        return;
+      }
+      if (frame.type === "response.inject" || frame.type === "response.steer") {
+        // Only ocx's own turn can have a native control channel.
+        if (containerTurn) { queue = queue.then(() => toContainer(raw)); return; }
+        sendJson(buildWsErrorFrame(400, frame.type === "response.inject"
+          ? { type: "invalid_request_error", code: "injection_not_supported", message: "Native injection is disabled or unavailable on this route." }
+          : { type: "invalid_request_error", code: "steering_not_supported", message: steeringUnavailable ?? "Native steering transport is unavailable; the route may be unsupported or using HTTP fallback." }));
+        return;
+      }
+      if (frame.type !== "response.create") return; // response.processed is an ack
+      // A new frame supersedes whatever turn the socket has, as in ocx.
+      abortTurn?.abort("websocket turn superseded or closed");
+      if (containerTurn) containerMuted = true;
+      const id = ++turnId;
+      steeringUnavailable = nativeSteeringUnavailableReason(frame, undefined);
+      if (frame.generate === false) {
+        // ocx answers a warm-up itself, after cancelling its own turn if it has one.
+        queue = queue.then(() => {
+          if (turnId !== id || closed) return;
+          if (containerTurn) { toContainer(raw); return; }
+          for (const payload of buildWarmupCompletionFrames(frame as Rec)) link.send(payload);
+        });
+        return;
+      }
+      const controller = new AbortController();
+      abortTurn = controller;
+      // Decisions run in arrival order so frames relayed to ocx keep their order.
+      queue = queue.then(() => serveOrRelay(frame as Rec, raw, id, controller.signal)).catch(() => {});
+    },
+    fromContainer(from, text) {
+      if (closed || from !== container || containerMuted) return;
+      const type = payloadType(text);
+      if (type && (TERMINAL_TYPES.has(type) || type === "error")) containerTurn = false;
+      link.send(text);
+    },
+    containerClosed(from, code, reason) {
+      if (from !== container) return; // one this session closed itself
+      container = undefined;
+      containerTurn = false;
+      // ocx closed the socket it holds for this client (a restart, an admission refusal): the client sees it.
+      if (!closed) link.close(code, reason);
+    },
+    closed() {
+      closed = true;
+      abortTurn?.abort("websocket turn superseded or closed");
+      container?.close();
+      container = undefined;
+    },
+  };
+}

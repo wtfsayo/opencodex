@@ -195,6 +195,12 @@ it sends, for four idle hours; the two keep separate copies (the Worker's in the
 `ocx`'s in memory, lost whenever the container sleeps), so a session whose catalog changes while its
 turns alternate between them can see both versions.
 
+With `websockets` on in the config, Codex can hold a WebSocket to `/v1/responses` instead of
+sending each turn over HTTP. The Worker then holds that socket itself (same token rule, no
+`Origin`): it answers each `response.create` it can serve as above, with the same frames `ocx`
+sends, and passes any other to `ocx` over a socket of its own to the container, relaying `ocx`'s
+frames back. A turn `ocx` is running on the socket keeps its steering and injection frames.
+
 And it answers `POST /v1/messages`, the API Claude Code uses, when `model` is one of the aliases
 `ocx` lists for Claude Code (`ocx-claude-<provider>--<model>`, or `ocx-claude2-…` for a model id
 with a `/`, and the older `claude-ocx-` spellings `ocx` still reads) and the provider qualifies as

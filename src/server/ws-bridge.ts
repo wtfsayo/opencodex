@@ -8,10 +8,11 @@ import type { ResponsesTerminalStatus } from "../bridge";
 import type { DataPlaneAdmission } from "./auth-cors";
 import type { AdmissionLease, AdmissionReservation } from "../lib/admission";
 import { BoundedSseFrameBuffer } from "./sse-frame-buffer";
-import { safeResponseHeaders } from "./safe-response-headers";
+import { buildWsErrorFrame } from "./ws-frames";
 import type { AudioSocketTarget } from "./audio-dictation";
 
 export { safeResponseHeaders } from "./safe-response-headers";
+export { buildWarmupCompletionFrames, buildWsErrorFrame } from "./ws-frames";
 
 const OPEN = 1;
 type ResponsesTerminalReporter = (status: ResponsesTerminalStatus) => void;
@@ -136,28 +137,6 @@ export function selectForwardHeadersForAuthContext(headers: Headers, ctx: CodexA
   return headersForCodexAuthContext(headers, ctx);
 }
 
-export function buildWarmupCompletionFrames(frame: Record<string, unknown>): string[] {
-  const createdAt = Math.floor(Date.now() / 1000);
-  const baseResponse: Record<string, unknown> = {
-    id: "",
-    object: "response",
-    created_at: createdAt,
-    model: typeof frame.model === "string" ? frame.model : undefined,
-    output: [],
-  };
-  return [
-    JSON.stringify({
-      type: "response.created",
-      sequence_number: 0,
-      response: { ...baseResponse, status: "in_progress" },
-    }),
-    JSON.stringify({
-      type: "response.completed",
-      sequence_number: 1,
-      response: { ...baseResponse, status: "completed" },
-    }),
-  ];
-}
 
 export function sendTextFrame(ws: ServerWebSocket<WsData>, payload: string): void {
   if (ws.readyState !== OPEN) throw new WsSendDroppedError();
@@ -170,18 +149,6 @@ export function sendJsonFrame(ws: ServerWebSocket<WsData>, payload: Record<strin
   sendTextFrame(ws, JSON.stringify(payload));
 }
 
-export function buildWsErrorFrame(
-  status: number,
-  error: Record<string, unknown>,
-  headers?: Headers,
-): Record<string, unknown> {
-  return {
-    type: "error",
-    status,
-    error,
-    headers: headers ? safeResponseHeaders(headers) : {},
-  };
-}
 
 function parseSseBlock(block: string): string | null {
   const data: string[] = [];

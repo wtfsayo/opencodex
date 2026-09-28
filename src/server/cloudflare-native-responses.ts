@@ -206,6 +206,8 @@ type TurnOptions = {
   sharedCacheCohort?: boolean;
   /** OpenCode Go's session lane when the caller derives it (claude-messages.ts does). */
   goSessionLane?: string;
+  /** The WebSocket transport sends every response with an empty id (websocket-handler.ts). */
+  responseId?: string;
   /** Runs once the route is known and before the send, so nothing after the send can throw. */
   beforeSend?(route: NativeChatRoute): void;
 };
@@ -342,6 +344,7 @@ export async function runNativeResponsesTurn(
     () => upstreamAbort.abort(), 2_000,
     {
       translatorBudget,
+      ...(options.responseId !== undefined ? { responseId: options.responseId } : {}),
       stallTimeoutSec: config.stallTimeoutSec,
       localUpstream: false,
       hideThinkingSummary: parsed.options.hideThinkingSummary,

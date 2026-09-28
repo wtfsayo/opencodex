@@ -59,3 +59,28 @@ export type WorkerUsageRow = {
 
 /** The replay key for a GET /v1/models request, or undefined when its answer cannot be replayed. */
 export type ModelListReplayKey = (url: URL, headers: Headers) => Promise<string | undefined>;
+
+/** A socket from the Worker to ocx's own Responses WebSocket, opened on first use. */
+export interface NativeWsContainer {
+  send(text: string): void;
+  close(): void;
+}
+
+/** What a Worker-held Responses WebSocket session needs from the Worker. */
+export interface NativeWsLink {
+  /** Sends a text frame to the client. */
+  send(text: string): void;
+  close(code: number, reason: string): void;
+  /** Opens a socket to ocx with the client's upgrade request; its frames and close come back through the session. */
+  openContainer(): NativeWsContainer;
+}
+
+export interface NativeWsSession {
+  receive(data: string | ArrayBuffer): void;
+  fromContainer(from: NativeWsContainer, text: string): void;
+  containerClosed(from: NativeWsContainer, code: number, reason: string): void;
+  /** The client went away. */
+  closed(): void;
+}
+
+export type CreateNativeWsSession = (link: NativeWsLink, upgradeHeaders: Headers, deps: NativeChatDeps) => NativeWsSession;

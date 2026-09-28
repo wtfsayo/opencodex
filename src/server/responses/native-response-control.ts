@@ -4,6 +4,7 @@ import type { NativeSteeringReplayObserver } from "./native-steering-replay";
 import type { ProviderExecutedCallType } from "../responses-undeclared-tool-guard";
 
 import { isInjectionRequest } from "./native-injection-protocol";
+import { nativeSteeringUnavailableReason } from "./native-steering-availability";
 
 /** Shared transport ownership, not a shared steer/inject protocol state machine. */
 export interface NativeResponseControl {
@@ -47,14 +48,4 @@ export function nativeResponseControlMode(frame: Record<string, unknown>, flags:
   return nativeSteeringUnavailableReason(frame, flags.codexNativeSteering) === undefined ? "steering" : undefined;
 }
 
-/** Explain documented execution-mode exclusions without claiming model entitlement. */
-export function nativeSteeringUnavailableReason(frame: Record<string, unknown>, enabled?: boolean): string | undefined {
-  if (enabled !== true) return "Native steering is disabled; enable codexNativeSteering and WebSockets for a supported route.";
-  if (isInjectionRequest(frame)) return "Multi-agent execution does not support single-agent response.steer; use a later client request.";
-  if (frame.conversation != null) return "Conversation-bound responses do not support native steering.";
-  if (Array.isArray(frame.context_management) && frame.context_management.some(item =>
-    item && typeof item === "object" && (item as Record<string, unknown>).type === "compaction")) {
-    return "Automatic API compaction and native steering cannot share an active response.";
-  }
-  return undefined;
-}
+export { nativeSteeringUnavailableReason };

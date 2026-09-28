@@ -184,8 +184,10 @@ export class LeaseState {
     if (new TextEncoder().encode(block).byteLength > MAX_SKILLS_BLOCK_BYTES) return;
     const now = this.now();
     await this.pruneSkills(now);
-    await this.storage.put(SKILLS_BLOCK_PREFIX + scope, block);
+    // Metadata first: reset and pruning find blocks only through it, so a block must never exist
+    // without its row.
     await this.storage.put<SkillsMeta>(SKILLS_META_PREFIX + scope, { lastAccessed: now });
+    await this.storage.put(SKILLS_BLOCK_PREFIX + scope, block);
   }
 
   /** Drops expired sessions, then the least recently used until there is room for one more. */

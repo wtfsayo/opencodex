@@ -16,6 +16,7 @@ import { renameRoutedIdentityInContext } from "../adapters/identity";
 import { bridgeToResponsesSSE } from "../bridge/sse";
 import { hasValidatedActiveReasoningEffort, parseRequest } from "../responses/parser";
 import { mapReasoningEffortWith, NO_REASONING_METADATA } from "../reasoning-effort-core";
+import { metadataProviderKeyForBaseUrl } from "../providers/reasoning-metadata-destinations";
 import { readResponseStreamWithInactivity, ResponseBodyInactivityError } from "../lib/response-body-inactivity";
 import { createTranslatorBudget } from "../lib/translator-budget";
 import { resolveStallTimeoutMs } from "../stall-timeout";
@@ -162,6 +163,12 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   if ("decline" in loaded) return no(loaded.decline);
   const route = resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets);
   if (!route) return null;
+  // ocx maps effort for these destinations from models.dev metadata and refusals it learned, both
+  // kept on disk (reasoning-metadata.ts); without an effort that state is never consulted.
+  const effort = isRec(body.reasoning) ? body.reasoning.effort : undefined;
+  if (effort !== undefined && effort !== null && metadataProviderKeyForBaseUrl(route.provider.baseUrl) !== undefined) {
+    return no("reasoning-metadata-destination");
+  }
   const config = loaded.config as Pick<OcxConfig, "stallTimeoutSec">;
 
   // ocx's web-search sidecar resolves through a configured OpenAI provider's accounts.
@@ -178,7 +185,7 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   let parsed;
   try { parsed = parseRequest(body); } catch { return no("parse"); }
   // A v2 collaboration surface gets guidance built from the catalog on disk when subagent models
-  // are configured (collaboration.ts); v1 gets guidance only with an effort, which is declined.
+  // are configured (collaboration.ts); v1 gets guidance only at max effort, declined just below.
   const surface = collabSurface(parsed);
   const subagentModels = (loaded.config as { subagentModels?: unknown }).subagentModels;
   if (surface === "v2" && Array.isArray(subagentModels) && subagentModels.length > 0) return no("collaboration-v2-guidance");

@@ -151,7 +151,7 @@ describe("Worker-native Responses", () => {
     for (const baseUrl of ["https://opencode.ai/zen/v1", "https://opencode.ai/zen/go/v1/"]) {
       const reasons: string[] = [];
       const config = JSON.stringify({ providers: { p: { ...provider, baseUrl } } });
-      const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1")), new Headers(), new AbortController().signal, {
+      const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1", { reasoning: { effort: "high" } })), new Headers(), new AbortController().signal, {
         readConfig: async () => config, fetch: async () => { throw new Error("unexpected"); }, onDecline: reason => reasons.push(reason),
       });
       expect([response, reasons]).toEqual([null, ["responses:reasoning-metadata-destination"]]);

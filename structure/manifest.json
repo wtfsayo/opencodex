@@ -89,6 +89,7 @@
         "src/oauth/",
         "src/providers/",
         "src/reasoning-effort.ts",
+        "src/reasoning-effort-core.ts",
         "src/remote/",
         "src/responses/",
         "src/router.ts",

@@ -200,12 +200,17 @@ translated and answered as `ocx` does it, streamed or not, when it has text-only
 Anthropic credential, or a Claude Desktop alias), a config with a `claudeCode` section, an injected
 agent's `ocx-route` directive, or a subagent's message thread all go to `ocx`.
 
-`GET /v1/models` is answered from the last list `ocx` gave for the same request (the same query,
-user agent and `anthropic-version` header), when `ocx` gave it within its model cache time
-(`modelCacheTtlMs`, five minutes by default, at most an hour) and the config, logins and Codex
-accounts have not changed since. `ocx` stores each list it answers for the data token in the
-Durable Object; a request with no such list goes to `ocx`. Claude Desktop's list shapes and Cursor's
-requests always go to `ocx`, which updates state of its own when it answers them.
+`GET /v1/models` is answered from the last list `ocx` gave for the same request (the same query and
+`anthropic-version` header, and whether the user agent is Claude Code's) for as long as that list
+is still the one `ocx` would give: until `ocx` would fetch a provider's model list again (after its
+model cache time, `modelCacheTtlMs`, five minutes by default, or 30 seconds after a failed fetch),
+and for a Codex catalog at most `modelCacheTtlMs`; when no provider's list is fetched, for up to an
+hour. A change to the config, logins or Codex accounts, a deployment, or a changed secret ends it
+at once. `ocx` stores the lists it gives for the data token in the Durable Object, only while
+`OCX_WORKER_NATIVE` is set. Some requests always go to `ocx`: Cursor's, Claude Desktop's list
+shapes, and any from a config with an enabled OpenAI (ChatGPT) provider, whose rows depend on
+account entitlements `ocx` checks online. The model cache time is shorter than the container's
+sleep delay (`OCX_SLEEP_AFTER`), so a replay mostly saves the trip to a running container.
 
 If the provider returns an error status, the Worker sends the request to `ocx` instead, which
 retries and reports it as usual; the provider then sees that request twice. An answer with a 200

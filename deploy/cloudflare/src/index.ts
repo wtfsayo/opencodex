@@ -1,6 +1,6 @@
 import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
 import {
-  chatAdmitsDataToken, apiAuthAdmitsDataToken, containerEnv, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
+  chatAdmitsDataToken, apiAuthAdmitsDataToken, containerEnv, modelListStamp, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
 import { type DocumentSeqs, type DurableDocument, LeaseState, type ModelList } from "./lease";
@@ -167,9 +167,9 @@ export class OpencodexHub extends Container<Env> {
   enqueueUsage(row: unknown) { return this.leases.enqueueUsage(row); }
   skillsSnapshotRead(scope: string) { return this.leases.skillsSnapshotRead(scope); }
   skillsSnapshotCommit(scope: string, block: string) { return this.leases.skillsSnapshotCommit(scope, block); }
-  modelListRead(key: string) { return this.leases.modelListRead(key); }
-  modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number) {
-    return this.leases.modelListCommit(bootId, key, list, seqs, ttlMs);
+  modelListRead(key: string, stamp: string) { return this.leases.modelListRead(key, stamp); }
+  modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string) {
+    return this.leases.modelListCommit(bootId, key, list, seqs, ttlMs, stamp);
   }
   async nativeConfigSource(): Promise<{ config: string | undefined; hasSnapshot: boolean }> {
     return { config: (await this.leases.readDocument("config"))?.body, hasSnapshot: (await this.leases.currentSnapshot()) !== undefined };
@@ -193,7 +193,7 @@ async function handleState(req: Request, env: Env): Promise<Response> {
       } while (cursor && keys.length < limit);
       return keys;
     },
-  }, namespace);
+  }, namespace, await modelListStamp(env));
 }
 
 OpencodexHub.outboundByHost = {
@@ -292,7 +292,7 @@ async function tryWorkerModelList(req: Request, env: Env): Promise<Response | nu
   if (!(await apiAuthAdmitsDataToken(req, env))) return null;
   const key = await modelListReplayKey(url, req.headers);
   if (!key) return null;
-  const list = await getContainer(env.HUB, HUB_NAME).modelListRead(key);
+  const list = await getContainer(env.HUB, HUB_NAME).modelListRead(key, await modelListStamp(env));
   return list ? new Response(list.body, { headers: list.headers }) : null;
 }
 

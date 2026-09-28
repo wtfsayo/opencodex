@@ -8,6 +8,8 @@ export type SecretSource = {
   OCX_SNAPSHOT_INTERVAL_SECONDS?: string;
   /** Comma-separated names of further Worker secrets to expose to ocx, e.g. provider API keys. */
   OCX_PASSTHROUGH_SECRETS?: string;
+  OCX_WORKER_NATIVE?: string;
+  OCX_EDGE_KEY_CHECK?: string;
 };
 
 // Names that steer the process instead of carrying a credential: a passthrough entry must not be
@@ -15,7 +17,7 @@ export type SecretSource = {
 const REFUSED_PASSTHROUGH = new Set([
   "HOME", "OPENCODEX_HOME", "CODEX_HOME", "TMPDIR", "PATH", "NODE_ENV", "NODE_OPTIONS", "BUN_OPTIONS",
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
-  "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
+  "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "OCX_WORKER_MODEL_LISTS",
 ]);
 const warnedRefusals = new Set<string>();
 
@@ -40,6 +42,8 @@ export function containerEnv(env: SecretSource): Record<string, string> {
     OPENCODEX_ADMIN_AUTH_TOKEN: env.OPENCODEX_ADMIN_AUTH_TOKEN,
     OCX_BOOTSTRAP_CONFIG_JSON: env.OCX_BOOTSTRAP_CONFIG_JSON,
     OCX_SNAPSHOT_INTERVAL_SECONDS: env.OCX_SNAPSHOT_INTERVAL_SECONDS,
+    // Tells ocx to hand its model lists to the Durable Object, only where the Worker replays them.
+    OCX_WORKER_MODEL_LISTS: env.OCX_WORKER_NATIVE?.trim() === "1" && env.OCX_EDGE_KEY_CHECK?.trim() !== "presence" ? "1" : undefined,
   };
   return Object.fromEntries([...passthrough, ...Object.entries(fixed)].filter((entry): entry is [string, string] => !!entry[1]));
 }
@@ -65,6 +69,14 @@ export async function envFingerprint(env: Record<string, string>): Promise<strin
   const canonical = JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)));
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * What a replayed model list must have been answered under: this Worker version and the environment
+ * the container gets. A deploy or a secret change makes every stored list a miss.
+ */
+export async function modelListStamp(env: SecretSource & { CF_VERSION?: { id?: string } }): Promise<string> {
+  return `${await envFingerprint(containerEnv(env))}:${env.CF_VERSION?.id ?? ""}`;
 }
 
 export type EdgeDecision = { forward: true } | { forward: false; status: number; message: string };

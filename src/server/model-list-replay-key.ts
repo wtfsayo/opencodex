@@ -4,28 +4,38 @@
 import { CURSOR_USER_AGENT } from "../integrations/cursor-seen";
 
 /**
- * Every request input the /v1/models route in serve-options.ts reads, as a hex digest, or undefined
+ * Every request input the /v1/models route in serve-options.ts reads, canonically, or undefined
  * when its answer also depends on something a replay would skip:
  * - an `Origin` header: CORS headers and ocx's origin check;
  * - Cursor's user agent: ocx records when Cursor last asked (cursor-seen.ts);
- * - the Claude Desktop list shapes (`format=desktop-config`, hashed ids): ocx rebuilds its Desktop
- *   alias registry while answering, and later Desktop turns resolve through it.
+ * - the Claude Desktop list shapes (`format=desktop-config`, hashed ids), whose aliases later
+ *   Desktop turns resolve through the registry ocx rebuilds while answering. Claude Code's readable
+ *   ids decode without it, and ocx builds it at startup as well.
+ * - a repeated parameter: the route reads the first value, so the order would matter.
  */
-export async function modelListReplayKey(url: URL, headers: Headers): Promise<string | undefined> {
+export function modelListReplayInputs(url: URL, headers: Headers): string | undefined {
   if (headers.has("origin")) return undefined;
   const userAgent = headers.get("user-agent") ?? "";
   if (CURSOR_USER_AGENT.test(userAgent.trim())) return undefined;
   const params = url.searchParams;
+  const names = [...params.keys()];
+  if (new Set(names).size !== names.length) return undefined;
   if (params.has("format")) return undefined;
   const anthropicVersion = headers.get("anthropic-version") !== null;
-  const anthropicList = anthropicVersion || params.get("flavor") === "anthropic";
-  if (anthropicList && !params.has("client_version")) {
+  // The one thing the route reads from the user agent besides Cursor's.
+  const claudeCode = /^claude-code\//i.test(userAgent);
+  if ((anthropicVersion || params.get("flavor") === "anthropic") && !params.has("client_version")) {
     const ids = params.get("ids");
-    const readable = ids === "cli" || (ids !== "desktop" && /^claude-code\//i.test(userAgent));
-    if (!readable) return undefined;
+    if (!(ids === "cli" || (ids !== "desktop" && claudeCode))) return undefined;
   }
-  const query = [...params].sort(([a, x], [b, y]) => a < b ? -1 : a > b ? 1 : x < y ? -1 : x > y ? 1 : 0);
-  const key = JSON.stringify(["v1", query, anthropicVersion, userAgent]);
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key));
+  const query = [...params].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return JSON.stringify(["v2", query, anthropicVersion, claudeCode]);
+}
+
+/** The digest of `modelListReplayInputs`, or undefined when the answer cannot be replayed. */
+export async function modelListReplayKey(url: URL, headers: Headers): Promise<string | undefined> {
+  const inputs = modelListReplayInputs(url, headers);
+  if (inputs === undefined) return undefined;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(inputs));
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }

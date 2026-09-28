@@ -15,7 +15,7 @@ export interface StateHub {
   commitDocument(bootId: string, name: DurableDocument, body: string, seq: number): Promise<DocumentCommit>;
   peekUsage(bootId: string, limit: number): Promise<{ seq: number; row: unknown }[] | null>;
   ackUsage(bootId: string, seqs: readonly number[]): Promise<boolean>;
-  modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number): Promise<boolean>;
+  modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string): Promise<boolean>;
 }
 
 export interface StateBucket {
@@ -48,7 +48,11 @@ export async function sweepOrphans(hub: Pick<StateHub, "currentSnapshot">, bucke
   return orphans.length;
 }
 
-export async function handleStateRequest(req: Request, hub: StateHub, bucket: StateBucket, namespace: string): Promise<Response> {
+/**
+ * `stamp` names the Worker version and container environment in force, which a model list is
+ * stored under (see modelListRead).
+ */
+export async function handleStateRequest(req: Request, hub: StateHub, bucket: StateBucket, namespace: string, stamp = ""): Promise<Response> {
   const path = new URL(req.url).pathname;
   const bootId = req.headers.get("x-ocx-boot-id") ?? "";
   if (!BOOT_ID_PATTERN.test(bootId)) return new Response("missing boot id", { status: 400 });
@@ -112,11 +116,12 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
   }
   const modelListKey = /^\/model-lists\/([0-9a-f]{64})$/.exec(path)?.[1];
   if (modelListKey !== undefined && req.method === "PUT") {
+    if (Number(req.headers.get("content-length")) > MAX_MODEL_LIST_BYTES) return new Response("model list too large", { status: 413 });
     const text = await req.text();
     if (new TextEncoder().encode(text).byteLength > MAX_MODEL_LIST_BYTES) return new Response("model list too large", { status: 413 });
     const entry = parseModelListEntry(text);
     if (!entry) return new Response("model list, headers, seqs and ttlMs required", { status: 400 });
-    return (await hub.modelListCommit(bootId, modelListKey, entry.list, entry.seqs, entry.ttlMs))
+    return (await hub.modelListCommit(bootId, modelListKey, entry.list, entry.seqs, entry.ttlMs, stamp))
       ? new Response(null, { status: 204 })
       : new Response("lease lost", { status: 409 });
   }

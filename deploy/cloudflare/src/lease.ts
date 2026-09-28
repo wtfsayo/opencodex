@@ -52,12 +52,15 @@ type SkillsMeta = { lastAccessed: number };
 const MODEL_LIST_PREFIX = "ocx:model-list:";
 const MODEL_LIST_META_PREFIX = "ocx:model-list-meta:";
 export const MAX_MODEL_LISTS = 32;
-export const MAX_MODEL_LIST_BYTES = 1024 * 1024;
-// ocx's modelCacheTtlMs is honoured up to this; a longer one would let a list outlive a restart by hours.
+// A Codex catalog runs to about 24 KB a model; SQLite-backed objects take values up to 2 MiB.
+export const MAX_MODEL_LIST_BYTES = 2_000_000;
+// However long ocx says an answer stays its answer, it is replayed for at most this long.
 export const MAX_MODEL_LIST_TTL_MS = 60 * 60 * 1000;
 export type DocumentSeqs = Record<DurableDocument, number>;
 export type ModelList = { body: string; headers: [string, string][] };
-type ModelListMeta = { expiresAt: number; seqs: DocumentSeqs };
+/** `stamp` names the Worker version and container environment the list was answered under. */
+type ModelListMeta = { expiresAt: number; seqs: DocumentSeqs; stamp: string };
+const DOCUMENT_SEQ_KEY_PREFIX = "ocx:document-seq:";
 
 const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
@@ -111,7 +114,10 @@ export class LeaseState {
   async discardSnapshot(): Promise<string | undefined> {
     const discarded = await this.storage.get<string>(SNAPSHOT_KEY);
     await this.storage.delete(SNAPSHOT_KEY);
-    for (const name of DURABLE_DOCUMENTS) await this.storage.delete(DOCUMENT_KEY_PREFIX + name);
+    for (const name of DURABLE_DOCUMENTS) {
+      await this.storage.delete(DOCUMENT_KEY_PREFIX + name);
+      await this.storage.delete(DOCUMENT_SEQ_KEY_PREFIX + name);
+    }
     for (;;) {
       const queued = await this.storage.list({ prefix: USAGE_KEY_PREFIX, limit: 1000 });
       if (queued.size === 0) break;
@@ -156,6 +162,7 @@ export class LeaseState {
     const current = await this.readDocument(name);
     if (current && current.seq >= seq) return { kind: "stale", storedSeq: current.seq };
     await this.storage.put<StoredDocument>(DOCUMENT_KEY_PREFIX + name, { body, seq });
+    await this.storage.put<number>(DOCUMENT_SEQ_KEY_PREFIX + name, seq);
     return { kind: "committed" };
   }
 
@@ -224,17 +231,22 @@ export class LeaseState {
    * A /v1/models answer ocx computed for `key`, while it is younger than ocx's model cache TTL and
    * every document still has the sequence it was computed under; else undefined.
    */
-  async modelListRead(key: string): Promise<ModelList | undefined> {
+  async modelListRead(key: string, stamp: string): Promise<ModelList | undefined> {
     const meta = await this.storage.get<ModelListMeta>(MODEL_LIST_META_PREFIX + key);
-    if (!meta || this.now() >= meta.expiresAt) return undefined;
+    if (!meta || this.now() >= meta.expiresAt || meta.stamp !== stamp) return undefined;
     for (const name of DURABLE_DOCUMENTS) {
-      if (((await this.readDocument(name))?.seq ?? 0) !== meta.seqs[name]) return undefined;
+      if ((await this.documentSeq(name)) !== meta.seqs[name]) return undefined;
     }
     return this.storage.get<ModelList>(MODEL_LIST_PREFIX + key);
   }
 
+  /** A document's sequence without reading its body (a document from before seq rows reads its body once). */
+  private async documentSeq(name: DurableDocument): Promise<number> {
+    return (await this.storage.get<number>(DOCUMENT_SEQ_KEY_PREFIX + name)) ?? (await this.readDocument(name))?.seq ?? 0;
+  }
+
   /** Stores an answer from the lease holder, dropping expired ones and then the soonest to expire. */
-  async modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number): Promise<boolean> {
+  async modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string): Promise<boolean> {
     if (!(await this.holdsLease(bootId))) return false;
     const now = this.now();
     const metas = await this.storage.list<ModelListMeta>({ prefix: MODEL_LIST_META_PREFIX, limit: MAX_MODEL_LISTS + 50 });
@@ -247,7 +259,7 @@ export class LeaseState {
     live.sort((a, b) => a[1] - b[1]);
     while (live.length >= MAX_MODEL_LISTS) await this.dropModelList(live.shift()![0]);
     // Metadata first, as for skills: reset finds bodies only through it.
-    await this.storage.put<ModelListMeta>(MODEL_LIST_META_PREFIX + key, { expiresAt: now + Math.min(ttlMs, MAX_MODEL_LIST_TTL_MS), seqs });
+    await this.storage.put<ModelListMeta>(MODEL_LIST_META_PREFIX + key, { expiresAt: now + Math.min(ttlMs, MAX_MODEL_LIST_TTL_MS), seqs, stamp });
     await this.storage.put<ModelList>(MODEL_LIST_PREFIX + key, list);
     return true;
   }

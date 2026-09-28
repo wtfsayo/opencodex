@@ -183,6 +183,17 @@ export function isModelsFetchCoolingDown(
   return failure.authorityIdentity === authorityIdentity;
 }
 
+/**
+ * The earliest time this process would fetch `provider`'s models again, as far as the cache
+ * decides it: the end of a failure cooldown, else when the cached entry turns stale, else now.
+ */
+export function providerModelsFreshUntil(provider: string, ttlMs: number, now = Date.now()): number {
+  const failure = failureAt.get(provider);
+  if (failure !== undefined && now - failure.at < MODELS_FETCH_FAILURE_COOLDOWN_MS) return failure.at + MODELS_FETCH_FAILURE_COOLDOWN_MS;
+  const entry = cache.get(provider);
+  return entry ? entry.fetchedAt + ttlMs : now;
+}
+
 /** Fresh cached models for a provider, or null when absent/stale (caller should re-fetch). */
 export function getFreshCached(provider: string, ttlMs: number, now = Date.now(), authorityIdentity?: string): CatalogModel[] | null {
   const entry = cache.get(provider);

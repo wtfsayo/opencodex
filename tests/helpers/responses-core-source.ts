@@ -31,6 +31,7 @@ export const RESPONSES_CORE_MODULES = [
   "core-combo-native.ts",
   "request-prepare.ts",
   "skills-snapshot.ts",
+  "skills-catalog.ts",
   "shadow-target-availability.ts",
   "compaction-routing.ts",
   "compaction-recovery.ts",

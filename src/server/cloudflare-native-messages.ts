@@ -67,9 +67,9 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
   } catch {
     return decline("translation-budget");
   }
-  // ocx also drops `reasoning` when the route's configured ladder is empty (supportedLadderFor),
-  // which only noReasoningModels, reasoningEfforts or modelReasoningEfforts can make it; the
-  // Worker admits none of those provider fields, so the ladder is unknown and the effort stays.
+  // ocx also drops `reasoning` when the route's ladder is definitively empty (supportedLadderFor).
+  // No route the Worker takes has one: its own providers carry no ladder fields, and every model
+  // of the Anthropic login has a non-empty ladder.
 
   // The replayed request carries only these caller headers, never the admission bearer.
   const internalHeaders = new Headers({ "content-type": "application/json" });

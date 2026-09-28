@@ -479,7 +479,8 @@ the formatter in `tests/server/retry-after-429.test.ts`, and the native Chat cla
 ## Combo output headroom
 
 A combo child is admitted against two budgets, not one. `resolveInputCeiling` in
-`src/server/responses/input-admission.ts` answers "how much input may this target take", which
+`src/server/responses/input-admission.ts` (the logic is `input-admission-core.ts`, over native
+lookups the Cloudflare Worker leaves empty) answers "how much input may this target take", which
 `modelMaxInputTokens` can tighten below the window. The context window itself is what input and
 output actually share. When the caller declared `max_output_tokens`,
 `checkComboTargetInputAdmission` requires both `estimated input <= ceiling` and

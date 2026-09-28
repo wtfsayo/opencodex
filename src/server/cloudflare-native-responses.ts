@@ -7,7 +7,9 @@
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
 import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, TURN_ADAPTERS, withOpenCodeGoSession, type NativeChatRoute } from "./cloudflare-native-chat";
-import { createAnthropicAdapterWith, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
+import { createAnthropicAdapterWith, isLikelyRealAnthropicThinkingSignature, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
+import { CLAUDE_CODE_HEADERS } from "../adapters/client-fingerprint";
+import { createInputAdmission } from "./responses/input-admission-core";
 import { finishRegisteredAdapter, wrapOpenAIChatAdapter } from "../adapters/registered-adapter";
 import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { buildToolBridgeMaps } from "./responses/tool-bridge-maps";
@@ -164,6 +166,8 @@ async function oauthStoreFor(model: unknown, deps: NativeChatDeps): Promise<unkn
   try { return text ? JSON.parse(text) : undefined; } catch { return undefined; }
 }
 
+// The Worker never serves the native OpenAI provider, the only one these lookups answer for.
+const WORKER_INPUT_ADMISSION = createInputAdmission({ contextWindow: () => undefined, maxInputTokens: () => undefined, maxOutputTokens: () => undefined });
 // Image-bearing turns are declined, and ocx's normalization returns at once without images.
 const NO_IMAGE_NORMALIZATION: AnthropicAdapterDeps = { normalizeAnthropicImages: async () => {} };
 
@@ -279,17 +283,36 @@ export async function runNativeResponsesTurn(
   const responseModelId = route.providerName === "anthropic" || route.provider.adapter === "anthropic" ? parsed.modelId : route.modelId;
   parsed.modelId = route.modelId;
   parsed.context = renameRoutedIdentityInContext(parsed.context, route.modelId);
-  // core-normalize.ts; the provider's showThinkingSummary is outside the fields this path admits.
-  // Only for a Responses client: an Anthropic replay keeps what the parser decided.
+  // core-normalize.ts. Only for a Responses client: an Anthropic replay keeps what the parser decided.
   if (options.inbound === "responses") {
     const summary = isRec(body.reasoning) ? body.reasoning.summary : undefined;
-    parsed.options.hideThinkingSummary = summary === "none" || (!summary && !hasValidatedActiveReasoningEffort(parsed.options));
+    parsed.options.hideThinkingSummary = summary === "none"
+      || (!summary && !hasValidatedActiveReasoningEffort(parsed.options) && route.provider.showThinkingSummary !== true);
+  }
+
+  // Whether ocx replays a signed thinking block turns on the serving identity it bound to the
+  // thread in memory (core-replay.ts), which the Worker cannot see.
+  if (route.provider.adapter === "anthropic" && parsed.context.messages.some(message => message.role === "assistant"
+    && message.content.some(part => part.type === "thinking" && (!!part.redacted?.length || isLikelyRealAnthropicThinkingSignature(part.signature))))) {
+    return no("reasoning-replay-state");
+  }
+  // request-prepare.ts refuses an input far past the context window, with its own error.
+  if (parsed._compactionRequest !== true
+    && !WORKER_INPUT_ADMISSION.checkInputAdmission(parsed, route.provider, route.providerName, parsed.modelId).admitted) {
+    return no("input-admission");
   }
 
   const translatorBudget = options.translatorBudget;
   // As createRegisteredAdapter builds them (registered-adapter.ts), with the Worker's own hooks.
+  // A subscription turn carries the Claude Code fingerprint of the process ocx runs in.
+  let anthropicDeps = NO_IMAGE_NORMALIZATION;
+  if (route.provider.adapter === "anthropic" && route.provider.authMode === "oauth") {
+    const runtime = await deps.clientRuntime?.();
+    if (!runtime) return no("oauth-client-runtime-unpublished");
+    anthropicDeps = { ...NO_IMAGE_NORMALIZATION, claudeCodeHeaders: { ...CLAUDE_CODE_HEADERS, ...runtime } };
+  }
   const adapter = route.provider.adapter === "anthropic"
-    ? finishRegisteredAdapter(createAnthropicAdapterWith(route.provider, config.cacheRetention, NO_IMAGE_NORMALIZATION), "anthropic")
+    ? finishRegisteredAdapter(createAnthropicAdapterWith(route.provider, config.cacheRetention, anthropicDeps), "anthropic")
     : finishRegisteredAdapter(wrapOpenAIChatAdapter(createOpenAIChatAdapterWith(route.provider, workerAdapterDeps(metadata))), "openai-chat");
   const upstreamAbort = new AbortController();
   const upstreamSignal = AbortSignal.any([signal, upstreamAbort.signal]);

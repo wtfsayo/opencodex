@@ -276,6 +276,20 @@ the registry and the Worker. Verified by tests that run ocx and the Worker side 
 body, every upstream header, client bytes, usage fields); not run live, as the test account has no
 Anthropic key or Claude login.
 
+Two reviews of that branch found the OAuth path narrower than it looked. A real login row carries
+the registry preset (context windows, modalities, effort ladders, output budget), which the first
+cut declined on sight, so the Worker never served a real login; it now admits those fields when they
+equal what `ocx login` writes, and the parity tests build the row that way. ocx refuses input far past
+the context window before sending (#1412), so input admission moved to a core the Worker binds
+without the native-catalog lookups (`input-admission-core.ts`). The Claude Code fingerprint headers
+name the sending process's runtime (`process.version`, arch, OS); workerd's differ from the
+container's Bun, so ocx publishes its own at startup (`server/worker-native-state.ts`) under the
+deployment stamp, and the Worker declines subscription turns until it has. Declined as ocx state the
+Worker cannot see: replayed signed thinking (ocx strips it when the thread's serving identity
+changed, a per-process memory) and accounts marked `needsReauth`. A registry-matched transport skips
+the destination check inside `routedProviderConfigWith`, so the Worker checks the final base URL
+itself and refuses its own local hosts for a route carrying an account token.
+
 Still container-only: the dashboard and management API, Codex-pool and other OAuth providers, spend
 limits, and the web-search sidecar. Spend limits need the reservation ledger's authority moved into
 the Durable Object (its API is synchronous at every call site today); OAuth needs token refresh

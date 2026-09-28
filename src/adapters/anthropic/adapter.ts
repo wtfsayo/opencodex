@@ -281,7 +281,7 @@ function normalizeTtlOrdering(body: Record<string, unknown>): void {
   }
 }
 
-function isLikelyRealAnthropicThinkingSignature(signature: string | undefined): signature is string {
+export function isLikelyRealAnthropicThinkingSignature(signature: string | undefined): signature is string {
   if (typeof signature !== "string" || signature.length < 16) return false;
   if (/^(fc|call|msg|rs|resp|reasoning|item|ws|tool|func|function)[-_]/i.test(signature)) return false;
   return /^[A-Za-z0-9+/_=-]+$/.test(signature);
@@ -550,13 +550,17 @@ export function applyAnthropicKeyAuth(headers: Record<string, string>, provider:
  * OAuth (Claude Pro/Max) credential placement: the bearer, the OAuth beta pair and the Claude
  * Code client fingerprint. Shared by the adapter and the managed native lane.
  */
-export function applyAnthropicOAuthAuth(headers: Record<string, string>, accessToken: string): void {
+export function applyAnthropicOAuthAuth(
+  headers: Record<string, string>,
+  accessToken: string,
+  fingerprint: Readonly<Record<string, string>> = CLAUDE_CODE_HEADERS,
+): void {
   headers["Authorization"] = `Bearer ${accessToken}`;
   headers["anthropic-beta"] = ANTHROPIC_OAUTH_BETA;
   // Match the real Claude Code CLI request fingerprint: a valid OAuth token with an empty
   // header set is a non-first-party signature. (cch billing-header signing is intentionally
   // out of scope — brittle and version-coupled.)
-  Object.assign(headers, CLAUDE_CODE_HEADERS);
+  Object.assign(headers, fingerprint);
   headers["X-Claude-Code-Session-Id"] = claudeCodeSessionId(accessToken);
   headers["x-client-request-id"] = crypto.randomUUID();
 }
@@ -1028,6 +1032,8 @@ function normalizeAnthropicInputSchema(schema: unknown): Record<string, unknown>
 /** What the adapter needs from outside its own module: image normalization uses Bun's image codec. */
 export interface AnthropicAdapterDeps {
   normalizeAnthropicImages(messages: unknown[], options: { tierBias?: number; abortSignal?: AbortSignal }): Promise<void>;
+  /** The Claude Code fingerprint an OAuth turn carries; this process's own when unset. */
+  claudeCodeHeaders?: Readonly<Record<string, string>>;
 }
 
 export function createAnthropicAdapterWith(
@@ -1204,7 +1210,7 @@ export function createAnthropicAdapterWith(
       const fastSpeed = anthropicFastSpeed(parsed, provider);
       if (fastSpeed) body.speed = fastSpeed.value;
       const headers = anthropicBaseRequestHeaders(parsed.stream);
-      if (isOAuth) applyAnthropicOAuthAuth(headers, provider.apiKey);
+      if (isOAuth) applyAnthropicOAuthAuth(headers, provider.apiKey, deps.claudeCodeHeaders);
       else applyAnthropicKeyAuth(headers, provider);
       if (provider.headers) Object.assign(headers, provider.headers);
       mergeAnthropicBetaHeader(headers, fastSpeed?.betas ?? []);

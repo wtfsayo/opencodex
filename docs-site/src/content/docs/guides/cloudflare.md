@@ -185,9 +185,13 @@ It also answers `POST /v1/responses`, the API Codex uses, for the same providers
 of your own with `adapter: "anthropic"` (key auth, `baseUrl`, `apiKey`, `models`; `cacheRetention`
 applies as in `ocx`), and for the built-in `anthropic` provider logged in with a Claude subscription
 (`authMode: "oauth"`) when it has exactly one account whose token has more than a minute left: the
-Worker uses the token `ocx` stored and never refreshes one, so a token near expiry, a second account
-(which turns on `ocx`'s failover and quota tracking), or any other setting on that provider sends the
-turn to `ocx`. That covers the turn when it is
+Worker uses the token `ocx` stored and never refreshes one, so a token near expiry, an account
+waiting for a new login, a second account (which turns on `ocx`'s failover and quota tracking), or a
+setting on that provider other than what `ocx login anthropic` wrote sends the turn to `ocx`. So does
+a turn that replays Claude's signed thinking, which `ocx` checks against the account that produced
+it, and any subscription turn before `ocx` has started once under the current deployment: `ocx`
+tells the Worker which runtime to report in the Claude Code headers, so Anthropic sees the same
+client from either. That covers the turn when it is
 streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
 is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only

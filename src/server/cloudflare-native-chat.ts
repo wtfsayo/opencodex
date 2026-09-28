@@ -22,6 +22,7 @@ import { getOrAllocateRequestSessionLane } from "./request-log-conversation";
 import { apiKeyAccountLogLabel } from "../codex/key-account-label";
 import { stampOAuthAccountLabel } from "../providers/label";
 import { routedProviderConfigWith } from "../providers/routed-provider-config";
+import { deriveOAuthProviderConfig } from "../providers/derive";
 
 type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
@@ -77,14 +78,24 @@ function resolveKeyReference(value: string, secrets: Readonly<Record<string, str
 }
 
 const CHAT_ADAPTERS: ReadonlySet<string> = new Set(["openai-chat"]);
-// Built-in providers whose OAuth login the Worker uses, with the saved-row fields it reproduces.
+// Built-in providers whose OAuth login the Worker uses, and the saved-row fields it reproduces
+// whatever their value. Any other field must hold what `ocx login` writes (upsertOAuthProvider);
+// routed-provider-config.ts merges the registry's own values over those anyway.
 const OAUTH_PROVIDERS = new Set(["anthropic"]);
-const OAUTH_ROW_FIELDS = new Set(["adapter", "baseUrl", "authMode", "models"]);
+const OAUTH_ROW_FIELDS = new Set(["adapter", "baseUrl", "authMode"]);
 // oauth/index.ts's REFRESH_SKEW_MS: ocx refreshes a token this close to expiry before sending. The
 // Worker never refreshes (refresh tokens rotate, and only ocx may spend one), so it leaves those
 // turns to ocx.
 const OAUTH_REFRESH_SKEW_MS = 60_000;
 const PLAIN_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const NO_LOCAL_HOSTS: ReadonlySet<string> = new Set();
+
+/** JSON with object keys sorted, so two values compare equal whatever order they were written in. */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, inner: unknown) => isRec(inner)
+    ? Object.fromEntries(Object.keys(inner).sort().map(key => [key, inner[key]]))
+    : inner);
+}
 
 /**
  * A built-in OAuth provider's route as ocx takes it with its account pool off: the registry's
@@ -97,7 +108,9 @@ function resolveOAuthRoute(
   authStore: unknown, no: (reason: string) => null,
 ): NativeChatRoute | null {
   if (!isRec(row)) return no("provider-shape");
-  const unknownField = Object.keys(row).find(key => !OAUTH_ROW_FIELDS.has(key));
+  const preset = deriveOAuthProviderConfig(providerName) as Record<string, unknown> | undefined;
+  const unknownField = Object.keys(row).find(key => !OAUTH_ROW_FIELDS.has(key)
+    && (preset?.[key] === undefined || canonicalJson(row[key]) !== canonicalJson(preset[key])));
   if (unknownField) return no(`provider-field:${unknownField}`);
   if (row.authMode !== "oauth") return no("auth-mode");
   // An explicit namespace routes the id verbatim; anything the slug codec would decode is ocx's.
@@ -106,22 +119,34 @@ function resolveOAuthRoute(
   try {
     provider = routedProviderConfigWith(providerName, row as unknown as OcxProviderConfig, {
       resolveApiKey: () => undefined,
+      // Never a host the Worker answers itself: the route carries the account's token.
       assertDestinationAllowed: (_name, target) => {
-        if (typeof target.baseUrl !== "string" || !destinationAllowed(target.baseUrl, localHosts)) throw new Error("destination");
+        if (typeof target.baseUrl !== "string" || !destinationAllowed(target.baseUrl, NO_LOCAL_HOSTS)
+          || localHosts.has(new URL(target.baseUrl).host)) throw new Error("destination");
       },
       warnBaseUrlDiscarded: () => {},
     });
   } catch {
     return no("destination");
   }
+  // A registry-matched transport skips the check above, and the row may still override baseUrl.
+  // sendUpstream answers a host of the Worker's own itself, whatever its name looks like.
+  if (typeof provider.baseUrl !== "string" || !destinationAllowed(provider.baseUrl, NO_LOCAL_HOSTS)
+    || localHosts.has(new URL(provider.baseUrl).host)) return no("destination");
   if (provider.adapter !== "anthropic" || provider.authMode !== "oauth") return no("adapter");
   const accountSet = isRec(authStore) ? authStore[providerName] : undefined;
   if (!isRec(accountSet) || !Array.isArray(accountSet.accounts)) return no("oauth-no-login");
   if (accountSet.accounts.length !== 1) return no("oauth-account-pool");
   const account = accountSet.accounts[0];
-  if (!isRec(account) || account.id !== accountSet.activeAccountId || !isRec(account.credential)) return no("oauth-account-shape");
-  const { access, expires } = account.credential;
-  if (typeof access !== "string" || access.trim() === "" || typeof expires !== "number") return no("oauth-account-shape");
+  // oauth/store.ts's normalizeAccount: an account it would drop is no login at all to ocx.
+  if (!isRec(account) || typeof account.id !== "string" || account.id === "" || account.id !== accountSet.activeAccountId
+    || !isRec(account.credential)) return no("oauth-account-shape");
+  const { access, refresh, expires } = account.credential;
+  if (typeof access !== "string" || access.trim() === "" || typeof refresh !== "string" || typeof expires !== "number") {
+    return no("oauth-account-shape");
+  }
+  // ocx refuses an account marked for a fresh login (resolveAccessSnapshotForAccount).
+  if (account.needsReauth === true) return no("oauth-needs-reauth");
   if (expires <= Date.now() + OAUTH_REFRESH_SKEW_MS) return no("oauth-refresh-due");
   return { providerName, provider: { ...provider, apiKey: access }, modelId, requestedModel: model, apiKeyReference: "", oauthAccountId: account.id as string };
 }

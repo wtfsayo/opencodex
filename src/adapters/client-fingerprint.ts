@@ -27,6 +27,12 @@ export const CLAUDE_CODE_HEADERS: Record<string, string> = {
 };
 
 /**
+ * The headers above that describe the process sending them. A Cloudflare Worker sending a turn for
+ * the container takes the container's values (server/worker-native-state.ts), not its own.
+ */
+export const CLAUDE_CODE_RUNTIME_HEADERS = ["X-Stainless-Arch", "X-Stainless-OS", "X-Stainless-Runtime-Version"] as const;
+
+/**
  * Stable per-credential session id, matching Claude Code's `X-Claude-Code-Session-Id`. Real Claude
  * Code keeps one session id per CLI session; we derive a deterministic UUIDv4-shaped id from the
  * OAuth token so it stays stable across a conversation's turns without persisting state. The token

@@ -69,6 +69,11 @@ export const REASONING_METADATA_KINDS = ["snapshot", "support"] as const;
 export type ReasoningMetadataKind = (typeof REASONING_METADATA_KINDS)[number];
 type StoredReasoningMetadata = { bootId: string; version: number; body: string };
 
+// The Claude Code fingerprint headers naming ocx's runtime (src/server/worker-native-state.ts),
+// under the stamp of the Worker version and container environment they were published under.
+const CLIENT_RUNTIME_KEY = "ocx:client-runtime";
+type StoredClientRuntime = { stamp: string; headers: Record<string, string> };
+
 const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
 const DOCUMENT_KEY_PREFIX = "ocx:document:";
@@ -138,6 +143,7 @@ export class LeaseState {
       for (const key of metas.keys()) await this.dropSkills(key.slice(SKILLS_META_PREFIX.length));
     }
     for (const kind of REASONING_METADATA_KINDS) await this.storage.delete(REASONING_METADATA_PREFIX + kind);
+    await this.storage.delete(CLIENT_RUNTIME_KEY);
     for (;;) {
       const metas = await this.storage.list<ModelListMeta>({ prefix: MODEL_LIST_META_PREFIX, limit: 1000 });
       if (metas.size === 0) break;
@@ -292,6 +298,18 @@ export class LeaseState {
       if (typeof stored?.body === "string") out[kind] = stored.body;
     }
     return out;
+  }
+
+  async clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string): Promise<boolean> {
+    if (!(await this.holdsLease(bootId))) return false;
+    await this.storage.put<StoredClientRuntime>(CLIENT_RUNTIME_KEY, { stamp, headers });
+    return true;
+  }
+
+  /** The headers as published under `stamp`; undefined before this deployment's ocx has published. */
+  async clientRuntimeRead(stamp: string): Promise<Record<string, string> | undefined> {
+    const stored = await this.storage.get<StoredClientRuntime>(CLIENT_RUNTIME_KEY);
+    return stored?.stamp === stamp ? stored.headers : undefined;
   }
 
   private async dropModelList(key: string): Promise<void> {

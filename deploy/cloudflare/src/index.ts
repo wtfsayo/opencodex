@@ -175,6 +175,10 @@ export class OpencodexHub extends Container<Env> {
   modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string) {
     return this.leases.modelListCommit(bootId, key, list, seqs, ttlMs, stamp);
   }
+  clientRuntimeRead(stamp: string) { return this.leases.clientRuntimeRead(stamp); }
+  clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string) {
+    return this.leases.clientRuntimeCommit(bootId, headers, stamp);
+  }
   async nativeConfigSource(): Promise<{ config: string | undefined; hasSnapshot: boolean }> {
     return { config: (await this.leases.readDocument("config"))?.body, hasSnapshot: (await this.leases.currentSnapshot()) !== undefined };
   }
@@ -234,6 +238,7 @@ function nativeDeps(env: Env, ctx: ExecutionContext, hub: ReturnType<typeof getC
     secrets: containerEnv(env),
     readAuth: async () => (await hub.readDocument("auth"))?.body,
     reasoningMetadata: () => hub.reasoningMetadataRead(),
+    clientRuntime: async () => hub.clientRuntimeRead(await modelListStamp(env)),
     skills: {
       read: scope => hub.skillsSnapshotRead(scope),
       commit: (scope, block) => { ctx.waitUntil(hub.skillsSnapshotCommit(scope, block).catch(() => {})); },

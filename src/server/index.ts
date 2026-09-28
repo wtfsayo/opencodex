@@ -114,7 +114,7 @@ import {
 } from "./request-log";
 import { sessionLaneIdFromRequest } from "./request-log-conversation";
 import { setUsageLedgerRetention } from "./usage-ledger-retention";
-import { startWorkerUsageInbox } from "../usage/worker-usage-inbox";
+import { startWorkerNativeState } from "./worker-native-state";
 import { admitHttpWorkflowTurn, workflowDecisionRefusalResponse, type WorkflowRefusalLog } from "./workflow-refusal";
 export {
   addFinalRequestLog,
@@ -307,7 +307,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
   // After ownership: a second server on the same home is refused above, so the process running
   // this line is the only one appending to usage.jsonl and the only one that may compact it.
   setUsageLedgerRetention(config.usageLedgerMaxBytes);
-  startWorkerUsageInbox(); // Cloudflare only: rows for turns the Worker served; see worker-usage-inbox.ts.
+  startWorkerNativeState(); // Cloudflare only: usage rows and runtime facts for the Worker; see worker-native-state.ts.
   registerCodexCooldownRecoveryProbeWorker(config);
   // Issue #42 Phase 3: opt-in archived auto-cleanup (default OFF). Unref'd hourly
   // tick for daily/weekly; startup evaluation is fire-and-forget after listen.

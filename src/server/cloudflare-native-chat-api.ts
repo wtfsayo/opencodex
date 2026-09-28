@@ -23,6 +23,11 @@ export type NativeChatDeps = {
    * of its file, "null" when ocx has none, absent when never published.
    */
   reasoningMetadata?(): Promise<{ snapshot?: string; support?: string }>;
+  /**
+   * The Claude Code fingerprint headers naming ocx's runtime, as this deployment's ocx published
+   * them (worker-native-state.ts); undefined until it has.
+   */
+  clientRuntime?(): Promise<Record<string, string> | undefined>;
   /** Called once per served turn, after its last byte; the Worker queues it for ocx's usage log. */
   recordUsage?(row: WorkerUsageRow): void;
   /** Why a request went to the container. Reasons name config keys and fields, never values. */

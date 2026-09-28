@@ -57,9 +57,13 @@ describe("selection capture dependency boundary", () => {
   });
 
   test("the router consumes capture without a direct import of the stateful selection module", () => {
-    const imports = runtimeImports(readFileSync(repoPath("src/router.ts"), "utf8"));
-    expect(imports).toContain("./providers/api-key-selection-capture");
-    expect(imports).not.toContain("./providers/api-key-selection");
+    // routedProviderConfig's body lives in routed-provider-config.ts, which the Cloudflare Worker shares.
+    const router = runtimeImports(readFileSync(repoPath("src/router.ts"), "utf8"));
+    expect(router).toContain("./providers/routed-provider-config");
+    expect(router).not.toContain("./providers/api-key-selection");
+    const routed = runtimeImports(readFileSync(repoPath("src/providers/routed-provider-config.ts"), "utf8"));
+    expect(routed).toContain("./api-key-selection-capture");
+    expect(routed).not.toContain("./api-key-selection");
   });
 
   test("the boundary scanner distinguishes erased types from a runtime dependency", () => {

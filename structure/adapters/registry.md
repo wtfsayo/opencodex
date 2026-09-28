@@ -235,7 +235,7 @@ and exempting them would restore the silent drop the scanner exists to prevent. 
 the decoder share one predicate so a request cannot be exempted here and reduced to a marker
 there.
 
-`src/adapters/input-media-guard.ts` guards adapters created by the registry after effective
+`src/adapters/input-media-guard.ts` guards adapters created by the registry (`registered-adapter.ts`) after effective
 wire selection. A translated `buildRequest` refuses these inputs through the existing 400
 error path; `runTurn` emits one nonretryable `unsupported_input_modality` error without
 starting its underlying transport. `localTerminal` declines a success shortcut for such a

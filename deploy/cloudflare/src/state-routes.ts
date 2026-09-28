@@ -17,6 +17,7 @@ export interface StateHub {
   ackUsage(bootId: string, seqs: readonly number[]): Promise<boolean>;
   modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string): Promise<boolean>;
   reasoningMetadataCommit(bootId: string, kind: ReasoningMetadataKind, body: string, version: number): Promise<boolean>;
+  clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string): Promise<boolean>;
 }
 
 export interface StateBucket {
@@ -47,6 +48,15 @@ export async function sweepOrphans(hub: Pick<StateHub, "currentSnapshot">, bucke
   const orphans = (await bucket.list(snapshotPrefix(namespace), SWEEP_LIMIT)).filter(key => key !== keep);
   for (const key of orphans) await bucket.delete(key);
   return orphans.length;
+}
+
+// client-fingerprint.ts's CLAUDE_CODE_RUNTIME_HEADERS, each a short header-safe value.
+const CLIENT_RUNTIME_HEADERS = ["X-Stainless-Arch", "X-Stainless-OS", "X-Stainless-Runtime-Version"];
+function isClientRuntime(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value);
+  return entries.length === CLIENT_RUNTIME_HEADERS.length
+    && entries.every(([name, text]) => CLIENT_RUNTIME_HEADERS.includes(name) && typeof text === "string" && /^[\x21-\x7e]{1,64}$/.test(text));
 }
 
 /**
@@ -136,6 +146,12 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     if (!Number.isSafeInteger(parsed?.version) || !("value" in parsed)) return new Response("version and value required", { status: 400 });
     const committed = await hub.reasoningMetadataCommit(bootId, reasoningKind as ReasoningMetadataKind, JSON.stringify(parsed.value), parsed.version as number);
     return committed ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
+  }
+  if (path === "/client-runtime" && req.method === "PUT") {
+    let headers: unknown;
+    try { headers = await req.json(); } catch { headers = undefined; }
+    if (!isClientRuntime(headers)) return new Response("the Claude Code runtime headers required", { status: 400 });
+    return (await hub.clientRuntimeCommit(bootId, headers, stamp)) ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
   }
   const document = /^\/documents\/([a-z-]+)$/.exec(path)?.[1];
   if (document !== undefined) {

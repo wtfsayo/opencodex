@@ -7,6 +7,7 @@
 import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 import { appendUsageEntry, isKnownUsageSurface, type PersistedUsageEntry } from "./log";
 import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
+import { sharedSpendLedger } from "../lib/spend-reservation-ledger";
 
 const DRAIN_INTERVAL_MS = 60_000;
 const BATCH = 500;
@@ -51,6 +52,35 @@ const ENTRY_FIELDS = [
   "status", "durationMs", "firstOutputMs", "usageStatus", "totalTokens",
 ] as const;
 
+/**
+ * request-spend.ts books every send in the spend ledger, limits or not, so a ceiling configured
+ * later counts what was already spent. A Worker turn is booked here, as one send already made:
+ * settled with its usage, or unresolved without one. Keyed by the row's request id, so a batch
+ * appended twice is refused as a duplicate send rather than counted twice.
+ */
+function bookWorkerSpend(entry: PersistedUsageEntry): void {
+  try {
+    const ledger = sharedSpendLedger();
+    const sendId = `worker:${entry.requestId}`;
+    const decision = ledger.reserve({
+      sendId,
+      scopes: {
+        ...(entry.accountLogLabel !== undefined ? { identityId: entry.accountLogLabel } : {}),
+        poolId: entry.provider,
+      },
+      inputTokens: entry.usage?.inputTokens ?? 0,
+      outputCeilingTokens: 0,
+      alreadySent: true,
+    });
+    if (!decision.reserved) return;
+    ledger.markDispatched(sendId);
+    if (entry.usage) ledger.settle(sendId, { inputTokens: entry.usage.inputTokens, outputTokens: entry.usage.outputTokens });
+    else ledger.markLost(sendId);
+  } catch (error) {
+    console.warn(`[usage] Worker turn not booked in the spend ledger: ${error instanceof Error ? error.name : "error"}`);
+  }
+}
+
 /** Appends every queued row it can take, acknowledging each batch; returns how many were appended. */
 export function drainWorkerUsageInbox(): Promise<number> {
   draining ??= (async () => {
@@ -64,6 +94,7 @@ export function drainWorkerUsageInbox(): Promise<number> {
         const entry = toEntry(row);
         if (!entry) continue;
         appendUsageEntry(entry);
+        bookWorkerSpend(entry);
         appended++;
       }
       const ack = await stateRequest("/usage-inbox/ack", {

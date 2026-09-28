@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/lib/durable-mirror";
 import { drainWorkerUsageInbox } from "../../src/usage/worker-usage-inbox";
 import { usageLogPath } from "../../src/usage/log";
+import { resetSharedSpendLedgerForTest, sharedSpendLedger } from "../../src/lib/spend-reservation-ledger";
+import { acquireSpendLedgerOwner } from "../../src/lib/spend-ledger-owner";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 let home: string;
@@ -26,6 +28,7 @@ describe("Worker usage inbox", () => {
 
   afterEach(() => {
     setDurableMirrorTransportForTests(null);
+    resetSharedSpendLedgerForTest();
     if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = previousHome;
     if (previousBootId === undefined) delete process.env[DURABLE_STATE_BOOT_ID_ENV];
@@ -90,5 +93,31 @@ describe("Worker usage inbox", () => {
     const [kept, cleaned] = readFileSync(usageLogPath(), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(kept).toMatchObject({ surface: "claude", accountLogLabel: good.accountLogLabel, conversationId: good.conversationId, resolvedModel: "meta/llama", requestedEffort: "high" });
     for (const field of ["surface", "accountLogLabel", "conversationId", "resolvedModel", "requestedEffort", "extra"]) expect(cleaned[field]).toBeUndefined();
+  });
+
+  test("books each Worker turn in the spend ledger once, even when a batch is delivered twice", async () => {
+    process.env[DURABLE_STATE_BOOT_ID_ENV] = "c".repeat(32);
+    resetSharedSpendLedgerForTest();
+    // The running server holds the ledger; so does this test.
+    const owner = acquireSpendLedgerOwner(home);
+    try {
+    const reported = { ...row(4), usageStatus: "reported", usage: { inputTokens: 30, outputTokens: 12 }, totalTokens: 42 };
+    // The first drain appends and then loses its acknowledgement, so the same rows come back.
+    setDurableMirrorTransportForTests({
+      origin: "http://state.test",
+      fetch: async url => url.endsWith("/usage-inbox/ack")
+        ? new Response(null, { status: 500 })
+        : Response.json({ rows: [{ seq: 1, row: reported }, { seq: 2, row: row(5) }] }),
+    });
+    expect(await drainWorkerUsageInbox()).toBe(2);
+    expect(await drainWorkerUsageInbox()).toBe(2);
+    const pool = sharedSpendLedger().snapshot("pool", "workers-ai");
+    expect(pool?.settled).toBe(42);
+    // A turn that reported no usage may still have been billed: unresolved, not free.
+    expect(pool?.unresolved).toBe(0);
+    } finally {
+      resetSharedSpendLedgerForTest();
+      owner.release();
+    }
   });
 });

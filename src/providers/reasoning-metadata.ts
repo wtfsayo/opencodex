@@ -53,6 +53,9 @@ let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let refreshInFlight: Promise<unknown> | null = null;
 
 /** Test seam: drop the memoised snapshot/support caches so a suite can drive the load paths. */
+const PUBLISH_RETRY_MS = [1_000, 5_000, 30_000];
+const publishRetries: Partial<Record<"snapshot" | "support", ReturnType<typeof setTimeout>>> = {};
+
 export function resetReasoningMetadataCachesForTests(): void {
   snapshotMemo = undefined;
   supportMemo = undefined;
@@ -61,6 +64,10 @@ export function resetReasoningMetadataCachesForTests(): void {
     persistTimer = null;
   }
   refreshInFlight = null;
+  for (const kind of ["snapshot", "support"] as const) {
+    clearTimeout(publishRetries[kind]);
+    delete publishRetries[kind];
+  }
 }
 
 let publishVersion = Date.now();
@@ -68,19 +75,34 @@ let publishVersion = Date.now();
 /**
  * On a Cloudflare deployment, hands the Durable Object what this process now holds, so the Worker
  * maps effort from the same caches (reasoning-metadata-core.ts). Refusal rows go without their
- * evidence text; the Worker needs only the keys and times.
+ * evidence text; the Worker needs only the keys and times. A failed publish is retried with
+ * whatever the process holds by then, since the Worker otherwise keeps sending a refused rung.
  */
-function publishForWorker(kind: "snapshot" | "support", value: MetadataSnapshot | null | Map<string, number>): void {
-  if (!durableMirrorEnabled()) return;
+function publishForWorker(kind: "snapshot" | "support", attempt = 0): void {
+  // Only where the Worker serves requests (the Worker sets it; see containerEnv).
+  if (process.env.OCX_WORKER_NATIVE_STATE !== "1" || !durableMirrorEnabled()) return;
+  const value = kind === "snapshot" ? snapshotMemo ?? null : supportMemo;
+  if (kind === "support" && !value) return;
   const body = value instanceof Map
     ? { version: 2, rows: Object.fromEntries([...value].map(([key, at]) => [key, { effort: JSON.parse(key)[3] ?? "", at }])) }
     : value;
   const version = ++publishVersion;
-  stateRequest(`/reasoning-metadata/${kind}`, {
+  const retry = () => {
+    if (attempt >= PUBLISH_RETRY_MS.length || publishRetries[kind]) return;
+    const timer = setTimeout(() => { delete publishRetries[kind]; publishForWorker(kind, attempt + 1); }, PUBLISH_RETRY_MS[attempt]);
+    timer.unref?.();
+    publishRetries[kind] = timer;
+  };
+  const sent = stateRequest(`/reasoning-metadata/${kind}`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ version, value: body }),
-  })?.catch(() => { /* the Worker declines effort turns it has no copy for */ });
+  });
+  sent?.then(response => {
+    void response.body?.cancel();
+    // 409 means another process holds the lease; its own copy is the one that counts.
+    if (!response.ok && response.status !== 409) retry();
+  }, retry);
 }
 
 function readJsonFile<T>(filename: string): T | null {
@@ -148,7 +170,7 @@ function credentialIdentity(provider: OcxProviderConfig): string | undefined {
 function loadSnapshot(): MetadataSnapshot | null {
   if (snapshotMemo !== undefined) return snapshotMemo;
   snapshotMemo = parseMetadataSnapshot(readJsonFile<MetadataSnapshot>(FILENAME));
-  publishForWorker("snapshot", snapshotMemo);
+  publishForWorker("snapshot");
   return snapshotMemo;
 }
 
@@ -198,7 +220,7 @@ function loadSupport(): Map<string, number> {
   // Version 1 rows had no credential identity and are deliberately invalidated: accepting them
   // would preserve destination-wide refusals written by a lower-entitlement account.
   supportMemo = parseSupportRows(readJsonFile<SupportSnapshot>(SUPPORT_FILENAME), nowMs);
-  publishForWorker("support", supportMemo);
+  publishForWorker("support");
   return supportMemo;
 }
 
@@ -260,8 +282,7 @@ export function dropLearnedUnsupportedReasoningEfforts(
  *   returns undefined (status quo) rather than advertising "no effort control".
  */
 export function reasoningEffortsFromMetadata(provider: OcxProviderConfig, modelId: string): string[] | undefined {
-  const credential = metadataProviderKey(provider) ? credentialIdentity(provider) : undefined;
-  return reasoningEffortsFromMetadataIn(loadSnapshot(), loadSupport(), credential, provider, modelId);
+  return reasoningEffortsFromMetadataIn(loadSnapshot(), loadSupport, () => credentialIdentity(provider), provider, modelId);
 }
 
 const supportEvidence = new Map<string, string>();
@@ -284,6 +305,8 @@ export function recordUnsupportedReasoningEffort(
   if (rows.has(rowKey)) return false;
   rows.set(rowKey, Date.now());
   if (evidence) supportEvidence.set(rowKey, evidence.slice(0, 240));
+  // The Worker reads this process's view, not the file, so it learns the refusal before the write.
+  publishForWorker("support");
   if (persistTimer) clearTimeout(persistTimer);
   persistTimer = setTimeout(() => {
     persistTimer = null;
@@ -298,7 +321,7 @@ export function recordUnsupportedReasoningEffort(
         };
       }
       atomicWriteFile(join(getConfigDir(), SUPPORT_FILENAME), JSON.stringify({ version: 2, rows: out }) + "\n");
-      publishForWorker("support", rows);
+      publishForWorker("support");
     } catch {
       // Best-effort persistence only.
     }
@@ -319,7 +342,7 @@ export function flushReasoningSupportCache(): void {
       out[rowKey] = { effort: JSON.parse(rowKey)[3] ?? "", at, ...(evidenceText ? { evidence: evidenceText } : {}) };
     }
     atomicWriteFile(join(getConfigDir(), SUPPORT_FILENAME), JSON.stringify({ version: 2, rows: out }) + "\n");
-    publishForWorker("support", rows);
+    publishForWorker("support");
   } catch {
     // Best-effort persistence only.
   }
@@ -481,7 +504,7 @@ export async function refreshReasoningMetadata(options: { force?: boolean; waitM
     const next: MetadataSnapshot = { version: 2, fetchedAt: Date.now(), source: SOURCE_URL, providers, apis };
     atomicWriteFile(join(getConfigDir(), FILENAME), JSON.stringify(next) + "\n");
     snapshotMemo = next;
-    publishForWorker("snapshot", next);
+    publishForWorker("snapshot");
     return { ok: true, reason: "refreshed", providers: Object.keys(providers).length, models };
   })();
   refreshInFlight = job.catch(() => undefined).finally(() => { refreshInFlight = null; });

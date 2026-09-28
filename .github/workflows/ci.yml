@@ -344,6 +344,8 @@ jobs:
               - 'src/server/cloudflare-native*.ts'
               - 'src/server/model-list-replay*.ts'
               - 'src/integrations/cursor-seen.ts'
+              - 'src/providers/reasoning-metadata*.ts'
+              - 'src/server/ws-frames.ts'
               - 'src/server/collab-surface.ts'
               - 'src/lib/model-record.ts'
               - 'src/lib/durable-mirror.ts'
@@ -1243,7 +1245,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Cloudflare deploy unit test
-        run: bun test tests/service/cloudflare-deploy.test.ts tests/service/cloudflare-worker-native.test.ts tests/service/cloudflare-worker-native-responses.test.ts tests/service/cloudflare-worker-native-messages.test.ts tests/service/cloudflare-model-list-replay.test.ts
+        run: bun test tests/service/cloudflare-deploy.test.ts tests/service/cloudflare-worker-native*.test.ts tests/service/cloudflare-model-list-replay.test.ts
 
   # `gates` already runs `privacy:scan` on every event it runs for, so this job
   # covers exactly the pull requests `gates` skips -- its condition is the

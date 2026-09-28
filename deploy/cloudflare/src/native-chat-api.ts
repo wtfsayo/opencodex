@@ -10,3 +10,4 @@ export declare const serveNativeResponses: ServeNativeChat;
 export declare const serveNativeMessages: ServeNativeChat;
 export declare const modelListReplayKey: ModelListReplayKey;
 export declare const createNativeWsSession: CreateNativeWsSession;
+export declare const nativeConfigAdmitted: (config: unknown) => boolean;

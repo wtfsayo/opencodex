@@ -1,4 +1,4 @@
-// On a Cloudflare deployment whose Worker replays model lists (OCX_WORKER_MODEL_LISTS, set by the
+// On a Cloudflare deployment whose Worker replays model lists (OCX_WORKER_NATIVE_STATE, set by the
 // Worker), hands each GET /v1/models answer to the Durable Object so the Worker can give it without
 // starting the container (deploy/cloudflare/src/index.ts). An answer is published only while it is
 // the one this process would give again: until the first moment it would refetch any input, and
@@ -85,7 +85,7 @@ async function publish(url: URL, headers: Headers, response: Response, config: O
  * entitlements this process resolves from the network.
  */
 export function modelListReplay(req: Request, url: URL, admission: DataPlaneAdmission, config: OcxConfig): (response: Response) => Response {
-  if (process.env.OCX_WORKER_MODEL_LISTS !== "1" || !durableMirrorEnabled() || admission.kind !== "environment") return response => response;
+  if (process.env.OCX_WORKER_NATIVE_STATE !== "1" || !durableMirrorEnabled() || admission.kind !== "environment") return response => response;
   if (shouldIncludeNativeOpenAi(config) || shouldIncludeAccountBoundNativeOpenAi(config)) return response => response;
   if (modelListReplayInputs(url, req.headers) === undefined) return response => response;
   const before = JSON.stringify(mirroredSequences() ?? null);

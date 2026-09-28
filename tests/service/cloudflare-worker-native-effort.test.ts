@@ -38,13 +38,14 @@ function memoryStorage(): LeaseStorage {
 describe("Worker-native effort for models.dev destinations", () => {
   let home = "";
   let hub: LeaseState;
-  const saved = { home: process.env.OPENCODEX_HOME, bootId: process.env[DURABLE_STATE_BOOT_ID_ENV] };
+  const saved = { home: process.env.OPENCODEX_HOME, bootId: process.env[DURABLE_STATE_BOOT_ID_ENV], flag: process.env.OCX_WORKER_NATIVE_STATE };
   const originalFetch = globalThis.fetch;
 
   beforeEach(async () => {
     home = mkdtempSync(join(tmpdir(), "ocx-worker-effort-"));
     process.env.OPENCODEX_HOME = home;
     process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
+    process.env.OCX_WORKER_NATIVE_STATE = "1";
     resetReasoningMetadataCachesForTests();
     hub = new LeaseState(memoryStorage());
     await hub.acquireLease(BOOT_ID);
@@ -67,7 +68,7 @@ describe("Worker-native effort for models.dev destinations", () => {
     globalThis.fetch = originalFetch;
     setDurableMirrorTransportForTests(null);
     resetReasoningMetadataCachesForTests();
-    for (const [name, value] of [["OPENCODEX_HOME", saved.home], [DURABLE_STATE_BOOT_ID_ENV, saved.bootId]] as const) {
+    for (const [name, value] of [["OPENCODEX_HOME", saved.home], [DURABLE_STATE_BOOT_ID_ENV, saved.bootId], ["OCX_WORKER_NATIVE_STATE", saved.flag]] as const) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
@@ -137,6 +138,14 @@ describe("Worker-native effort for models.dev destinations", () => {
     expect(await run(async () => ({ snapshot: "{", support: "{}" }))).toEqual(["responses:reasoning-metadata-unreadable"]);
     // ocx with no snapshot maps as if the destination had no metadata; so does the Worker.
     expect(await run(async () => ({ snapshot: "null", support: "{}" }))).toEqual([]);
+  });
+
+  test("ocx publishes nothing where the Worker does not serve requests", async () => {
+    delete process.env.OCX_WORKER_NATIVE_STATE;
+    const { reasoningEffortsFromMetadata } = await import("../../src/providers/reasoning-metadata");
+    expect(reasoningEffortsFromMetadata(zen as never, "m-1")).toBeDefined();
+    await Bun.sleep(20);
+    expect(await hub.reasoningMetadataRead()).toEqual({});
   });
 
   test("the store keeps the newest version from one process and takes any from a new one", async () => {

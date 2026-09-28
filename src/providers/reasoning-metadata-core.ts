@@ -126,7 +126,7 @@ export function dropLearnedIn(
  * removed, and a ladder emptied by that learning returns undefined.
  */
 export function reasoningEffortsFromMetadataIn(
-  snapshot: MetadataSnapshot | null, support: ReadonlyMap<string, number>, credential: string | undefined,
+  snapshot: MetadataSnapshot | null, support: () => ReadonlyMap<string, number>, credential: () => string | undefined,
   provider: OcxProviderConfig, modelId: string,
 ): string[] | undefined {
   let ladder = metadataEffortValuesIn(snapshot, provider, modelId);
@@ -136,7 +136,10 @@ export function reasoningEffortsFromMetadataIn(
     ladder = classified ? CLASSIFIED_STYLE_EFFORTS : undefined;
   }
   if (!ladder || ladder.length === 0) return undefined;
-  const kept = ladder.filter(effort => !learnedUnsupportedIn(support, credential, provider, modelId, effort));
+  // Read only once a ladder exists: the credential may come from the OS keychain.
+  const refused = support();
+  const identity = metadataProviderKey(provider) ? credential() : undefined;
+  const kept = ladder.filter(effort => !learnedUnsupportedIn(refused, identity, provider, modelId, effort));
   return kept.length === 0 ? undefined : kept;
 }
 
@@ -151,7 +154,7 @@ export function metadataAccessFrom(
     dropLearned: (provider, modelId, efforts) =>
       metadataProviderKey(provider) ? dropLearnedIn(support, credential(provider), provider, modelId, efforts) : [...efforts],
     fromMetadata: (provider, modelId) =>
-      reasoningEffortsFromMetadataIn(snapshot, support, metadataProviderKey(provider) ? credential(provider) : undefined, provider, modelId),
+      reasoningEffortsFromMetadataIn(snapshot, () => support, () => credential(provider), provider, modelId),
     ensureSnapshot: () => {},
   };
 }

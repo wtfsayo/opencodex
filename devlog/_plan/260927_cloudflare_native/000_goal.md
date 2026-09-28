@@ -254,8 +254,11 @@ OpenCode key.
 Responses WebSocket (branch `feat/cloudflare-worker-ws`): with `websockets` on, the Worker holds the
 socket and runs a session (`src/server/cloudflare-native-ws.ts`) that answers each `response.create`
 its Responses turn can serve with ocx's framing (empty response id, SSE payloads as text frames, the
-same errors, warm-ups and limits) and relays any other frame to ocx over a socket to the container
-opened on first use. A new frame supersedes the socket's turn in either place. Real Codex CLI
+same errors, warm-ups and limits). From the first frame it cannot serve, it relays every frame of
+that socket to ocx over a socket to the container. The first version tracked whose turn was current
+frame by frame; review showed ocx sends error frames mid-turn and several completions under native
+steering, so that tracking could interleave two turns. Relaying the rest of the session is exact by
+construction, at the cost of the container staying up for it. Real Codex CLI
 0.157.1 with `supports_websockets=true` on `opencodex-wo2-test` completed a shell tool loop in 8.9 s
 over one socket; the Worker log shows only the upgrade, `nativeConfigSource` and `enqueueUsage`, no
 container traffic. A frame with `previous_response_id` was declined by the Worker and answered by

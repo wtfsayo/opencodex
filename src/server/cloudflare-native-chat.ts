@@ -39,7 +39,9 @@ const CONFIG_KEYS = new Set([
   "multiAgentSurfaceAdvisoryVersion", "apiKeys", "subagentModels",
   // Caps the retained state (logs, caches, continuations) of the container process; no module on
   // the native chat lane consults it, so it shapes the container's load, not this turn.
-  "appOwnedMemoryBudgetMb", "websockets",
+  "appOwnedMemoryBudgetMb",
+  // Only opens the Responses WebSocket transport, whose frames run as these same turns.
+  "websockets",
 ]);
 const RESERVED_NAMESPACES = new Set(["policy", "combo"]);
 // chat-native.ts: config.connectTimeoutMs ?? 200_000; a config that sets it is declined.
@@ -129,6 +131,11 @@ export function resolveNativeChatRoute(
 export function withOpenCodeGoSession(route: NativeChatRoute, headers: Headers, lane?: string): NativeChatRoute {
   const sessionLane = lane ?? getOrAllocateRequestSessionLane(new Request("http://worker.invalid/", { headers }));
   return { ...route, provider: resolveOpenCodeGoTransport(route.provider, sessionLane, route.provider) };
+}
+
+/** Whether a config has only the keys this path reproduces; any other key declines every turn. */
+export function nativeConfigAdmitted(config: unknown): boolean {
+  return isRec(config) && isRec(config.providers) && Object.keys(config).every(key => CONFIG_KEYS.has(key));
 }
 
 /** The usage-row fields ocx fills from the route (providers/label.ts labels the key). */

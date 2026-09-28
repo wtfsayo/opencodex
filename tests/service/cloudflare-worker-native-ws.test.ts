@@ -112,7 +112,8 @@ describe("Worker-held Responses WebSocket", () => {
       socket.addEventListener("message", event => received.push(String(event.data)));
       await new Promise((resolve, reject) => { socket.addEventListener("open", resolve); socket.addEventListener("error", reject); });
       for (const frame of frames) socket.send(JSON.stringify(frame));
-      await settle(() => received.length >= expected);
+      // Every case ends with a turn's terminal frame; the count alone can stop at an early error.
+      await settle(() => received.length >= expected && received.some(frame => /"type":"response\.(completed|failed|incomplete)"/.test(frame)));
       socket.close();
     } finally {
       await server.stop(true);
@@ -138,7 +139,7 @@ describe("Worker-held Responses WebSocket", () => {
     });
   }
 
-  test("relays a frame its turn cannot serve to ocx, and passes ocx's frames back", async () => {
+  test("relays a frame its turn cannot serve to ocx, and every frame after it, passing ocx's frames back", async () => {
     const answer = (frame: Rec) => frame.type === "response.create"
       ? [JSON.stringify({ type: "response.created", response: { id: "" } }), JSON.stringify({ type: "response.completed", response: { id: "" } })]
       : [];
@@ -149,32 +150,39 @@ describe("Worker-held Responses WebSocket", () => {
     await settle(() => worker.sent.length >= 2);
     expect(worker.relayed).toEqual([JSON.stringify(relayedFrame)]);
     expect(worker.sent.map(frame => (JSON.parse(frame) as Rec).type)).toEqual(["response.created", "response.completed"]);
-    // ocx's turn has ended, so the next servable frame is the Worker's and ocx's socket stays open.
+    // From here ocx holds the socket's turns: it alone knows whether a frame continues its own.
     worker.session.receive(JSON.stringify(create()));
-    await settle(() => worker.sent.some((frame, index) => index > 1 && frame.includes("response.completed")));
-    expect(worker.relayed).toHaveLength(1);
+    worker.session.receive(JSON.stringify({ type: "response.steer", input: [] }));
+    await settle(() => worker.relayed.length === 3);
+    expect(worker.relayed.map(frame => (JSON.parse(frame) as Rec).type)).toEqual(["response.create", "response.create", "response.steer"]);
+    expect(worker.containers).toHaveLength(1);
     expect(worker.closedContainers.size).toBe(0);
   });
 
-  test("a new frame supersedes ocx's turn: its later frames are dropped and its socket closed", async () => {
-    let release!: () => void;
-    const held = new Promise<void>(resolve => { release = resolve; });
-    const worker = workerSession(textReply);
-    worker.session.receive(JSON.stringify(create({ previous_response_id: "resp_1" })));
-    await settle(() => worker.relayed.length === 1);
-    const oldTurn = worker.containers[0]!;
-    worker.session.fromContainer(oldTurn, JSON.stringify({ type: "response.created", response: { id: "" } }));
-    worker.session.receive(JSON.stringify(create()));
-    // A frame ocx sent for the superseded turn after the new one arrived.
-    worker.session.fromContainer(oldTurn, JSON.stringify({ type: "response.output_text.delta", delta: "stale" }));
-    release();
-    await held;
-    await settle(() => worker.sent.some(frame => frame.includes("response.completed")));
-    expect(worker.sent.some(frame => frame.includes("stale"))).toBe(false);
-    expect(worker.closedContainers.has(oldTurn)).toBe(true);
-    // Closing it ourselves is not ocx closing the client's socket.
-    worker.session.containerClosed(oldTurn, 1000, "superseded");
-    expect(worker.closes).toEqual([]);
+  test("a frame too large for the Worker goes to ocx unparsed, stopping the Worker's own turn", async () => {
+    let upstreamSignal: AbortSignal | undefined;
+    const sent: string[] = [];
+    const relayed: string[] = [];
+    const session = createNativeWsSession({
+      send: text => sent.push(text),
+      close: () => {},
+      openContainer: () => ({ send: text => relayed.push(text), close: () => {} }),
+    }, new Headers(), {
+      readConfig: async () => workerConfig,
+      // An upstream that has not answered yet, and gives up when aborted as fetch does.
+      fetch: async request => {
+        upstreamSignal = request.signal;
+        return new Promise<Response>((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("aborted"))));
+      },
+    });
+    session.receive(JSON.stringify(create()));
+    await settle(() => upstreamSignal !== undefined);
+    const large = JSON.stringify(create({ instructions: "x".repeat(5 * 1024 * 1024) }));
+    session.receive(large);
+    await settle(() => relayed.length === 1);
+    expect(relayed[0] === large).toBe(true);
+    expect(upstreamSignal!.aborted).toBe(true);
+    expect(sent).toEqual([]);
   });
 
   test("ocx closing its socket closes the client's, and an oversized frame closes it with 1009", async () => {

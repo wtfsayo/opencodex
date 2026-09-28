@@ -36,5 +36,4 @@ export function injectionResults(value: unknown): FunctionResult[] {
   }
   return value as FunctionResult[];
 }
-/** Detect explicit multi-agent opt-in without inferring it from the model name. */
 export { isInjectionRequest } from "./native-steering-availability";

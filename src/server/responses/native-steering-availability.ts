@@ -2,6 +2,7 @@
 // Its own module so the Cloudflare Worker, which holds that socket too, reports the same reason.
 import { nativeResponseRecord as injectionRecord } from "./native-response-json";
 
+/** Detect explicit multi-agent opt-in without inferring it from the model name. */
 export function isInjectionRequest(frame: Record<string, unknown>): boolean {
   return injectionRecord(frame.multi_agent) && frame.multi_agent.enabled === true;
 }

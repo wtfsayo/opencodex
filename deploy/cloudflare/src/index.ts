@@ -5,7 +5,7 @@ import {
 } from "./container-env";
 import { type DocumentSeqs, type DurableDocument, LeaseState, type ModelList, type ReasoningMetadataKind } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
-import { createNativeWsSession, modelListReplayKey, serveNativeChat, serveNativeMessages, serveNativeResponses, type NativeChatDeps } from "ocx-worker-native";
+import { createNativeWsSession, modelListReplayKey, nativeConfigAdmitted, serveNativeChat, serveNativeMessages, serveNativeResponses, type NativeChatDeps } from "ocx-worker-native";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
@@ -290,6 +290,11 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   return { forward: new Request(req, { body: bodyBytes }) };
 }
 
+// ocx's live relay holds at most 32 frames and 1 MiB before its upstream opens (live-sideband.ts);
+// a Responses frame is larger, so the byte bound is the Worker's own.
+const MAX_PENDING_RELAY_FRAMES = 32;
+const MAX_PENDING_RELAY_BYTES = 16 * 1024 * 1024;
+
 // Close codes a socket may send (1005 and 1006 are only ever reported, never sent).
 const sendableCloseCode = (code: number) => (code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) || (code >= 3000 && code <= 4999);
 
@@ -308,47 +313,71 @@ async function tryWorkerWebSocket(req: Request, env: Env, ctx: ExecutionContext)
   const configText = nativeConfigText(source.config, source.hasSnapshot, env);
   let config: unknown;
   try { config = configText ? JSON.parse(configText) : undefined; } catch { config = undefined; }
-  if (!config || typeof config !== "object" || (config as { websockets?: unknown }).websockets !== true) return null;
+  // ocx refuses the upgrade without `websockets`; a config with keys the Worker's turn declines
+  // would send every frame to ocx anyway, so ocx holds that socket itself.
+  if (!nativeConfigAdmitted(config) || (config as { websockets?: unknown }).websockets !== true) return null;
 
   const pair = new WebSocketPair();
   const [client, server] = [pair[0], pair[1]];
   server.accept();
-  const upgradeUrl = req.url;
-  const upgradeHeaders = new Headers(req.headers);
-  const session = createNativeWsSession({
-    send: text => server.send(text),
-    close: (code, reason) => server.close(sendableCloseCode(code) ? code : 1011, reason),
-    openContainer: () => {
-      let socket: WebSocket | undefined;
-      let closing = false;
-      const pending: string[] = [];
-      const handle = {
-        send: (text: string) => { if (socket) socket.send(text); else pending.push(text); },
-        close: () => { closing = true; socket?.close(1000, "superseded"); },
-      };
-      void getContainer(env.HUB, HUB_NAME).fetch(forwardableRequest(new Request(upgradeUrl, { headers: upgradeHeaders })))
-        .then(response => {
+  try {
+    const upgradeUrl = req.url;
+    const upgradeHeaders = new Headers(req.headers);
+    const session = createNativeWsSession({
+      send: text => server.send(text),
+      close: (code, reason) => server.close(sendableCloseCode(code) ? code : 1011, reason),
+      openContainer: () => {
+        let socket: WebSocket | undefined;
+        let closing = false;
+        let pending: string[] = [];
+        let pendingBytes = 0;
+        const handle = {
+          send: (text: string) => {
+            if (socket) { socket.send(text); return; }
+            // Frames that arrive while the container starts; bounded as ocx's live relay bounds its own.
+            pending.push(text);
+            pendingBytes += text.length;
+            if (pending.length > MAX_PENDING_RELAY_FRAMES || pendingBytes > MAX_PENDING_RELAY_BYTES) {
+              pending = [];
+              session.containerClosed(handle, 1013, "too many frames while opencodex starts");
+            }
+          },
+          close: () => { closing = true; pending = []; socket?.close(1000, "closed"); },
+        };
+        void (async () => {
+          const container = getContainer(env.HUB, HUB_NAME);
+          // As the forwarding path does: a stale object resets before it takes the socket.
+          await container.assertCurrentVersion(env.CF_VERSION?.timestamp).catch(() => {});
+          const response = await container.fetch(forwardableRequest(new Request(upgradeUrl, { headers: upgradeHeaders })));
           const opened = response.webSocket;
           if (!opened) {
+            await response.body?.cancel().catch(() => {});
             session.containerClosed(handle, response.status === 503 ? 1013 : 1011, `opencodex refused the socket (HTTP ${response.status})`);
             return;
           }
           opened.accept();
+          if (closing) { opened.close(1000, "closed"); return; }
           socket = opened;
           opened.addEventListener("message", event => {
             session.fromContainer(handle, typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer));
           });
           opened.addEventListener("close", event => session.containerClosed(handle, event.code, event.reason));
           for (const text of pending.splice(0)) opened.send(text);
-          if (closing) opened.close(1000, "superseded");
-        })
-        .catch(() => session.containerClosed(handle, 1013, "opencodex is restarting; retry shortly."));
-      return handle;
-    },
-  }, req.headers, nativeDeps(env, ctx, hub));
-  server.addEventListener("message", event => session.receive(event.data as string | ArrayBuffer));
-  server.addEventListener("close", () => session.closed());
-  server.addEventListener("error", () => session.closed());
+          pendingBytes = 0;
+        })().catch(() => session.containerClosed(handle, 1013, "opencodex is restarting; retry shortly."));
+        return handle;
+      },
+    }, req.headers, nativeDeps(env, ctx, hub));
+    server.addEventListener("message", event => session.receive(event.data as string | ArrayBuffer));
+    server.addEventListener("close", event => {
+      session.closed();
+      try { server.close(sendableCloseCode(event.code) ? event.code : 1000, event.reason); } catch { /* already closed */ }
+    });
+    server.addEventListener("error", () => session.closed());
+  } catch (error) {
+    console.error(`Worker-native WebSocket setup failed: ${error instanceof Error ? error.message : String(error)}`);
+    server.close(1011, "opencodex could not start the session");
+  }
   return new Response(null, { status: 101, webSocket: client });
 }
 

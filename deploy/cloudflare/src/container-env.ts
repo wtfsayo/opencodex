@@ -17,7 +17,7 @@ export type SecretSource = {
 const REFUSED_PASSTHROUGH = new Set([
   "HOME", "OPENCODEX_HOME", "CODEX_HOME", "TMPDIR", "PATH", "NODE_ENV", "NODE_OPTIONS", "BUN_OPTIONS",
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
-  "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "OCX_WORKER_MODEL_LISTS",
+  "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "OCX_WORKER_NATIVE_STATE",
 ]);
 const warnedRefusals = new Set<string>();
 
@@ -42,8 +42,9 @@ export function containerEnv(env: SecretSource): Record<string, string> {
     OPENCODEX_ADMIN_AUTH_TOKEN: env.OPENCODEX_ADMIN_AUTH_TOKEN,
     OCX_BOOTSTRAP_CONFIG_JSON: env.OCX_BOOTSTRAP_CONFIG_JSON,
     OCX_SNAPSHOT_INTERVAL_SECONDS: env.OCX_SNAPSHOT_INTERVAL_SECONDS,
-    // Tells ocx to hand its model lists to the Durable Object, only where the Worker replays them.
-    OCX_WORKER_MODEL_LISTS: env.OCX_WORKER_NATIVE?.trim() === "1" && env.OCX_EDGE_KEY_CHECK?.trim() !== "presence" ? "1" : undefined,
+    // Tells ocx to hand the Durable Object the state the Worker-native paths read (model lists,
+    // effort caches), only where the Worker serves requests.
+    OCX_WORKER_NATIVE_STATE: env.OCX_WORKER_NATIVE?.trim() === "1" && env.OCX_EDGE_KEY_CHECK?.trim() !== "presence" ? "1" : undefined,
   };
   return Object.fromEntries([...passthrough, ...Object.entries(fixed)].filter((entry): entry is [string, string] => !!entry[1]));
 }

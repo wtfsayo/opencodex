@@ -196,10 +196,16 @@ it sends, for four idle hours; the two keep separate copies (the Worker's in the
 turns alternate between them can see both versions.
 
 With `websockets` on in the config, Codex can hold a WebSocket to `/v1/responses` instead of
-sending each turn over HTTP. The Worker then holds that socket itself (same token rule, no
-`Origin`): it answers each `response.create` it can serve as above, with the same frames `ocx`
-sends, and passes any other to `ocx` over a socket of its own to the container, relaying `ocx`'s
-frames back. A turn `ocx` is running on the socket keeps its steering and injection frames.
+sending each turn over HTTP. When the config has nothing beyond the settings listed above, the
+Worker holds that socket itself (same token rule, no `Origin`) and answers each `response.create`
+it can serve with the same frames `ocx` sends. At the first frame it cannot serve, it opens a
+socket of its own to `ocx` and relays that frame and every later one on the client's socket, so
+`ocx` handles the rest of that session as it would its own socket, steering and injection
+included. That session then keeps the container awake until Codex closes the socket, and a
+container restart closes the client's socket, which Codex reopens. `ocx` refusing that socket
+mid-session (for example because `websockets` was turned off meanwhile) also closes the client's
+socket; Codex falls back to HTTP only when the refusal comes at connect time, which is when `ocx`
+holds the socket itself.
 
 And it answers `POST /v1/messages`, the API Claude Code uses, when `model` is one of the aliases
 `ocx` lists for Claude Code (`ocx-claude-<provider>--<model>`, or `ocx-claude2-…` for a model id

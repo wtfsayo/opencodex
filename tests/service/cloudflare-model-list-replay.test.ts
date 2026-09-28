@@ -132,11 +132,11 @@ describe("model list store in the Durable Object", () => {
 
   test("ocx is told to publish only where the Worker replays, and the stamp follows the environment", async () => {
     const env = { OPENCODEX_API_AUTH_TOKEN: DATA_TOKEN, CF_VERSION: { id: "v1" } };
-    expect(containerEnv({ ...env, OCX_WORKER_NATIVE: "1" }).OCX_WORKER_MODEL_LISTS).toBe("1");
-    expect(containerEnv(env).OCX_WORKER_MODEL_LISTS).toBeUndefined();
-    expect(containerEnv({ ...env, OCX_WORKER_NATIVE: "1", OCX_EDGE_KEY_CHECK: "presence" }).OCX_WORKER_MODEL_LISTS).toBeUndefined();
+    expect(containerEnv({ ...env, OCX_WORKER_NATIVE: "1" }).OCX_WORKER_NATIVE_STATE).toBe("1");
+    expect(containerEnv(env).OCX_WORKER_NATIVE_STATE).toBeUndefined();
+    expect(containerEnv({ ...env, OCX_WORKER_NATIVE: "1", OCX_EDGE_KEY_CHECK: "presence" }).OCX_WORKER_NATIVE_STATE).toBeUndefined();
     // Only the Worker sets it: a passthrough secret of that name is refused.
-    expect(containerEnv({ ...env, OCX_PASSTHROUGH_SECRETS: "OCX_WORKER_MODEL_LISTS", OCX_WORKER_MODEL_LISTS: "1" } as never).OCX_WORKER_MODEL_LISTS).toBeUndefined();
+    expect(containerEnv({ ...env, OCX_PASSTHROUGH_SECRETS: "OCX_WORKER_NATIVE_STATE", OCX_WORKER_NATIVE_STATE: "1" } as never).OCX_WORKER_NATIVE_STATE).toBeUndefined();
     const stamp = await modelListStamp(env);
     expect(await modelListStamp({ ...env, CF_VERSION: { id: "v2" } })).not.toBe(stamp);
     expect(await modelListStamp({ ...env, OCX_BOOTSTRAP_CONFIG_JSON: "{}" })).not.toBe(stamp);
@@ -153,7 +153,7 @@ describe("ocx publishes its /v1/models answers for the Worker", () => {
     home: process.env.OPENCODEX_HOME,
     token: process.env.OPENCODEX_API_AUTH_TOKEN,
     bootId: process.env[DURABLE_STATE_BOOT_ID_ENV],
-    flag: process.env.OCX_WORKER_MODEL_LISTS,
+    flag: process.env.OCX_WORKER_NATIVE_STATE,
   };
   const clock = { offset: 0 };
   let hub: LeaseState;
@@ -172,7 +172,7 @@ describe("ocx publishes its /v1/models answers for the Worker", () => {
     process.env.OPENCODEX_HOME = home;
     process.env.OPENCODEX_API_AUTH_TOKEN = DATA_TOKEN;
     process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
-    process.env.OCX_WORKER_MODEL_LISTS = "1";
+    process.env.OCX_WORKER_NATIVE_STATE = "1";
     clearModelCache();
     clock.offset = 0;
     upstreamModelsOk = true;
@@ -208,7 +208,7 @@ describe("ocx publishes its /v1/models answers for the Worker", () => {
     clearModelCache();
     await upstream?.stop(true);
     for (const [name, value] of [
-      ["OPENCODEX_HOME", saved.home], ["OPENCODEX_API_AUTH_TOKEN", saved.token], [DURABLE_STATE_BOOT_ID_ENV, saved.bootId], ["OCX_WORKER_MODEL_LISTS", saved.flag],
+      ["OPENCODEX_HOME", saved.home], ["OPENCODEX_API_AUTH_TOKEN", saved.token], [DURABLE_STATE_BOOT_ID_ENV, saved.bootId], ["OCX_WORKER_NATIVE_STATE", saved.flag],
     ] as const) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
@@ -268,10 +268,10 @@ describe("ocx publishes its /v1/models answers for the Worker", () => {
     published = [];
     await modelsThroughOcx("/v1/models", { authorization: `Bearer ${DATA_TOKEN}`, "user-agent": "Cursor/1.0" });
     expect(published).toEqual([]);
-    delete process.env.OCX_WORKER_MODEL_LISTS;
+    delete process.env.OCX_WORKER_NATIVE_STATE;
     await modelsThroughOcx("/v1/models", openaiList);
     expect(published).toEqual([]);
-    process.env.OCX_WORKER_MODEL_LISTS = "1";
+    process.env.OCX_WORKER_NATIVE_STATE = "1";
     // Native rows depend on Codex entitlements ocx resolves from the network: with an OpenAI
     // provider, and with no enabled provider at all (ocx then lists only native rows).
     for (const providers of [

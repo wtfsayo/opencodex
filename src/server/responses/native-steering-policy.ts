@@ -1,5 +1,6 @@
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../types";
-import { nativeEffortClamp, shouldApplyNativeEffortClamp } from "../../codex/catalog";
+import { catalogModelSupportsReasoningSummaries, nativeEffortClamp, shouldApplyNativeEffortClamp } from "../../codex/catalog";
+import { DISK_METADATA } from "../../reasoning-effort";
 import { applyEffortCap, applyPinnedEffort, effortCapAppliesTo, prepareEffortNormalization, stripEmptyLadderEffort, supportedLadderFor } from "../effort-policy";
 import { collabSurface } from "./collaboration";
 import { mapRoutedResponsesReasoningEffort, normalizeConfiguredReasoningSummaryDelivery,
@@ -36,11 +37,11 @@ export function createSteeringSettingsNormalizer(
       const clamp = shouldApplyNativeEffortClamp(route.providerName, route.provider, route.modelId)
         ? nativeEffortClamp(route.modelId, candidate.options.reasoning) : null;
       if (clamp && record(body.reasoning)) body.reasoning.effort = clamp;
-      body = mapRoutedResponsesReasoningEffort(body, route.provider, route.modelId) as Frame;
+      body = mapRoutedResponsesReasoningEffort(body, route.provider, route.modelId, DISK_METADATA) as Frame;
       body.reasoning = stripEmptyLadderEffort(body.reasoning, supportedLadderFor(route));
     }
     body = stripDisabledVerbosity(stripDisabledReasoningSummaries(
-      normalizeConfiguredReasoningSummaryDelivery(stripUnsupportedReasoningSummaryDelivery(body, route.modelId), route.provider, route.modelId),
+      normalizeConfiguredReasoningSummaryDelivery(stripUnsupportedReasoningSummaryDelivery(body, route.modelId, catalogModelSupportsReasoningSummaries), route.provider, route.modelId),
       route.provider, route.modelId), route.provider, route.modelId) as Frame;
     const next = { ...frame };
     for (const key of STEERING_MUTABLE_SETTINGS) if (Object.hasOwn(frame, key)) next[key] = body[key];

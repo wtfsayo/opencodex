@@ -4,7 +4,7 @@ import { configuredReasoningEffortsWith, mapReasoningEffortWith, type ReasoningM
 
 export * from "./reasoning-effort-core";
 
-const DISK_METADATA: ReasoningMetadataAccess = {
+export const DISK_METADATA: ReasoningMetadataAccess = {
   dropLearned: dropLearnedUnsupportedReasoningEfforts,
   fromMetadata: reasoningEffortsFromMetadata,
   ensureSnapshot: ensureReasoningMetadataSnapshot,

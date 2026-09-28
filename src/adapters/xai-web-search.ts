@@ -1,6 +1,6 @@
 import type { OcxProviderConfig } from "../types";
 import { debugProviderDiagnostic } from "../lib/debug";
-import { isXaiResponsesDestination } from "../providers/xai-transport";
+import { isXaiResponsesDestination } from "../providers/xai-destination";
 import { isOpenCodeGoResponsesUrl } from "./opencode-go-additional-tools";
 
 const CODEX_WEB_SEARCH_TOOL = "web_search";

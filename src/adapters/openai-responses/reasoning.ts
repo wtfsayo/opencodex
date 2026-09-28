@@ -1,7 +1,6 @@
 import { namespacedToolName, type AdapterEvent, type OcxParsedRequest, type OcxProviderConfig, type OcxUsage, type TierDecision } from "../../types";
-import { catalogModelSupportsReasoningSummaries } from "../../codex/catalog";
 import { OCX_REASONING_PREFIX } from "../../responses/reasoning-envelope";
-import { configuredReasoningEfforts, mapReasoningEffort, modelRecordValue } from "../../reasoning-effort";
+import { configuredReasoningEffortsWith, mapReasoningEffortWith, modelRecordValue, type ReasoningMetadataAccess } from "../../reasoning-effort-core";
 import { isPlainObject } from "./internal";
 
 /** Drop only replayed Responses reasoning items; all other continuation input stays untouched. */
@@ -156,8 +155,13 @@ export function sanitizeReasoningInputContent(
   return changed ? { ...raw, input } : body;
 }
 
-export function stripUnsupportedReasoningSummaryDelivery(body: unknown, modelId: string): unknown {
-  if (catalogModelSupportsReasoningSummaries(modelId) !== false) return body;
+/** `supportsSummaries` is the Codex catalog's answer (catalogModelSupportsReasoningSummaries). */
+export function stripUnsupportedReasoningSummaryDelivery(
+  body: unknown,
+  modelId: string,
+  supportsSummaries: (modelId: string) => boolean | undefined,
+): unknown {
+  if (supportsSummaries(modelId) !== false) return body;
   if (!isPlainObject(body) || !isPlainObject(body.stream_options)) return body;
   if (!("reasoning_summary_delivery" in body.stream_options)) return body;
 
@@ -264,9 +268,10 @@ export function mapRoutedResponsesReasoningEffort(
   body: unknown,
   provider: OcxProviderConfig,
   modelId: string,
+  metadata: ReasoningMetadataAccess,
 ): unknown {
   if (provider.authMode === "forward") return body;
-  if (configuredReasoningEfforts(provider, modelId) === undefined) return body;
+  if (configuredReasoningEffortsWith(provider, modelId, metadata) === undefined) return body;
   if (!isPlainObject(body) || !isPlainObject(body.reasoning)) return body;
   const declaredEfforts = modelRecordValue(provider.modelReasoningEfforts, modelId) ?? provider.reasoningEfforts;
   // An explicitly empty ladder means no effort control, not no reasoning output.
@@ -278,7 +283,7 @@ export function mapRoutedResponsesReasoningEffort(
   const requested = body.reasoning.effort;
   if (typeof requested !== "string") return body;
 
-  const mapped = mapReasoningEffort(provider, modelId, requested);
+  const mapped = mapReasoningEffortWith(provider, modelId, requested, metadata);
   if (!mapped || mapped === requested) return body;
   return { ...body, reasoning: { ...body.reasoning, effort: mapped } };
 }

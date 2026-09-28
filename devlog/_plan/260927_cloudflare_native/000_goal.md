@@ -251,5 +251,17 @@ tests that run ocx and the Worker side by side (headers for five lane sources, e
 rungs on two models with a refused rung in play); not run live, as the test account has no
 OpenCode key.
 
-Still container-only: WebSocket Responses, the dashboard and management API, OAuth and Codex-pool
-providers, spend limits, and the web-search sidecar.
+Responses WebSocket (branch `feat/cloudflare-worker-ws`): with `websockets` on, the Worker holds the
+socket and runs a session (`src/server/cloudflare-native-ws.ts`) that answers each `response.create`
+its Responses turn can serve with ocx's framing (empty response id, SSE payloads as text frames, the
+same errors, warm-ups and limits) and relays any other frame to ocx over a socket to the container
+opened on first use. A new frame supersedes the socket's turn in either place. Real Codex CLI
+0.157.1 with `supports_websockets=true` on `opencodex-wo2-test` completed a shell tool loop in 8.9 s
+over one socket; the Worker log shows only the upgrade, `nativeConfigSource` and `enqueueUsage`, no
+container traffic. A frame with `previous_response_id` was declined by the Worker and answered by
+ocx over the relay (`previous_response_not_found`, 659 ms with the container warm).
+
+Still container-only: the dashboard and management API, OAuth and Codex-pool providers, spend
+limits, and the web-search sidecar. Spend limits need the reservation ledger's authority moved into
+the Durable Object (its API is synchronous at every call site today); OAuth needs token refresh
+coordinated between the Worker and ocx, since refresh tokens rotate.

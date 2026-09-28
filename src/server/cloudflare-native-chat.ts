@@ -426,7 +426,7 @@ export async function sendUpstream(
   deps: Pick<NativeChatDeps, "fetch" | "localHosts">,
 ): Promise<Response> {
   const headerDeadline = new AbortController();
-  const timer = setTimeout(() => headerDeadline.abort(new Error("upstream headers timed out")), HEADER_TIMEOUT_MS);
+  const timer = setTimeout(() => headerDeadline.abort(new DOMException("Timeout elapsed", "TimeoutError")), HEADER_TIMEOUT_MS);
   const upstreamRequest = new Request(request.url, {
     method: request.method, headers: request.headers, body: request.body, redirect: "manual",
     signal: AbortSignal.any([signal, headerDeadline.signal]),

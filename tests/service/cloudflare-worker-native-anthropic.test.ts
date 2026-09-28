@@ -181,6 +181,31 @@ describe("Worker-native turns on the anthropic adapter", () => {
     expect(refused.declines).toEqual(["responses:upstream-400"]);
   });
 
+  test("a lost connection is never answered with an error the client would retry", async () => {
+    const run = async (fetchImpl: () => Promise<Response>) => {
+      const declines: string[] = [];
+      const rows: Rec[] = [];
+      const res = await serveNativeResponses(JSON.stringify(responsesTurn("z/m-1", { max_output_tokens: 300 })), new Headers({ "user-agent": "test/1" }), new AbortController().signal, {
+        readConfig: async () => JSON.stringify({ providers: { z: { ...chat, baseUrl: "https://api.example.test/v1" } } }),
+        fetch: fetchImpl,
+        onDecline: reason => declines.push(reason),
+        recordUsage: row => rows.push(row as Rec),
+      });
+      return { declines, rows, status: res?.status, text: await res?.text(), retry: res?.headers.get("x-should-retry") };
+    };
+    // How a Worker's fetch reports a connection dropped under the request.
+    const lost = await run(async () => { throw new Error("Network connection lost."); });
+    expect(lost.declines).toEqual([]);
+    expect(lost.status).toBe(429);
+    expect(lost.retry).toBe("false");
+    // The failed send is still booked at what ocx reserves for it.
+    expect(lost.rows.map(row => [row.status, row.spendOutputCeilingTokens])).toEqual([[429, 300]]);
+    // A header deadline never reached the upstream, and reads as ocx's timeout.
+    const timedOut = await run(async () => { throw new DOMException("Timeout elapsed", "TimeoutError"); });
+    expect(timedOut.status).toBe(502);
+    expect(timedOut.text).toContain("Provider connect timeout after 200000ms");
+  });
+
   test("an anthropic provider with a setting the Worker does not reproduce is left to ocx", async () => {
     const worker = await throughWorker("/v1/responses", responsesTurn("z/claude-x"), { ...anthropic, apiKeyTransport: "bearer" }, anthropicText, "");
     expect(worker.declines).toEqual(["responses:provider-field:apiKeyTransport"]);

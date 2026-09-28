@@ -37,9 +37,8 @@ import { createTranslatorBudget } from "../lib/translator-budget";
 import { formatErrorResponse } from "../bridge/errors";
 import type { ResponsesTerminalStatus } from "../bridge";
 import { readDisplaySafeErrorText } from "../lib/bounded-body";
-import { applyUpstreamRecoveryInit, fetchWithTransientRetry, isNonReplayableResponse, isReplayRefusalResponse, TRANSIENT_RETRY_MAX_ATTEMPTS } from "../lib/upstream-retry";
+import { applyUpstreamRecoveryInit, fetchWithTransientRetry, isNonReplayableResponse, isReplayRefusalResponse, replayRefusalResponse, TRANSIENT_RETRY_MAX_ATTEMPTS } from "../lib/upstream-retry";
 import { classifyTransportFailureKind } from "../lib/upstream-reachability";
-import { describeUpstreamConnectFailure } from "./responses/upstream-error";
 import { formatPassthroughUpstreamError } from "./responses/passthrough-error";
 import { captureTerminalHttpStatus, httpStatusForRequestLogTerminal, type TerminalStatusContext } from "./terminal-status";
 import { ADMISSION_TOLERANCE, estimateInputTokens } from "./responses/input-admission-core";
@@ -378,11 +377,14 @@ export async function runNativeOpenAiTurn(
       recordRow(499);
       return { response: formatErrorResponse(499, "client_cancelled", "Client cancelled request") };
     }
-    const message = classifyTransportFailureKind(error) === "timeout"
-      ? `Provider connect timeout after ${CONNECT_TIMEOUT_MS}ms`
-      : describeUpstreamConnectFailure(error, CONNECT_TIMEOUT_MS);
-    recordRow(502);
-    return { response: formatErrorResponse(502, "upstream_error", message) };
+    // As the routed path: a timeout never reached the upstream; any other rejection may have, and is
+    // answered with the reset ladder's refusal rather than an error the client would retry.
+    if (classifyTransportFailureKind(error) === "timeout") {
+      recordRow(502);
+      return { response: formatErrorResponse(502, "upstream_error", `Provider connect timeout after ${CONNECT_TIMEOUT_MS}ms`) };
+    }
+    recordRow(429);
+    return { response: replayRefusalResponse() };
   }
   const responseHeaders = sanitizePassthroughHeaders(upstream.headers);
   // A refused create generated nothing: ocx sends it itself and runs its own recovery on the answer.

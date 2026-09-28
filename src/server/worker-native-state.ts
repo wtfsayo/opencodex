@@ -17,6 +17,7 @@ import { listModelMetadata } from "../generated/model-metadata";
 import { OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { resolveInputCeiling } from "./responses/input-admission";
 import { requiresVisionPreprocessing } from "../vision/plan";
+import { routedProviderConfig } from "../router";
 import { contextRelayActivated } from "../codex/context-compat";
 import { getObservedMainQuotaIdentityKey, mainQuotaCredentialObserved, onMainQuotaCredentialChange } from "../codex/main-account-cache";
 import { isNativeMainTrafficBlocked } from "../codex/native-profile-startup";
@@ -83,7 +84,11 @@ function visionPreprocessed(): Record<string, boolean> {
   for (const [name, row] of Object.entries(config.providers ?? {})) {
     if (!row || !Array.isArray(row.models)) continue;
     for (const id of row.models) {
-      if (typeof id === "string" && id) answers[`${name}/${id}`] = requiresVisionPreprocessing(config, row, id, name);
+      if (typeof id !== "string" || !id) continue;
+      // As request-prepare.ts asks it: of the provider it routes with, registry policy merged in.
+      let routed;
+      try { routed = routedProviderConfig(name, row); } catch { continue; }
+      answers[`${name}/${id}`] = requiresVisionPreprocessing(config, routed, id, name);
     }
   }
   return answers;

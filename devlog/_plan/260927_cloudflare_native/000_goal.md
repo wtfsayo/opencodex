@@ -375,3 +375,14 @@ one container-free design, replaying ocx's last answers from the Durable Object 
 has no freshness rule of ocx's own to bound it, so it would show stale usage and quotas where ocx
 shows live ones. The Worker serves the dashboard's files, and opening it wakes the container.
 
+Upstream failures after the send (routed and native): a 4xx still goes to ocx (nothing was
+generated; ocx replays with its recovery, one extra rejected send); a 5xx gets ocx's own answer in
+the client's wire (the routed error body, the Anthropic 529 reshaping, the WebSocket error frame).
+A transport failure is where the Worker knowingly differs: ocx on Bun tells a connection reset
+(answered with its replay refusal, 429 and x-should-retry: false) from a failure to connect
+(a retryable 502), but a Worker's fetch reports both as "Network connection lost.", so the Worker
+answers every non-timeout rejection with the refusal. That errs toward not repeating a turn that may
+already be running; a header timeout, which never reached the upstream, keeps ocx's 502.
+Routed inline images to openai-chat providers are served when ocx would send them unchanged; ocx
+publishes its vision answer per configured provider model, computed on the routed provider row.
+

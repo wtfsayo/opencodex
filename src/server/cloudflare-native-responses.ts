@@ -10,7 +10,7 @@ import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields
 import { createAnthropicAdapterWith, isLikelyRealAnthropicThinkingSignature, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
 import { CLAUDE_CODE_HEADERS } from "../adapters/client-fingerprint";
 import { noStoredCodexAccounts, runNativeOpenAiTurn } from "./cloudflare-native-openai";
-import { applyUpstreamRecoveryInit, fetchWithResetRetry, isNonReplayableResponse } from "../lib/upstream-retry";
+import { applyUpstreamRecoveryInit, fetchWithResetRetry, isNonReplayableResponse, replayRefusalResponse } from "../lib/upstream-retry";
 import { readDisplaySafeErrorText } from "../lib/bounded-body";
 import { formatErrorResponse } from "../bridge/errors";
 import { describeUpstreamConnectFailure } from "./responses/upstream-error";
@@ -190,7 +190,7 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
 }
 
 // Effort is mapped with ocx's caches as it published them (or none, for a destination without
-// models.dev metadata). Image-bearing turns are declined above, so the image hooks are never reached.
+// models.dev metadata). Images are sent unchanged or the turn declined, so normalization never runs here.
 function workerAdapterDeps(metadata: ReasoningMetadataAccess, images: { normalizationNeeded: boolean }): OpenAIChatAdapterDeps {
   return {
     mapReasoningEffort: (provider, modelId, requested) => mapReasoningEffortWith(provider, modelId, requested, metadata),
@@ -198,6 +198,10 @@ function workerAdapterDeps(metadata: ReasoningMetadataAccess, images: { normaliz
     hasShrinkableOpenAIChatImages,
     normalizeOpenAIChatImages: async () => { images.normalizationNeeded = true; },
   };
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.name === "TimeoutError";
 }
 
 /** The auth store copy, read only when the model names a provider the Worker may use a login of. */
@@ -383,6 +387,8 @@ export async function runNativeResponsesTurn(
     cursorConversationId: parsed._cursorConversationId,
   });
   const requestedEffort = parsed.options.reasoning;
+  const maxOutput = parsed.options.maxOutputTokens;
+  const spendOutputCeilingTokens = typeof maxOutput === "number" && maxOutput > 0 ? Math.trunc(maxOutput) : undefined;
   const failureRow = (status: number): WorkerUsageRow => ({
     requestId: crypto.randomUUID(),
     timestamp: startedAt,
@@ -394,13 +400,14 @@ export async function runNativeResponsesTurn(
     ...(options.surface ? { surface: options.surface } : {}),
     inboundProtocol: options.inbound === "anthropic" ? "messages" : "responses",
     admissionKind: "environment",
+    // request-spend.ts charged the send before it left; a failed one stays unresolved at that figure.
+    ...(options.spendInputTokens ? { spendInputTokens: options.spendInputTokens() } : {}),
+    ...(spendOutputCeilingTokens !== undefined ? { spendOutputCeilingTokens } : {}),
     status,
     durationMs: Date.now() - startedAt,
     usageStatus: "unreported",
   });
   const recordFailure = (status: number) => deps.recordUsage?.(failureRow(status));
-  const maxOutput = parsed.options.maxOutputTokens;
-  const spendOutputCeilingTokens = typeof maxOutput === "number" && maxOutput > 0 ? Math.trunc(maxOutput) : undefined;
   // adapter-dispatch.ts: reset-only retries for these providers, identity encoding for a stream,
   // and no ambiguous resend (ocx may buy one; the Worker never sends a possibly running turn twice).
   let upstream: Response;
@@ -416,8 +423,15 @@ export async function runNativeResponsesTurn(
       recordFailure(499);
       return { failure: formatErrorResponse(499, "client_cancelled", "Client cancelled request") };
     }
-    recordFailure(502);
-    return { failure: formatErrorResponse(502, "upstream_error", describeUpstreamConnectFailure(error, 200_000)) };
+    // A timeout never reached the upstream. Any other rejection may have: ocx's reset ladder refuses
+    // to replay a connection lost under the request, and the Worker cannot tell such a loss from a
+    // failure to connect by its message, so it answers every one with that refusal.
+    if (isTimeoutError(error)) {
+      recordFailure(502);
+      return { failure: formatErrorResponse(502, "upstream_error", describeUpstreamConnectFailure(error, 200_000)) };
+    }
+    recordFailure(429);
+    return { failure: replayRefusalResponse() };
   }
   // A refused create generated nothing: ocx sends it itself and runs its recovery on the answer. The
   // retry ladder's own refusal is answered as ocx answers it.
@@ -430,7 +444,7 @@ export async function runNativeResponsesTurn(
     await upstream.body?.cancel().catch(() => {});
     return no(`upstream-${upstream.status}`);
   }
-  if (!upstream.ok || !upstream.body) {
+  if (!upstream.ok) {
     commitSkills?.();
     const errorText = await readDisplaySafeErrorText(upstream, upstreamSignal, "unknown error");
     recordFailure(upstream.status);

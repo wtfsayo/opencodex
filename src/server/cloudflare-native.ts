@@ -4,6 +4,8 @@
 import type { ServeNativeChat } from "./cloudflare-native-chat-api";
 import { serveNativeChat as chat } from "./cloudflare-native-chat";
 import { serveNativeResponses as responses } from "./cloudflare-native-responses";
+import { serveNativeMessages as messages } from "./cloudflare-native-messages";
 
 export const serveNativeChat: ServeNativeChat = chat;
 export const serveNativeResponses: ServeNativeChat = responses;
+export const serveNativeMessages: ServeNativeChat = messages;

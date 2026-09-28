@@ -6,7 +6,7 @@
 //
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
-import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, sendUpstream } from "./cloudflare-native-chat";
+import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, sendUpstream, type NativeChatRoute } from "./cloudflare-native-chat";
 import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { buildToolBridgeMaps } from "./responses/tool-bridge-maps";
 import { replaceSkillsBlock, singleSkillsBlock } from "./responses/skills-catalog";
@@ -18,7 +18,7 @@ import { hasValidatedActiveReasoningEffort, parseRequest } from "../responses/pa
 import { mapReasoningEffortWith, NO_REASONING_METADATA } from "../reasoning-effort-core";
 import { metadataProviderKeyForBaseUrl } from "../providers/reasoning-metadata-destinations";
 import { readResponseStreamWithInactivity, ResponseBodyInactivityError } from "../lib/response-body-inactivity";
-import { createTranslatorBudget } from "../lib/translator-budget";
+import { createTranslatorBudget, type TranslatorBudget } from "../lib/translator-budget";
 import { resolveStallTimeoutMs } from "../stall-timeout";
 import type { AdapterEvent, OcxConfig, OcxUsage } from "../types";
 
@@ -151,12 +151,30 @@ const WORKER_ADAPTER_DEPS: OpenAIChatAdapterDeps = {
   normalizeOpenAIChatImages: async () => {},
 };
 
-export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, signal, deps) => {
-  const startedAt = Date.now();
-  const no = (reason: string) => { deps.onDecline?.(`responses:${reason}`); return null; };
-  let body: unknown;
-  try { body = JSON.parse(bodyText); } catch { return no("body-not-json"); }
-  if (!isRec(body)) return no("body-shape");
+/** A turn sent upstream: its Responses SSE, and the callback that writes its usage row when it ends. */
+export type NativeResponsesTurn = {
+  sse: ReadableStream<Uint8Array>;
+  route: NativeChatRoute;
+  finish(end: "end" | "error" | "cancel"): void;
+};
+
+type TurnOptions = {
+  /** The client's wire. ocx replays a Messages turn through its Responses pipeline as "anthropic". */
+  inbound: "responses" | "anthropic";
+  translatorBudget: TranslatorBudget;
+  requestedModel?: string;
+  startedAt: number;
+};
+
+/**
+ * The Responses turn as ocx runs it for `body`, or null (after `no`) when this path cannot match
+ * it. Nothing reaches the client until the upstream has answered OK.
+ */
+export async function runNativeResponsesTurn(
+  body: Rec, headers: Headers, signal: AbortSignal, deps: NativeChatDeps,
+  no: (reason: string) => null, options: TurnOptions,
+): Promise<NativeResponsesTurn | null> {
+  const { startedAt } = options;
   const declined = nativeResponsesDeclineReason(body, headers);
   if (declined) return no(declined);
   const loaded = await loadNativeConfig(deps);
@@ -196,10 +214,13 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   parsed.modelId = route.modelId;
   parsed.context = renameRoutedIdentityInContext(parsed.context, route.modelId);
   // core-normalize.ts; the provider's showThinkingSummary is outside the fields this path admits.
-  const summary = isRec(body.reasoning) ? body.reasoning.summary : undefined;
-  parsed.options.hideThinkingSummary = summary === "none" || (!summary && !hasValidatedActiveReasoningEffort(parsed.options));
+  // Only for a Responses client: an Anthropic replay keeps what the parser decided.
+  if (options.inbound === "responses") {
+    const summary = isRec(body.reasoning) ? body.reasoning.summary : undefined;
+    parsed.options.hideThinkingSummary = summary === "none" || (!summary && !hasValidatedActiveReasoningEffort(parsed.options));
+  }
 
-  const translatorBudget = createTranslatorBudget();
+  const translatorBudget = options.translatorBudget;
   const adapter = createOpenAIChatAdapterWith(route.provider, WORKER_ADAPTER_DEPS);
   const upstreamAbort = new AbortController();
   const upstreamSignal = AbortSignal.any([signal, upstreamAbort.signal]);
@@ -226,8 +247,8 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
       timestamp: startedAt,
       provider: route.providerName,
       model: route.modelId,
-      requestedModel: route.requestedModel,
-      inboundProtocol: "responses",
+      requestedModel: options.requestedModel ?? route.requestedModel,
+      inboundProtocol: options.inbound === "anthropic" ? "messages" : "responses",
       admissionKind: "environment",
       status,
       durationMs: Date.now() - startedAt,
@@ -266,7 +287,8 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
       hideThinkingSummary: parsed.options.hideThinkingSummary,
       declaredToolNames: maps.declaredToolNames,
       bareCustomToolNames: maps.bareCustomToolNames,
-      enforceDeclaredToolNames: true,
+      // run-turn-execution.ts enforces declared tool names for Responses clients only.
+      enforceDeclaredToolNames: options.inbound === "responses",
       toolParameterSchemas: maps.toolParameterSchemas,
       onFirstOutput: () => { firstOutputAt ??= Date.now(); },
       onUsage: reported => { usage = reported; },
@@ -275,10 +297,23 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
       onCompletedResponse: () => { completed = true; },
     },
   );
-  // A stream that ends without response.completed failed (response.failed, a translator limit).
-  return new Response(recordAtEnd(sse, end => record(
-    end === "cancel" || signal.aborted ? 499 : completed && errorStatus === undefined ? 200 : errorStatus ?? 502,
-  )), {
+  return {
+    sse,
+    route,
+    // A stream that ends without response.completed failed (response.failed, a translator limit).
+    finish: end => record(end === "cancel" || signal.aborted ? 499 : completed && errorStatus === undefined ? 200 : errorStatus ?? 502),
+  };
+}
+
+export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, signal, deps) => {
+  const startedAt = Date.now();
+  const no = (reason: string) => { deps.onDecline?.(`responses:${reason}`); return null; };
+  let body: unknown;
+  try { body = JSON.parse(bodyText); } catch { return no("body-not-json"); }
+  if (!isRec(body)) return no("body-shape");
+  const turn = await runNativeResponsesTurn(body, headers, signal, deps, no, { inbound: "responses", translatorBudget: createTranslatorBudget(), startedAt });
+  if (!turn) return null;
+  return new Response(recordAtEnd(turn.sse, turn.finish), {
     headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" },
   });
 };

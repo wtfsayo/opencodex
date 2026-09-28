@@ -7,3 +7,4 @@ import type { ServeNativeChat } from "../../../src/server/cloudflare-native-chat
 export type { NativeChatDeps, ServeNativeChat } from "../../../src/server/cloudflare-native-chat-api";
 export declare const serveNativeChat: ServeNativeChat;
 export declare const serveNativeResponses: ServeNativeChat;
+export declare const serveNativeMessages: ServeNativeChat;

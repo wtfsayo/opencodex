@@ -1,11 +1,11 @@
 import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
 import {
-  chatAdmitsDataToken, containerEnv, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
+  chatAdmitsDataToken, messagesAdmitsDataToken, containerEnv, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
 import { type DurableDocument, LeaseState } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
-import { serveNativeChat, serveNativeResponses } from "ocx-worker-native";
+import { serveNativeChat, serveNativeMessages, serveNativeResponses } from "ocx-worker-native";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
@@ -223,8 +223,9 @@ const NATIVE_MAX_BODY_BYTES = 4 * 1024 * 1024;
 /**
  * The Worker-native path runs only where the edge has matched the data token exactly: with
  * OCX_EDGE_KEY_CHECK=presence the key is verified by ocx, which this path would skip. It also
- * applies ocx's own header rule for chat (chatAdmitsDataToken). Returns the response, or the
- * request to forward when the body was read and declined, or null when the request is untouched.
+ * applies ocx's own header rule for each endpoint (chatAdmitsDataToken, messagesAdmitsDataToken).
+ * Returns the response, or the request to forward when the body was read and declined, or null
+ * when the request is untouched.
  */
 async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): Promise<Response | { forward: Request } | null> {
   if (env.OCX_WORKER_NATIVE?.trim() !== "1" || env.OCX_EDGE_KEY_CHECK?.trim() === "presence") return null;
@@ -232,6 +233,7 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   const serve = req.method !== "POST" ? undefined
     : path === "/v1/chat/completions" ? serveNativeChat
     : path === "/v1/responses" ? serveNativeResponses
+    : path === "/v1/messages" ? serveNativeMessages
     : undefined;
   if (!serve) return null;
   // ocx decompresses gzip and zstd bodies; this path would have to as well, so leave them to it.
@@ -241,7 +243,7 @@ async function tryWorkerNative(req: Request, env: Env, ctx: ExecutionContext): P
   // ocx refuses cross-origin data-plane requests unless the origin is loopback, the hub itself, or
   // configured (isAllowedRequestOrigin); the Worker leaves every request with an Origin to it.
   if (req.headers.has("origin")) return null;
-  if (!(await chatAdmitsDataToken(req, env))) return null;
+  if (!(await (serve === serveNativeMessages ? messagesAdmitsDataToken : chatAdmitsDataToken)(req, env))) return null;
   const bodyBytes = await req.arrayBuffer();
   const hub = getContainer(env.HUB, HUB_NAME);
   try {

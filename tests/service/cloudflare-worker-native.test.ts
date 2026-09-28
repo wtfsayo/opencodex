@@ -27,8 +27,9 @@ const FORBIDDEN_MODULES = [
   "src/config.ts", "src/router.ts", "src/server/request-log.ts", "src/server/lifecycle.ts",
   "src/usage/log.ts", "src/oauth/store.ts", "src/codex/account-store.ts", "src/lib/spend-reservation-ledger.ts", "src/storage/",
 ];
-// The Responses path brings the request parser, the openai-chat adapter and the SSE bridge.
-const MAX_CLOSURE = 140;
+// The Responses path brings the request parser, the openai-chat adapter and the SSE bridge; the
+// Messages path adds the Anthropic translators (src/claude/inbound.ts, outbound.ts), 21 files.
+const MAX_CLOSURE = 155;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {

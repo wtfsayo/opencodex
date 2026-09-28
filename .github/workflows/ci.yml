@@ -341,7 +341,7 @@ jobs:
             deploy:
               - 'deploy/**'
               - 'docker/cloudflare-supervisor.ts'
-              - 'src/server/cloudflare-native-chat*.ts'
+              - 'src/server/cloudflare-native*.ts'
               - 'src/server/collab-surface.ts'
               - 'src/lib/model-record.ts'
               - 'src/lib/durable-mirror.ts'

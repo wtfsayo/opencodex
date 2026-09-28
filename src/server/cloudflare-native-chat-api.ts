@@ -35,7 +35,7 @@ export type WorkerUsageRow = {
   provider: string;
   model: string;
   requestedModel: string;
-  inboundProtocol: "chat" | "responses";
+  inboundProtocol: "chat" | "responses" | "messages";
   admissionKind: "environment";
   status: number;
   durationMs: number;

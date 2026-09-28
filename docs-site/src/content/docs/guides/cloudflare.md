@@ -185,11 +185,19 @@ It also answers `POST /v1/responses`, the API Codex uses, for the same providers
 streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
 is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only
-messages; and no `<skills_instructions>` block. That covers what Codex CLI sends on an ordinary
-turn. Like `ocx`, the Worker freezes each session's `<skills_instructions>` catalog to the first one
+messages; and no `<skills_instructions>` block outside the instructions and developer messages.
+That covers what Codex CLI sends on an ordinary turn. Like `ocx`, the Worker freezes each session's `<skills_instructions>` catalog to the first one
 it sends, for four idle hours; the two keep separate copies (the Worker's in the Durable Object,
 `ocx`'s in memory, lost whenever the container sleeps), so a session whose catalog changes while its
 turns alternate between them can see both versions.
+
+And it answers `POST /v1/messages`, the API Claude Code uses, when `model` is one of the
+`ocx-claude-<provider>--<model>` aliases `ocx` lists for Claude Code and the provider qualifies as
+above. The data token may also arrive in `x-api-key`, as `ocx` accepts it there. The turn is
+translated and answered as `ocx` does it, streamed or not, when it has text-only messages and
+`ocx` would not treat it specially: a Claude model id (which may be passthrough on your own
+Anthropic credential, or a Claude Desktop alias), a config with a `claudeCode` section, an injected
+agent's `ocx-route` directive, or a subagent's message thread all go to `ocx`.
 
 If the provider returns an error status, the Worker sends the request to `ocx` instead, which
 retries and reports it as usual; the provider then sees that request twice. An answer with a 200

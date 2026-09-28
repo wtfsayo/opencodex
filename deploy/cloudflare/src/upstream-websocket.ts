@@ -12,11 +12,12 @@ class UpstreamWebSocket extends EventTarget {
   private socket: WebSocket | undefined;
   private readonly queued: (string | ArrayBuffer)[] = [];
   private closeRequested: { code?: number; reason?: string } | undefined;
+  private readonly dial = new AbortController();
 
   constructor(url: string, headers: Record<string, string>) {
     super();
     const httpUrl = url.replace(/^wss:/i, "https:").replace(/^ws:/i, "http:");
-    fetch(httpUrl, { headers: { ...headers, upgrade: "websocket" } }).then(response => {
+    fetch(httpUrl, { headers: { ...headers, upgrade: "websocket" }, signal: this.dial.signal }).then(response => {
       const socket = response.webSocket;
       if (!socket) {
         void response.body?.cancel();
@@ -27,6 +28,10 @@ class UpstreamWebSocket extends EventTarget {
       this.socket = socket;
       socket.addEventListener("message", event => this.dispatchEvent(new MessageEvent("message", { data: event.data })));
       socket.addEventListener("close", event => {
+        // Complete the closing handshake; Workers do not answer a peer's close on their own.
+        if (this.readyState !== CLOSED) {
+          try { socket.close(event.code === 1005 ? 1000 : event.code, event.reason); } catch { /* already closed */ }
+        }
         this.readyState = CLOSED;
         this.dispatchEvent(new CloseEvent("close", { code: event.code, reason: event.reason, wasClean: event.wasClean }));
       });
@@ -50,7 +55,10 @@ class UpstreamWebSocket extends EventTarget {
     if (this.readyState === CLOSED || this.readyState === CLOSING) return;
     this.readyState = CLOSING;
     if (this.socket) this.socket.close(code ?? 1000, reason);
-    else this.closeRequested = { code, reason };
+    else {
+      this.closeRequested = { code, reason };
+      this.dial.abort();
+    }
   }
 
   /** A refused or failed upgrade: an error before any open, then a close, as a WebSocket reports it. */

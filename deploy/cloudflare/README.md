@@ -18,6 +18,7 @@ npx wrangler deploy
 | `src/index.ts` | Worker entry, `OpencodexHub` container class, outbound state host |
 | `src/lease.ts` | Single-writer lease kept in the Durable Object |
 | `src/state-routes.ts` | Snapshot and lease endpoints the container calls at `http://state.ocx.internal` |
+| `src/upstream-websocket.ts` | A client WebSocket with upgrade headers, for the ChatGPT backend a native Codex turn dials |
 | `../../docker/cloudflare-supervisor.ts` | Container entrypoint: lease, restore, run `ocx`, snapshot |
 
 Local run: copy `.dev.vars.example` to `.dev.vars`, fill in the token, and run `npx wrangler dev`

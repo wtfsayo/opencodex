@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,9 @@ import { startServer } from "../../src/server";
 import { readRecentUsageEntries } from "../../src/usage/log";
 import { serveNativeResponses } from "../../src/server/cloudflare-native-responses";
 import { createNativeWsSession } from "../../src/server/cloudflare-native-ws";
+import { nativeOpenAiDeclineReason } from "../../src/server/cloudflare-native-openai";
+import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../../src/codex/catalog/native-models";
+import { CODEX_ACCOUNT_GATED_CANONICAL_WIRE_MODELS } from "../../src/server/responses/core-codex-account";
 import { bunSupportsBoundedCodexWsRelay } from "../../src/server/responses/ws-upstream";
 import type { NativeOpenAiFacts, WorkerUsageRow } from "../../src/server/cloudflare-native-chat-api";
 import { DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "../../src/lib/durable-mirror";
@@ -46,7 +50,11 @@ class FakeWebSocket {
   close() { this.readyState = 3; }
 }
 // The same backend over HTTP SSE, for a runtime ocx does not dial the WebSocket from.
-const sseReply = () => new Response(nextReply().map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(""), {
+// When set, the HTTP backend answers every send with this status instead.
+let failStatus: number | undefined;
+const sseReply = () => failStatus !== undefined
+  ? new Response(JSON.stringify({ error: { type: "server_error", code: "server_error", message: "The server had an error." } }), { status: failStatus, headers: { "content-type": "application/json" } })
+  : new Response(nextReply().map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(""), {
   headers: { "content-type": "text/event-stream" },
 });
 
@@ -84,6 +92,18 @@ const mcpTurn = (): Rec[] => [
   { type: "response.output_item.done", sequence_number: 2, output_index: 0, item: mcpCall },
   { type: "response.completed", sequence_number: 3, response: response("completed", [mcpCall], { input_tokens: 30, output_tokens: 5, total_tokens: 35 }) },
 ];
+const searchItem = { id: "ws_up1", type: "web_search_call", status: "completed", action: { type: "search", query: "bun 1.4" } };
+const searchTurn = (): Rec[] => [
+  { type: "response.created", sequence_number: 0, response: response("in_progress", []) },
+  { type: "response.output_item.added", sequence_number: 1, output_index: 0, item: { ...searchItem, status: "in_progress" } },
+  { type: "response.web_search_call.searching", sequence_number: 2, output_index: 0, item_id: "ws_up1" },
+  { type: "response.web_search_call.completed", sequence_number: 3, output_index: 0, item_id: "ws_up1" },
+  { type: "response.output_item.done", sequence_number: 4, output_index: 0, item: searchItem },
+  { type: "response.output_item.added", sequence_number: 5, output_index: 1, item: { id: "msg_up1", type: "message", role: "assistant", status: "in_progress", content: [] } },
+  { type: "response.output_text.delta", sequence_number: 6, item_id: "msg_up1", output_index: 1, content_index: 0, delta: "Found." },
+  { type: "response.output_item.done", sequence_number: 7, output_index: 1, item: message("Found.") },
+  { type: "response.completed", sequence_number: 8, response: response("completed", [searchItem, message("Found.")], { input_tokens: 50, output_tokens: 4, total_tokens: 54 }) },
+];
 const shell = { type: "function", name: "shell", description: "Run a command", strict: false, parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } };
 const codexTurn = (extra: Rec = {}): Rec => ({
   model: "gpt-5.5", instructions: "You are Codex.", store: false, stream: true, tools: [shell], tool_choice: "auto", parallel_tool_calls: false,
@@ -99,17 +119,22 @@ const withHistory = () => codexTurn({
     { type: "function_call_output", call_id: "call_1", output: "a\nb" },
   ],
 });
+// A ChatGPT access token is a JWT; this one is shaped like one and signs nothing.
+const CALLER_TOKEN = ["eyJhbGciOiJub25lIn0", "eyJzdWIiOiJjYWxsZXIifQ", "c2lnbmF0dXJl"].join(".");
 // What Codex CLI sends on its own ChatGPT login, with the hub's key in the dedicated header.
 const callerHeaders = () => ({
-  "content-type": "application/json", authorization: "Bearer caller-chatgpt-token", "chatgpt-account-id": "acct-caller",
+  "content-type": "application/json", authorization: `Bearer ${CALLER_TOKEN}`, "chatgpt-account-id": "acct-caller",
   originator: "codex_cli_rs", "user-agent": "codex_cli_rs/0.157.1", "x-opencodex-api-key": "hub-data-token",
   session_id: "0199aa00-thread", "x-codex-installation-id": "install-1",
 });
 
 const transport: NativeOpenAiFacts["upstreamTransport"] = bunSupportsBoundedCodexWsRelay() ? "websocket" : "sse";
+// This process's own ceilings, as the container would publish them.
 const facts = (extra: Partial<NativeOpenAiFacts> = {}): NativeOpenAiFacts => ({
-  mainCredentialObserved: false, nativeMainTrafficBlocked: false, contextRelayActive: false, upstreamTransport: transport, reasoningSummarySupport: {}, ...extra,
+  version: 1, mainAccountIdentityKey: null, codexAccountsStored: false, nativeMainTrafficBlocked: false, contextRelayActive: false,
+  upstreamTransport: transport, inputCeilings: nativeOpenAiFacts(true).inputCeilings, ...extra,
 });
+const isAdmissionSecret = async (value: string) => value === "hub-data-token";
 
 /** What the backend received: the create frame and handshake headers, or the POST body and headers. */
 type Sent = { body: Rec; headers: Record<string, string> };
@@ -173,7 +198,7 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     }
   }
 
-  async function throughWorker(body: Rec, config: string, extra: { facts?: NativeOpenAiFacts | undefined; accounts?: string; headers?: Rec } = {}) {
+  async function throughWorker(body: Rec, config: string, extra: { facts?: NativeOpenAiFacts | undefined; accounts?: string; headers?: Rec; secret?: (value: string) => boolean } = {}) {
     FakeWebSocket.dials = [];
     let httpSent: Sent | undefined;
     const declines: string[] = [];
@@ -181,6 +206,7 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     const res = await serveNativeResponses(JSON.stringify(body), new Headers({ ...callerHeaders(), ...(extra.headers ?? {}) } as Record<string, string>), new AbortController().signal, {
       readConfig: async () => config,
       readCodexAccounts: async () => extra.accounts,
+      isAdmissionSecret: async value => extra.secret?.(value) ?? isAdmissionSecret(value),
       nativeOpenAiFacts: async () => ("facts" in extra ? extra.facts : facts()),
       openUpstreamSocket: (url, headers) => new FakeWebSocket(url, { headers }) as unknown as WebSocket,
       fetch: async request => { httpSent = { body: await request.json() as Rec, headers: fetchHeaders(request.headers) }; return sseReply(); },
@@ -201,6 +227,16 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     ["a turn with Codex's freeform apply_patch, an MCP namespace and verbosity", codexTurn({
       tools: [shell, applyPatch, mcpNamespace], text: { verbosity: "low" },
     }), mcpTurn],
+    ["a turn with Codex's hosted web search, replaying a search", codexTurn({
+      tools: [shell, { type: "web_search", external_web_access: true }],
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Search it." }] },
+        { type: "web_search_call", id: "ws_1", status: "completed", action: { type: "search", query: "bun 1.4" } },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "Found it." }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Again." }] },
+      ],
+    }), textTurn],
+    ["a turn whose answer searches the web", codexTurn({ tools: [shell, { type: "web_search", external_web_access: true }] }), searchTurn],
     ["a turn replaying a custom tool call", codexTurn({
       tools: [shell, applyPatch],
       input: [
@@ -279,6 +315,7 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     }, new Headers(callerHeaders()), {
       readConfig: async () => config,
       readCodexAccounts: async () => undefined,
+      isAdmissionSecret,
       nativeOpenAiFacts: async () => facts(),
       openUpstreamSocket: (url, headers) => new FakeWebSocket(url, { headers }) as unknown as WebSocket,
       fetch: async request => { workerHttp.push(await request.json() as Rec); return sseReply(); },
@@ -311,6 +348,7 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     }, new Headers(callerHeaders()), {
       readConfig: async () => JSON.stringify({ ...(getDefaultConfig() as unknown as Rec), port: 0, websockets: true }),
       readCodexAccounts: async () => undefined,
+      isAdmissionSecret,
       nativeOpenAiFacts: async () => facts(),
       openUpstreamSocket: (url, headers) => new FakeWebSocket(url, { headers }) as unknown as WebSocket,
       fetch: async () => sseReply(),
@@ -331,6 +369,32 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     expect((input[1] as { id?: string }).id).toBe("msg_up1");
   });
 
+  test.if(transport === "sse")("an upstream 5xx after the send: ocx's answer and row, and no second send through ocx", async () => {
+    events = textTurn();
+    failStatus = 503;
+    try {
+      const proxy = await throughOcx(codexTurn());
+      const worker = await throughWorker(codexTurn(), proxy.config);
+      expect(worker.declines).toEqual([]);
+      expect(worker.status).toBe(proxy.status);
+      expect(worker.text).toBe(proxy.text);
+      expect(worker.row?.status).toBe(proxy.row?.status);
+      // A refused create generated nothing, so ocx sends it itself and runs its own recovery.
+      failStatus = 400;
+      const refused = await throughWorker(codexTurn(), proxy.config);
+      expect(refused.sent).toBeDefined();
+      expect(refused.declines).toEqual(["responses:upstream-400"]);
+    } finally {
+      failStatus = undefined;
+    }
+  });
+
+  test("every model ocx gates by account is declined by name", () => {
+    for (const model of [...ACCOUNT_GATED_NATIVE_OPENAI_MODELS, ...CODEX_ACCOUNT_GATED_CANONICAL_WIRE_MODELS.keys()]) {
+      expect([model, nativeOpenAiDeclineReason(codexTurn({ model }), new Headers(callerHeaders()))]).toEqual([model, "native-model"]);
+    }
+  });
+
   test("leaves to ocx what its own state decides, before anything is sent", async () => {
     events = textTurn();
     const config = JSON.stringify({ ...(getDefaultConfig() as unknown as Rec), port: 0 });
@@ -341,7 +405,18 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     };
     expect(await declines(codexTurn(), { accounts: JSON.stringify({ accounts: [{ id: "a1" }] }) })).toEqual(["responses:codex-accounts"]);
     expect(await declines(codexTurn(), { facts: undefined })).toEqual(["responses:native-facts-unpublished"]);
-    expect(await declines(codexTurn(), { facts: facts({ mainCredentialObserved: true }) })).toEqual(["responses:main-credential-observed"]);
+    // Only a caller holding the main login ocx observed; another account is still served.
+    const mainKey = createHash("sha256").update("opencodex-main-quota-v1\0").update("acct-caller").digest("hex");
+    expect(await declines(codexTurn(), { facts: facts({ mainAccountIdentityKey: mainKey }) })).toEqual(["responses:main-account"]);
+    expect(await declines(codexTurn(), { facts: facts({ codexAccountsStored: true }) })).toEqual(["responses:codex-accounts"]);
+    expect(await declines(codexTurn(), { facts: facts({ inputCeilings: {} }) })).toEqual(["responses:input-ceiling-unknown"]);
+    expect(await declines(codexTurn(), { facts: facts({ inputCeilings: { "gpt-5.5": 10 } }) })).toEqual(["responses:input-admission"]);
+    // A bearer that is one of the hub's own keys never leaves for chatgpt.com.
+    expect(await declines(codexTurn(), { secret: () => true })).toEqual(["responses:caller-login"]);
+    expect(await declines(codexTurn(), { headers: { authorization: "Bearer sk-an-api-key" } })).toEqual(["responses:caller-login"]);
+    expect((await throughWorker(codexTurn(), JSON.stringify({ ...JSON.parse(config), apiKeys: [{ id: "k1", key: "x" }] }))).declines).toEqual(["responses:configured-api-keys"]);
+    // A part keyed in any order is found.
+    expect(await declines(codexTurn({ input: [{ type: "message", role: "user", content: [{ encrypted_content: "x", type: "encrypted_content" }] }] }))).toEqual(["responses:encrypted-content-part"]);
     expect(await declines(codexTurn(), { facts: facts({ nativeMainTrafficBlocked: true }) })).toEqual(["responses:native-main-blocked"]);
     expect(await declines(codexTurn(), { facts: facts({ contextRelayActive: true }) })).toEqual(["responses:context-relay"]);
     expect(await declines(codexTurn({ previous_response_id: "resp_1" }))).toEqual(["responses:body-fields:previous_response_id"]);
@@ -385,7 +460,8 @@ describe("what a ChatGPT passthrough turn reads from ocx's process", () => {
   });
 
   test("this process's answers, published under the stamp and read only while its boot holds the lease", async () => {
-    expect(nativeOpenAiFacts()).toMatchObject({ mainCredentialObserved: false, contextRelayActive: false, upstreamTransport: transport });
+    expect(nativeOpenAiFacts()).toMatchObject({ mainAccountIdentityKey: null, codexAccountsStored: false, contextRelayActive: false, upstreamTransport: transport });
+    expect(nativeOpenAiFacts().inputCeilings["gpt-5.5"]).toBeGreaterThan(0);
     const hub = new LeaseState(memoryStorage());
     await hub.acquireLease(BOOT_ID);
     process.env[DURABLE_STATE_BOOT_ID_ENV] = BOOT_ID;
@@ -395,10 +471,13 @@ describe("what a ChatGPT passthrough turn reads from ocx's process", () => {
       fetch: async (url, init) => handleStateRequest(new Request(url, init), hub, noBucket, "ns", "stamp-1"),
     });
     await publishNativeOpenAiFactsForWorker();
-    expect(await hub.nativeOpenAiFactsRead("stamp-1")).toEqual(nativeOpenAiFacts());
+    const published = await hub.nativeOpenAiFactsRead("stamp-1") as NativeOpenAiFacts;
+    expect({ ...published, version: 0 }).toEqual({ ...nativeOpenAiFacts(), version: 0 });
     expect(await hub.nativeOpenAiFactsRead("stamp-2")).toBeUndefined();
-    // A new process holds the lease: the old one's answers describe a process that is gone.
+    // Asleep, the next boot restores the same state: the answers stand. Another boot holding the
+    // lease has not said yet what it holds.
     await hub.releaseLease(BOOT_ID);
+    expect(await hub.nativeOpenAiFactsRead("stamp-1")).toBeDefined();
     await hub.acquireLease("fedcba9876543210fedcba9876543210");
     expect(await hub.nativeOpenAiFactsRead("stamp-1")).toBeUndefined();
   });
@@ -409,7 +488,7 @@ describe("what a ChatGPT passthrough turn reads from ocx's process", () => {
     observeMainQuotaIdentity("acct-main");
     observeMainQuotaCredential("main-token", "acct-main");
     expect(changes).toBe(2);
-    expect(nativeOpenAiFacts().mainCredentialObserved).toBe(true);
+    expect(nativeOpenAiFacts().mainAccountIdentityKey).toBe(createHash("sha256").update("opencodex-main-quota-v1\0").update("acct-main").digest("hex"));
     const hub = new LeaseState(memoryStorage());
     await hub.acquireLease(BOOT_ID);
     const put = (body: unknown) => handleStateRequest(new Request("http://state.ocx.internal/native-openai-facts", {
@@ -417,7 +496,11 @@ describe("what a ChatGPT passthrough turn reads from ocx's process", () => {
     }), hub, noBucket, "ns", "stamp-1");
     expect((await put({ ...facts(), extra: true })).status).toBe(400);
     expect((await put({ ...facts(), upstreamTransport: "carrier-pigeon" })).status).toBe(400);
-    expect((await put({ ...facts(), reasoningSummarySupport: { "gpt-5.5": "yes" } })).status).toBe(400);
-    expect((await put(facts({ reasoningSummarySupport: { "gpt-5.5": false } }))).status).toBe(204);
+    expect((await put({ ...facts(), inputCeilings: { "gpt-5.5": "big" } })).status).toBe(400);
+    expect((await put({ ...facts(), mainAccountIdentityKey: "acct-main" })).status).toBe(400);
+    expect((await put(facts({ version: 5 }))).status).toBe(204);
+    // An older publish from the same process arriving late does not replace a newer one.
+    expect((await put(facts({ version: 4, codexAccountsStored: true }))).status).toBe(204);
+    expect(((await hub.nativeOpenAiFactsRead("stamp-1")) as NativeOpenAiFacts).codexAccountsStored).toBe(false);
   });
 });

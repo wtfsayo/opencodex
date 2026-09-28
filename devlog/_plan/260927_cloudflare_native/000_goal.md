@@ -343,3 +343,19 @@ WebSocket upstream).
 Known divergence: a chained frame the Worker declines reaches ocx with the history expanded and no
 `previous_response_id`, so ocx's replay-prefix provenance (compaction-marker acknowledgement,
 guidance de-duplication) and its request log treat it as client input.
+
+Two reviews of that branch found it unsafe and narrower than it looked, and the fixes changed its
+shape. It could forward one of the hub's own keys to chatgpt.com (a bearer equal to the data token
+passed every check); it now requires a JWT-shaped bearer that is none of the hub's keys, and declines
+any config with client keys. It declined every upstream failure after sending, so ocx sent the turn
+a second time; now a 4xx (nothing generated) still goes to ocx, and a 5xx or transport failure is
+answered with ocx's own error and status, sent through ocx's transient ladder with no ambiguous
+resend. The facts were valid only while the publishing boot held the lease, so every turn after a
+sleep woke the container; they now stand while no other boot holds it. Any hub with a stored login
+declined everyone, since that login is observed at boot; the facts now carry the observed account's
+identity key and only a caller holding that account is declined. Publishes carry a version, go out
+only when the observed account changes, and compute ceilings off the request path. ocx's input
+admission, its terminal-to-status mapping and its usage totals now apply to the Worker's turns
+(ceilings published per native model, the mapping in `terminal-status.ts`). Hosted web search is
+served; the ChatGPT backend runs it. Still not verified live: the Worker's own path to chatgpt.com.
+

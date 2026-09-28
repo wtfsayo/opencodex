@@ -35,8 +35,9 @@ const FORBIDDEN_MODULES = [
 // config (model policy, registry merge) and ocx's usage labels, eight more; a ChatGPT passthrough
 // turn (the Responses passthrough adapter, the ChatGPT WebSocket exchange, the eager relay and the
 // passthrough client rewrites), 38 more; ocx's SSE inspector and the continuation replay a
-// WebSocket session keeps for its own native responses, three more.
-const MAX_CLOSURE = 231;
+// WebSocket session keeps for its own native responses, three more; ocx's failure answers for that
+// turn (the passthrough error body, transport-failure text, request-log terminal status), seven more.
+const MAX_CLOSURE = 238;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {
@@ -70,9 +71,9 @@ function closure(entry: string) {
         if (!ALLOWED_NODE.has(spec) && !BUNDLED_PACKAGES.has(spec)) problems.push(`${spec} in ${chain(file)}`);
         continue;
       }
-      // A JSON module (package.json's version) is inlined by the bundler and imports nothing.
+      // package.json, for its version, is the one JSON module the bundle may inline.
       if (spec.endsWith(".json")) {
-        if (!existsSync(resolve(dirname(file), spec))) problems.push(`unresolved ${spec} in ${chain(file)}`);
+        if (relative(root, resolve(dirname(file), spec)) !== "package.json") problems.push(`JSON module ${spec} in ${chain(file)}`);
         continue;
       }
       const base = resolve(dirname(file), spec.replace(/\.js$/, ""));

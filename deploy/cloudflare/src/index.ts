@@ -1,6 +1,6 @@
 import { Container, ContainerProxy, getContainer } from "@cloudflare/containers";
 import {
-  chatAdmitsDataToken, apiAuthAdmitsDataToken, containerEnv, modelListStamp, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
+  chatAdmitsDataToken, apiAuthAdmitsDataToken, isHubSecret, containerEnv, modelListStamp, nativeConfigText, dashboardEnabled, DASHBOARD_BOOTSTRAP_META, DASHBOARD_HTML_HEADERS, edgeDecision, envFingerprint,
   forwardableRequest, isAnonymousHealthCheck, isSupersededBy, servedByHub, type EdgeEnv,
 } from "./container-env";
 import { type DocumentSeqs, type DurableDocument, LeaseState, type ModelList, type ReasoningMetadataKind } from "./lease";
@@ -178,8 +178,8 @@ export class OpencodexHub extends Container<Env> {
   }
   clientRuntimeRead(stamp: string) { return this.leases.clientRuntimeRead(stamp); }
   nativeOpenAiFactsRead(stamp: string) { return this.leases.nativeOpenAiFactsRead(stamp); }
-  nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string) {
-    return this.leases.nativeOpenAiFactsCommit(bootId, facts, stamp);
+  nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string, version: number) {
+    return this.leases.nativeOpenAiFactsCommit(bootId, facts, stamp, version);
   }
   clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string) {
     return this.leases.clientRuntimeCommit(bootId, headers, stamp);
@@ -245,6 +245,7 @@ function nativeDeps(env: Env, ctx: ExecutionContext, hub: ReturnType<typeof getC
     reasoningMetadata: () => hub.reasoningMetadataRead(),
     clientRuntime: async () => hub.clientRuntimeRead(await modelListStamp(env)),
     readCodexAccounts: async () => (await hub.readDocument("codex-accounts"))?.body,
+    isAdmissionSecret: value => isHubSecret(value, env),
     nativeOpenAiFacts: async () => (await hub.nativeOpenAiFactsRead(await modelListStamp(env))) as NativeOpenAiFacts | undefined,
     openUpstreamSocket: (url, headers) => openUpstreamWebSocket(url, headers),
     skills: {

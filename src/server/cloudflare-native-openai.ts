@@ -30,10 +30,20 @@ import { createSseInspectorCore } from "./sse-inspector";
 import { composeSseBlockRewrites, composeSsePayloadRewrites, payloadRewriteAsBlockRewrite } from "./sse-payload-rewrite";
 import { collectSelfNamedNamespaceScrubAuthorization, createSelfNamedToolCallNamespaceScrubRewrite } from "./responses-self-named-namespace-scrub";
 import { currentTurnWireToolCatalogBody } from "./responses-undeclared-tool-guard";
-import { createRoutedNamespaceCallRestoreRewrite, type RoutedNamespaceToolAliases } from "../responses/namespace-tool-compat";
+import { createRoutedNamespaceCallRestoreRewrite, restoreRoutedNamespaceCalls, type RoutedNamespaceToolAliases } from "../responses/namespace-tool-compat";
 import { createResponsesFieldBackfillBlockRewrite } from "./responses/responses-field-backfill";
 import { usageFromResponsesPayload } from "../usage/responses-usage";
 import { createTranslatorBudget } from "../lib/translator-budget";
+import { formatErrorResponse } from "../bridge/errors";
+import type { ResponsesTerminalStatus } from "../bridge";
+import { readDisplaySafeErrorText } from "../lib/bounded-body";
+import { applyUpstreamRecoveryInit, fetchWithTransientRetry, isReplayRefusalResponse, TRANSIENT_RETRY_MAX_ATTEMPTS } from "../lib/upstream-retry";
+import { classifyTransportFailureKind } from "../lib/upstream-reachability";
+import { describeUpstreamConnectFailure } from "./responses/upstream-error";
+import { formatPassthroughUpstreamError } from "./responses/passthrough-error";
+import { captureTerminalHttpStatus, httpStatusForRequestLogTerminal, type TerminalStatusContext } from "./terminal-status";
+import { ADMISSION_TOLERANCE, estimateInputTokens } from "./responses/input-admission-core";
+import { usageDisplayTotalTokens } from "../usage/totals";
 import type { OcxProviderConfig, OcxUsage } from "../types";
 
 type Rec = Record<string, unknown>;
@@ -51,12 +61,29 @@ const BODY_FIELDS = new Set([
   "model", "instructions", "input", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "store",
   "stream", "include", "prompt_cache_key", "text", "client_metadata",
 ]);
-const INPUT_ITEMS = new Set(["message", "function_call", "function_call_output", "reasoning", "custom_tool_call", "custom_tool_call_output"]);
-const TOOL_TYPES = new Set(["function", "custom", "namespace"]);
+const INPUT_ITEMS = new Set(["message", "function_call", "function_call_output", "reasoning", "custom_tool_call", "custom_tool_call_output", "web_search_call"]);
+// The ChatGPT backend runs hosted web search itself; ocx's search sidecar is for routed providers.
+const TOOL_TYPES = new Set(["function", "custom", "namespace", "web_search"]);
 // router.ts's native family is wider; these are the plain release slugs. ocx rewrites or entitles
 // account-gated models and the Reserve lane (core-codex-account.ts, catalog/native-models.ts).
 const PLAIN_NATIVE_MODEL = /^gpt-\d+(?:\.\d+)?(?:-[a-z0-9]+)*$/;
 const GATED_NATIVE_MODEL = /daybreak|astra|reserve/;
+
+const CHATGPT_ACCESS_TOKEN = /^eyJ[\w-]*\.[\w-]+\.[\w-]+$/;
+
+/** A `type: "encrypted_content"` part anywhere in the input, which request-prepare.ts rewrites. */
+function hasEncryptedContentPart(value: unknown): boolean {
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (Array.isArray(node)) stack.push(...node);
+    else if (isRec(node)) {
+      if (node.type === "encrypted_content") return true;
+      stack.push(...Object.values(node));
+    }
+  }
+  return false;
+}
 
 /** Why this turn is not one the Worker can serve exactly as ocx would, or undefined when it is. */
 export function nativeOpenAiDeclineReason(body: Rec, headers: Headers, continued = false): string | undefined {
@@ -84,12 +111,15 @@ export function nativeOpenAiDeclineReason(body: Rec, headers: Headers, continued
     if (!isRec(item) || typeof item.type !== "string" || !INPUT_ITEMS.has(item.type)) return "input-item";
   }
   // request-prepare.ts rewrites plaintext spawn-message slots and recovers encrypted agent tasks.
-  if (JSON.stringify(body.input).includes("\"encrypted_content\",")) return "encrypted-content-part";
+  if (hasEncryptedContentPart(body.input)) return "encrypted-content-part";
   if (isThreadSpawnRequest(headers) || headers.has("x-codex-parent-thread-id")) return "collaboration-turn";
   if (headers.has("x-opencodex-grok")) return "grok-surface";
   // The caller's own login: its bearer and account, with the hub's key in the dedicated header
   // (auth-context.ts treats a bearer that is the admission key as a request for the stored main).
-  if (!/^Bearer\s+\S/i.test(headers.get("authorization") ?? "") || !headers.get("chatgpt-account-id") || !headers.get("x-opencodex-api-key")) {
+  // A ChatGPT login's bearer is its access token, a JWT; anything else (an API key, one of the hub's
+  // own keys) is not a login this path forwards.
+  const bearer = (headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+  if (!CHATGPT_ACCESS_TOKEN.test(bearer) || !headers.get("chatgpt-account-id")?.trim() || !headers.get("x-opencodex-api-key")) {
     return "caller-login";
   }
   return undefined;
@@ -157,15 +187,21 @@ function workerCodexWsFetch(
  * until the terminal, the first output, and the terminal status.
  */
 function createTurnInspector(onCompletedResponse?: (response: Rec) => void) {
-  let terminal: "completed" | "failed" | "incomplete" | null = null;
+  let terminal: ResponsesTerminalStatus | null = null;
   let usage: OcxUsage | undefined;
   let firstOutputAt: number | undefined;
+  const statusContext: TerminalStatusContext = {};
   const inspector = createSseInspectorCore({
-    onTerminal: status => { terminal ??= status === "completed" || status === "failed" || status === "incomplete" ? status : null; },
+    onTerminal: status => { terminal ??= status; },
     inspectLogPayload: (_payload, parsed) => {
       if (!isRec(parsed)) return;
       const source = isRec(parsed.response) ? parsed.response : parsed;
       usage = usageFromResponsesPayload(source.usage) ?? usage;
+      // request-log.ts's captureUpstreamErrorParsed, for the status its row records.
+      captureTerminalHttpStatus(statusContext, parsed);
+      const reason = isRec(parsed.response) && isRec(parsed.response.incomplete_details) ? parsed.response.incomplete_details.reason : undefined;
+      if (parsed.type === "response.incomplete" && statusContext.terminalIncompleteReason === undefined
+        && typeof reason === "string" && reason.trim()) statusContext.terminalIncompleteReason = reason.trim();
     },
     onFirstOutput: () => { firstOutputAt ??= Date.now(); },
     ...(onCompletedResponse ? { onCompletedResponse: (response: Rec) => onCompletedResponse(response) } : {}),
@@ -178,6 +214,7 @@ function createTurnInspector(onCompletedResponse?: (response: Rec) => void) {
     get terminal() { return terminal; },
     get usage() { return usage; },
     get firstOutputAt() { return firstOutputAt; },
+    statusContext,
   };
 }
 
@@ -193,6 +230,30 @@ export type NativeOpenAiTurnOptions = {
   onCompletedResponse?: (request: Record<string, unknown>, response: Rec) => void;
 };
 
+/** main-account-cache.ts's identity key for an account id. */
+async function mainQuotaIdentityKey(accountId: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`opencodex-main-quota-v1\0${accountId}`);
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// passthrough-dispatch.ts's header deadline (config.connectTimeoutMs, not admitted, defaults to it).
+const CONNECT_TIMEOUT_MS = 200_000;
+
+/** fetch-helpers.ts's fetchWithHeaderTimeout: identity encoding for a stream, no redirects, a deadline. */
+async function sendWithHeaderDeadline(
+  send: (init: RequestInit) => Promise<Response>, init: RequestInit, signal: AbortSignal,
+): Promise<Response> {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new DOMException("Timeout elapsed", "TimeoutError")), CONNECT_TIMEOUT_MS);
+  try {
+    const headers = new Headers(init.headers);
+    if (!headers.has("accept-encoding")) headers.set("accept-encoding", "identity");
+    return await send({ ...init, headers, redirect: "manual", signal: AbortSignal.any([signal, deadline.signal]) });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** The turn, or null (after `no`) when ocx would serve it differently or its state decides it. */
 export async function runNativeOpenAiTurn(
   body: Rec, headers: Headers, signal: AbortSignal, deps: NativeChatDeps,
@@ -200,18 +261,28 @@ export async function runNativeOpenAiTurn(
 ): Promise<NativeOpenAiTurn | null> {
   const declined = nativeOpenAiDeclineReason(body, headers, options.continued);
   if (declined) return no(declined);
+  // auth-cors.ts's isProxyAdmissionSecret: ocx never forwards one of its own keys upstream.
+  const bearer = headers.get("authorization")!.replace(/^Bearer\s+/i, "").trim();
+  if (!deps.isAdmissionSecret || (await deps.isAdmissionSecret(bearer))) return no("caller-login");
   const loaded = await loadNativeConfig(deps);
   if ("decline" in loaded) return no(loaded.decline);
   const provider = canonicalOpenAiRow(loaded.config);
   if (!provider) return no("openai-row");
+  // Configured client keys are checked by ocx (auth-cors.ts), which the Worker does not repeat.
+  if (isRec(loaded.config) && Array.isArray(loaded.config.apiKeys) && loaded.config.apiKeys.length > 0) return no("configured-api-keys");
   if (!(await noStoredCodexAccounts(deps))) return no("codex-accounts");
   const facts: NativeOpenAiFacts | undefined = await deps.nativeOpenAiFacts?.();
   if (!facts) return no("native-facts-unpublished");
-  if (facts.mainCredentialObserved) return no("main-credential-observed");
+  if (facts.codexAccountsStored) return no("codex-accounts");
+  // auth-context.ts: a caller holding the main login ocx observed gets its hard lock and cooldowns.
+  if (facts.mainAccountIdentityKey !== null
+    && facts.mainAccountIdentityKey === await mainQuotaIdentityKey(headers.get("chatgpt-account-id")!.trim())) return no("main-account");
   if (facts.nativeMainTrafficBlocked) return no("native-main-blocked");
   if (facts.contextRelayActive) return no("context-relay");
   if (facts.upstreamTransport === "proxied") return no("egress-proxy");
   if (facts.upstreamTransport === "websocket" && !deps.openUpstreamSocket) return no("upstream-websocket-unavailable");
+  const ceiling = Object.hasOwn(facts.inputCeilings, body.model as string) ? facts.inputCeilings[body.model as string] : undefined;
+  if (ceiling === undefined) return no("input-ceiling-unknown");
 
   const frozen = await freezeSkillsCatalog(body, headers, deps);
   if (frozen === "decline") return no("skills-snapshot-unavailable");
@@ -223,13 +294,16 @@ export async function runNativeOpenAiTurn(
   if (options.continued) parsed._previousResponseInputExpanded = true;
   // collaboration.ts: guidance for these surfaces reads the catalog and config on disk.
   if (collabSurface(parsed) !== null) return no("collaboration-turn");
+  // request-prepare.ts answers an input far past the model's window locally (checkInputAdmission).
+  if (ceiling !== null && estimateInputTokens(parsed, parsed.modelId, provider) > ceiling * ADMISSION_TOLERANCE) return no("input-admission");
   // core-normalize.ts: an omitted store is sent as false to this backend.
   if (isRec(parsed._rawBody) && parsed._rawBody.store === undefined) parsed._rawBody.store = false;
 
   const translatorBudget = createTranslatorBudget();
   const adapterDeps: ResponsesPassthroughAdapterDeps = {
     reasoningMetadata: NO_REASONING_METADATA,
-    supportsReasoningSummaries: modelId => Object.hasOwn(facts.reasoningSummarySupport, modelId) ? facts.reasoningSummarySupport[modelId] : undefined,
+    // Only read for a body carrying stream_options, which is declined above.
+    supportsReasoningSummaries: () => undefined,
     observeOutbound: () => {},
   };
   const adapter = createResponsesPassthroughAdapterWith(provider, adapterDeps);
@@ -250,6 +324,13 @@ export async function runNativeOpenAiTurn(
     translatorBudget.dispose();
     return no("build-request");
   }
+  // The client and continuation restores passthrough-dispatch.ts applies for these are not
+  // reproduced here; the canonical row converts none on an ordinary Codex turn.
+  if ((request.convertedRoutedNamespaceToolAliases?.size ?? 0) > 0 || (request.convertedMuseToolNameAliases?.size ?? 0) > 0
+    || (request.plaintextV2AgentMessageToolNames?.size ?? 0) > 0 || (request.convertedRoutedToolSearchNames?.size ?? 0) > 0) {
+    translatorBudget.dispose();
+    return no("converted-tools");
+  }
   const conversationId = conversationIdFromResponsesRequest({
     clientThreadId: parsed._clientThreadId,
     sessionIdHeader: sessionIdHeaderFromRequest(headers),
@@ -257,45 +338,8 @@ export async function runNativeOpenAiTurn(
     cursorConversationId: parsed._cursorConversationId,
   });
   const requestedEffort = parsed.options.reasoning;
-
-  const upstreamAbort = new AbortController();
-  const upstreamSignal = AbortSignal.any([signal, upstreamAbort.signal]);
-  const init: RequestInit = { method: request.method, headers: request.headers, body: request.body, signal: upstreamSignal };
-  const sseFetch = (url: string, httpInit: RequestInit) => deps.fetch(new Request(url, httpInit));
-  let upstream: Response;
-  try {
-    upstream = facts.upstreamTransport === "websocket"
-      ? await workerCodexWsFetch(request.url, init, deps.openUpstreamSocket!, sseFetch)
-      : await sseFetch(request.url, init);
-  } catch {
-    translatorBudget.dispose();
-    return no("upstream-unreachable");
-  }
-  if (!upstream.ok || !upstream.body) {
-    await upstream.body?.cancel().catch(() => {});
-    translatorBudget.dispose();
-    return no(`upstream-${upstream.status}`);
-  }
-  commitSkills?.();
-
-  const payloadRewrites = [
-    createSelfNamedToolCallNamespaceScrubRewrite(scrubAuthorization),
-    bareNamespaceAliases.size > 0 ? createRoutedNamespaceCallRestoreRewrite(bareNamespaceAliases) : undefined,
-  ].filter((rewrite): rewrite is NonNullable<typeof rewrite> => rewrite !== undefined);
-  const rewriteBlocks = composeSseBlockRewrites(
-    payloadRewriteAsBlockRewrite(composeSsePayloadRewrites(...payloadRewrites)),
-    createResponsesFieldBackfillBlockRewrite(),
-  );
-  const rawBody = parsed._rawBody as Record<string, unknown>;
-  const inspector = createTurnInspector(options.onCompletedResponse ? response => options.onCompletedResponse!(rawBody, response) : undefined);
-  const turnAc = new AbortController();
-  turnAc.signal.addEventListener("abort", () => upstreamAbort.abort(), { once: true });
-  let recorded = false;
-  const record = (status: number) => {
-    if (recorded) return;
-    recorded = true;
-    const usage = inspector.usage;
-    const row: WorkerUsageRow = {
+  const recordRow = (status: number, fields: Partial<WorkerUsageRow> = {}) => {
+    deps.recordUsage?.({
       requestId: crypto.randomUUID(),
       timestamp: startedAt,
       provider: "openai",
@@ -308,27 +352,115 @@ export async function runNativeOpenAiTurn(
       admissionKind: "environment",
       status,
       durationMs: Date.now() - startedAt,
+      usageStatus: "unreported",
+      ...fields,
+    });
+  };
+
+  // passthrough-dispatch.ts: ocx's transient ladder, with no ambiguous resend (ocx may buy one; the
+  // Worker never sends a turn a second time that may already be running).
+  const upstreamAbort = new AbortController();
+  const upstreamSignal = AbortSignal.any([signal, upstreamAbort.signal]);
+  const sseFetch = (url: string, httpInit: RequestInit) => deps.fetch(new Request(url, httpInit));
+  const baseInit: RequestInit = { method: request.method, headers: request.headers, body: request.body };
+  let upstream: Response;
+  try {
+    upstream = await fetchWithTransientRetry(recovery => sendWithHeaderDeadline(init => facts.upstreamTransport === "websocket"
+      ? workerCodexWsFetch(request.url, init, deps.openUpstreamSocket!, sseFetch)
+      : sseFetch(request.url, init), applyUpstreamRecoveryInit(baseInit, recovery), upstreamSignal),
+    { abortSignal: upstreamSignal, label: "chatgpt.com", attempts: TRANSIENT_RETRY_MAX_ATTEMPTS, claimAmbiguousResend: () => false });
+  } catch (error) {
+    translatorBudget.dispose();
+    commitSkills?.();
+    if (signal.aborted) {
+      recordRow(499);
+      return { response: formatErrorResponse(499, "client_cancelled", "Client cancelled request") };
+    }
+    const message = classifyTransportFailureKind(error) === "timeout"
+      ? `Provider connect timeout after ${CONNECT_TIMEOUT_MS}ms`
+      : describeUpstreamConnectFailure(error, CONNECT_TIMEOUT_MS);
+    recordRow(502);
+    return { response: formatErrorResponse(502, "upstream_error", message) };
+  }
+  const responseHeaders = sanitizePassthroughHeaders(upstream.headers);
+  // A refused create generated nothing: ocx sends it itself and runs its own recovery on the answer.
+  if (upstream.status >= 400 && upstream.status < 500) {
+    await upstream.body?.cancel().catch(() => {});
+    translatorBudget.dispose();
+    return no(`upstream-${upstream.status}`);
+  }
+  commitSkills?.();
+  if (upstream.status >= 300 && upstream.status < 400) {
+    translatorBudget.dispose();
+    recordRow(upstream.status);
+    return { response: new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders }) };
+  }
+  if (!upstream.ok) {
+    const errorText = await readDisplaySafeErrorText(upstream, upstreamSignal, "");
+    translatorBudget.dispose();
+    recordRow(upstream.status);
+    return { response: formatPassthroughUpstreamError(upstream.status, errorText, {
+      statusText: upstream.statusText, headers: responseHeaders, replayRefusal: isReplayRefusalResponse(upstream),
+    }) };
+  }
+  const servedModel = responseHeaders.get("openai-model")?.trim();
+  const contentType = responseHeaders.get("content-type")?.toLowerCase();
+  if (!upstream.body || !(contentType?.includes("text/event-stream") || (!contentType && parsed.stream))) {
+    // passthrough-delivery.ts relays anything but an event stream outside the SSE relay.
+    translatorBudget.dispose();
+    await upstream.body?.cancel().catch(() => {});
+    return no("upstream-not-event-stream");
+  }
+
+  const payloadRewrites = [
+    createSelfNamedToolCallNamespaceScrubRewrite(scrubAuthorization),
+    bareNamespaceAliases.size > 0 ? createRoutedNamespaceCallRestoreRewrite(bareNamespaceAliases) : undefined,
+  ].filter((rewrite): rewrite is NonNullable<typeof rewrite> => rewrite !== undefined);
+  const rewriteBlocks = composeSseBlockRewrites(
+    payloadRewriteAsBlockRewrite(composeSsePayloadRewrites(...payloadRewrites)),
+    createResponsesFieldBackfillBlockRewrite(),
+  );
+  const rawBody = parsed._rawBody as Record<string, unknown>;
+  // passthrough-dispatch.ts's rememberPassthroughResponseChecked: the continuation keeps the
+  // client's own tool names (the bare-namespace restore), as the client sent them back.
+  const remember = options.onCompletedResponse
+    ? (response: Rec) => options.onCompletedResponse!(rawBody, restoreRoutedNamespaceCalls(response, bareNamespaceAliases).value as Rec)
+    : undefined;
+  const inspector = createTurnInspector(remember);
+  const turnAc = new AbortController();
+  turnAc.signal.addEventListener("abort", () => upstreamAbort.abort(), { once: true });
+  let recorded = false;
+  const record = (status: number) => {
+    if (recorded) return;
+    recorded = true;
+    const usage = inspector.usage;
+    recordRow(status, {
+      ...(servedModel ? { resolvedModel: servedModel } : {}),
       ...(inspector.firstOutputAt !== undefined ? { firstOutputMs: inspector.firstOutputAt - startedAt } : {}),
       usageStatus: usage ? "reported" : "unreported",
-      ...(usage ? { usage: usage as NonNullable<WorkerUsageRow["usage"]>, totalTokens: usage.totalTokens ?? usage.inputTokens + usage.outputTokens } : {}),
-    };
-    deps.recordUsage?.(row);
+      ...(usage ? { usage: usage as NonNullable<WorkerUsageRow["usage"]>, totalTokens: usageDisplayTotalTokens(usage) } : {}),
+    });
   };
-  let synthetic: "incomplete" | "failed" | undefined;
   const relayed = relaySseEagerBounded(upstream.body, turnAc, {
     inspectChunk: chunk => inspector.feed(chunk),
     finishInspection: () => inspector.finish(),
     disposeInspection: () => inspector.dispose(),
     sawTerminal: () => inspector.terminalSeen(),
     rewriteBlocks,
-    onSynthetic: kind => { synthetic ??= kind; },
+    // passthrough-delivery.ts's reportNativeTerminal for a synthetic end.
+    onSynthetic: (kind, reason) => {
+      if (kind === "incomplete") record(httpStatusForRequestLogTerminal("incomplete", inspector.statusContext));
+      else if (reason === "upstream_error") record(inspector.statusContext.terminalHttpStatus ?? 502);
+      else record(502);
+    },
     onClientCancel: () => record(499),
     onDone: () => {
       translatorBudget.dispose();
-      record(signal.aborted ? 499 : inspector.terminal === "completed" && !synthetic ? 200 : inspector.terminal === "incomplete" ? 200 : 502);
+      const terminal = inspector.terminal;
+      if (terminal) record(httpStatusForRequestLogTerminal(terminal, inspector.statusContext));
+      else record(signal.aborted ? 499 : 502);
     },
   }, { clientGoneSignal: signal, terminalBoundary: { dropCodexSafetyBuffering: false }, rewriteBudget: translatorBudget });
-  const responseHeaders = sanitizePassthroughHeaders(upstream.headers);
   if (!responseHeaders.has("content-type")) responseHeaders.set("content-type", "text/event-stream");
   return { response: new Response(relayed, { status: upstream.status, headers: responseHeaders }) };
 }

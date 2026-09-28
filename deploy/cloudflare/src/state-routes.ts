@@ -18,7 +18,7 @@ export interface StateHub {
   modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string): Promise<boolean>;
   reasoningMetadataCommit(bootId: string, kind: ReasoningMetadataKind, body: string, version: number): Promise<boolean>;
   clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string): Promise<boolean>;
-  nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string): Promise<boolean>;
+  nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string, version: number): Promise<boolean>;
 }
 
 export interface StateBucket {
@@ -53,18 +53,20 @@ export async function sweepOrphans(hub: Pick<StateHub, "currentSnapshot">, bucke
 
 // A catalog's worth of model ids with a boolean each; far below this.
 const MAX_NATIVE_OPENAI_FACTS_BYTES = 256 * 1024;
-const FACT_FLAGS = ["mainCredentialObserved", "nativeMainTrafficBlocked", "contextRelayActive"];
+const FACT_FLAGS = ["codexAccountsStored", "nativeMainTrafficBlocked", "contextRelayActive"];
 
 /** NativeOpenAiFacts (src/server/cloudflare-native-chat-api.ts), exactly. */
 export function isNativeOpenAiFacts(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const facts = value as Record<string, unknown>;
-  if (Object.keys(facts).length !== FACT_FLAGS.length + 2) return false;
+  if (Object.keys(facts).length !== FACT_FLAGS.length + 4) return false;
+  if (!Number.isSafeInteger(facts.version)) return false;
   if (!FACT_FLAGS.every(flag => typeof facts[flag] === "boolean")) return false;
+  if (facts.mainAccountIdentityKey !== null && !(typeof facts.mainAccountIdentityKey === "string" && /^[0-9a-f]{64}$/.test(facts.mainAccountIdentityKey))) return false;
   if (!["websocket", "sse", "proxied"].includes(facts.upstreamTransport as string)) return false;
-  const support = facts.reasoningSummarySupport;
-  return !!support && typeof support === "object" && !Array.isArray(support)
-    && Object.values(support).every(answer => typeof answer === "boolean");
+  const ceilings = facts.inputCeilings;
+  return !!ceilings && typeof ceilings === "object" && !Array.isArray(ceilings)
+    && Object.values(ceilings).every(ceiling => ceiling === null || (typeof ceiling === "number" && Number.isFinite(ceiling) && ceiling > 0));
 }
 
 // client-fingerprint.ts's CLAUDE_CODE_RUNTIME_HEADERS, each a short header-safe value.
@@ -170,7 +172,8 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     let facts: unknown;
     try { facts = JSON.parse(text); } catch { facts = undefined; }
     if (!isNativeOpenAiFacts(facts)) return new Response("native OpenAI facts required", { status: 400 });
-    return (await hub.nativeOpenAiFactsCommit(bootId, facts, stamp)) ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
+    const version = (facts as { version: number }).version;
+    return (await hub.nativeOpenAiFactsCommit(bootId, facts, stamp, version)) ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
   }
   if (path === "/client-runtime" && req.method === "PUT") {
     let headers: unknown;

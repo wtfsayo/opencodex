@@ -73,10 +73,11 @@ type StoredReasoningMetadata = { bootId: string; version: number; body: string }
 // under the stamp of the Worker version and container environment they were published under. Only
 // the newest is kept: a Worker version other than the hub's must not reuse an older container's.
 const CLIENT_RUNTIME_KEY = "ocx:client-runtime";
-// What a ChatGPT passthrough turn reads from ocx's process (src/server/worker-native-state.ts). It
-// describes one process, so it counts only while that boot holds the lease, and only under its stamp.
+// What a ChatGPT passthrough turn reads from ocx's process (src/server/worker-native-state.ts), under
+// the stamp it was published under. It outlives the process's sleep, since the next boot restores
+// the same state, and stops counting once another boot holds the lease, until that one publishes.
 const NATIVE_OPENAI_FACTS_KEY = "ocx:native-openai-facts";
-type StoredNativeOpenAiFacts = { bootId: string; stamp: string; facts: unknown };
+type StoredNativeOpenAiFacts = { bootId: string; stamp: string; version: number; facts: unknown };
 type StoredClientRuntime = { stamp: string; headers: Record<string, string> };
 
 const LEASE_KEY = "ocx:lease";
@@ -306,15 +307,20 @@ export class LeaseState {
     return out;
   }
 
-  async nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string): Promise<boolean> {
+  /** Publishes from one process can land out of order; an older version from it is ignored. */
+  async nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string, version: number): Promise<boolean> {
     if (!(await this.holdsLease(bootId))) return false;
-    await this.storage.put<StoredNativeOpenAiFacts>(NATIVE_OPENAI_FACTS_KEY, { bootId, stamp, facts });
+    const stored = await this.storage.get<StoredNativeOpenAiFacts>(NATIVE_OPENAI_FACTS_KEY);
+    if (stored?.bootId === bootId && stored.version >= version) return true;
+    await this.storage.put<StoredNativeOpenAiFacts>(NATIVE_OPENAI_FACTS_KEY, { bootId, stamp, version, facts });
     return true;
   }
 
   async nativeOpenAiFactsRead(stamp: string): Promise<unknown> {
     const stored = await this.storage.get<StoredNativeOpenAiFacts>(NATIVE_OPENAI_FACTS_KEY);
-    if (!stored || stored.stamp !== stamp || !(await this.holdsLease(stored.bootId))) return undefined;
+    if (!stored || stored.stamp !== stamp) return undefined;
+    const lease = await this.storage.get<Lease>(LEASE_KEY);
+    if (lease && lease.bootId !== stored.bootId && this.now() - lease.heartbeatAt < LEASE_STALE_MS) return undefined;
     return stored.facts;
   }
 

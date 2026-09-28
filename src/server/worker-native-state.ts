@@ -4,10 +4,15 @@ import { CLAUDE_CODE_HEADERS, CLAUDE_CODE_RUNTIME_HEADERS } from "../adapters/cl
 import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 import { resolveProxyRoute } from "../lib/proxy-env";
 import { startWorkerUsageInbox } from "../usage/worker-usage-inbox";
-import { catalogModelSupportsReasoningSummaries, readCatalog, readCodexCatalogPath } from "../codex/catalog";
-import { activeCodexModelsCachePath } from "../codex/catalog/parsing";
+import { loadConfig } from "../config";
+import { listCodexAccountIds } from "../codex/account-store";
+import { NATIVE_OPENAI_CONTEXT_OVERRIDES, nativeContextLimits } from "../codex/catalog/metadata";
+import { NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS, NATIVE_OPENAI_MODELS } from "../codex/catalog/native-models";
+import { listModelMetadata } from "../generated/model-metadata";
+import { OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
+import { resolveInputCeiling } from "./responses/input-admission";
 import { contextRelayActivated } from "../codex/context-compat";
-import { mainQuotaCredentialObserved, onMainQuotaCredentialChange } from "../codex/main-account-cache";
+import { getObservedMainQuotaIdentityKey, mainQuotaCredentialObserved, onMainQuotaCredentialChange } from "../codex/main-account-cache";
 import { isNativeMainTrafficBlocked } from "../codex/native-profile-startup";
 import { CODEX_RESPONSES_HTTP_URL, CODEX_RESPONSES_WS_URL } from "./responses/codex-ws-request";
 import { shouldUseCodexWsUpstream } from "./responses/ws-upstream";
@@ -35,27 +40,22 @@ export function publishClientRuntimeForWorker(retrySoon = false): Promise<void> 
     .then(ok => { if (!ok && retrySoon) setTimeout(() => void publishClientRuntimeForWorker(), FIRST_RETRY_MS).unref?.(); });
 }
 
-/**
- * The Codex catalog's reasoning-summary answer for every id it could give one for: each slug, and
- * the part after a provider prefix, which is how catalogModelSupportsReasoningSummaries matches a
- * bare id. An id outside the map gets no answer from ocx either.
- */
-function reasoningSummarySupport(): Record<string, boolean> {
-  const catalog = readCatalog(readCodexCatalogPath()) ?? readCatalog(activeCodexModelsCachePath());
-  const candidates = new Set<string>();
-  for (const entry of catalog?.models ?? []) {
-    for (const id of [entry.slug, entry.id]) {
-      if (typeof id !== "string" || id === "") continue;
-      candidates.add(id);
-      if (id.includes("/")) candidates.add(id.slice(id.indexOf("/") + 1));
-    }
-  }
-  const support: Record<string, boolean> = {};
-  for (const id of candidates) {
-    const answer = catalogModelSupportsReasoningSummaries(id);
-    if (typeof answer === "boolean") support[id] = answer;
-  }
-  return support;
+/** Every native model id ocx has a context table or metadata row for. */
+function nativeModelIds(): string[] {
+  const ids = new Set<string>([...NATIVE_OPENAI_MODELS, ...NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS, ...Object.keys(NATIVE_OPENAI_CONTEXT_OVERRIDES)]);
+  for (const catalog of ["openai-codex", "openai"]) for (const row of listModelMetadata(catalog)) ids.add(row.id);
+  return [...ids].filter(id => /^gpt-/.test(id));
+}
+
+/** request-prepare.ts's ceiling for the canonical `openai` row, per native model id. */
+function inputCeilings(): Record<string, number | null> {
+  const config = loadConfig();
+  const provider = config.providers?.[OPENAI_CODEX_PROVIDER_ID];
+  const ceilings: Record<string, number | null> = {};
+  if (!provider) return ceilings;
+  const limits = nativeContextLimits(config);
+  for (const id of nativeModelIds()) ceilings[id] = resolveInputCeiling(provider, OPENAI_CODEX_PROVIDER_ID, id, limits);
+  return ceilings;
 }
 
 /** ws-upstream.ts's choice for a streamed turn to the ChatGPT backend, in this process. */
@@ -66,25 +66,43 @@ function upstreamTransport(): NativeOpenAiFacts["upstreamTransport"] {
   return websocket ? "websocket" : "sse";
 }
 
-export function nativeOpenAiFacts(): NativeOpenAiFacts {
+function mainAccountIdentityKey(): string | null {
+  return mainQuotaCredentialObserved() ? getObservedMainQuotaIdentityKey() ?? null : null;
+}
+
+let factsVersion = Date.now();
+// Computed on the publish cadence, off any request: the catalog tables and config read are not free.
+let cachedCeilings: Record<string, number | null> | undefined;
+let publishedMainKey: string | null | undefined;
+let publishScheduled = false;
+
+export function nativeOpenAiFacts(refreshCeilings = false): NativeOpenAiFacts {
+  if (refreshCeilings || !cachedCeilings) cachedCeilings = inputCeilings();
   return {
-    mainCredentialObserved: mainQuotaCredentialObserved(),
+    version: ++factsVersion,
+    mainAccountIdentityKey: mainAccountIdentityKey(),
+    codexAccountsStored: listCodexAccountIds().length > 0,
     nativeMainTrafficBlocked: isNativeMainTrafficBlocked(),
     contextRelayActive: contextRelayActivated(),
     upstreamTransport: upstreamTransport(),
-    reasoningSummarySupport: reasoningSummarySupport(),
+    inputCeilings: cachedCeilings,
   };
 }
 
 /**
- * What a ChatGPT passthrough turn reads from this process (NativeOpenAiFacts). Published at start, on
- * every change of the observed main credential, and on the republish cadence for the rest (the
- * catalog, the ownership fence), so the Worker declines rather than serve on a stale answer.
+ * What a ChatGPT passthrough turn reads from this process (NativeOpenAiFacts). Published at start,
+ * when the observed main account changes, and on the republish cadence for the rest.
  */
-export function publishNativeOpenAiFactsForWorker(retrySoon = false): Promise<void> | undefined {
+export function publishNativeOpenAiFactsForWorker(retrySoon = false, refreshCeilings = false): Promise<void> | undefined {
   if (process.env.OCX_WORKER_NATIVE_STATE !== "1" || !durableMirrorEnabled()) return undefined;
   let facts: NativeOpenAiFacts;
-  try { facts = nativeOpenAiFacts(); } catch { return undefined; }
+  try {
+    facts = nativeOpenAiFacts(refreshCeilings);
+  } catch (error) {
+    console.warn(`[opencodex] Worker facts not published: ${error instanceof Error ? error.name : "error"}`);
+    return undefined;
+  }
+  publishedMainKey = facts.mainAccountIdentityKey;
   return stateRequest("/native-openai-facts", {
     method: "PUT",
     headers: { "content-type": "application/json" },
@@ -93,15 +111,25 @@ export function publishNativeOpenAiFactsForWorker(retrySoon = false): Promise<vo
     .then(ok => { if (!ok && retrySoon) setTimeout(() => void publishNativeOpenAiFactsForWorker(), FIRST_RETRY_MS).unref?.(); });
 }
 
+/** A main-credential observation: republish, after the request that caused it, only if it changed. */
+function mainCredentialChanged(): void {
+  if (publishScheduled || mainAccountIdentityKey() === publishedMainKey) return;
+  publishScheduled = true;
+  setTimeout(() => {
+    publishScheduled = false;
+    if (mainAccountIdentityKey() !== publishedMainKey) void publishNativeOpenAiFactsForWorker(true);
+  }, 0).unref?.();
+}
+
 export function startWorkerNativeState(): void {
   startWorkerUsageInbox();
   const published = publishClientRuntimeForWorker(true);
-  void publishNativeOpenAiFactsForWorker(true);
+  void publishNativeOpenAiFactsForWorker(true, true);
   if (published && !republish) {
-    onMainQuotaCredentialChange(() => void publishNativeOpenAiFactsForWorker(true));
+    onMainQuotaCredentialChange(mainCredentialChanged);
     republish = setInterval(() => {
       void publishClientRuntimeForWorker();
-      void publishNativeOpenAiFactsForWorker();
+      void publishNativeOpenAiFactsForWorker(false, true);
     }, REPUBLISH_MS);
     republish.unref?.();
   }

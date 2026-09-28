@@ -28,6 +28,8 @@ export type NativeChatDeps = {
    * them (worker-native-state.ts); undefined until it has.
    */
   clientRuntime?(): Promise<Record<string, string> | undefined>;
+  /** Whether a value is one of the hub's own admission or admin keys, which ocx never forwards upstream. */
+  isAdmissionSecret?(value: string): Promise<boolean>;
   /** The Durable Object's copy of codex-accounts.json, read only for a turn to the native OpenAI provider. */
   readCodexAccounts?(): Promise<string | undefined>;
   /** What ocx's process holds that a native OpenAI turn depends on, as published for this deployment. */
@@ -42,17 +44,23 @@ export type NativeChatDeps = {
 
 /**
  * ocx's own state that decides a ChatGPT passthrough turn (server/worker-native-state.ts publishes
- * it): whether a Codex main login is observed (its hard lock and cooldowns then apply to a caller
- * holding it), whether native main traffic is fenced, whether the context relay records sessions,
- * the upstream transport ocx dials, and the Codex catalog's reasoning-summary support by model id.
+ * it). Newer versions from one process replace older ones.
  */
 export type NativeOpenAiFacts = {
-  mainCredentialObserved: boolean;
+  version: number;
+  /**
+   * main-account-cache.ts's identity key (a sha256 of the account id) of the main login ocx has
+   * observed, or null: a caller holding that account gets ocx's hard lock and cooldowns.
+   */
+  mainAccountIdentityKey: string | null;
+  /** Codex accounts in ocx's store: pool selection then decides whose login a turn uses. */
+  codexAccountsStored: boolean;
   nativeMainTrafficBlocked: boolean;
   contextRelayActive: boolean;
   /** "proxied" when an egress proxy carries ocx's upstream traffic, which the Worker cannot use. */
   upstreamTransport: "websocket" | "sse" | "proxied";
-  reasoningSummarySupport: Record<string, boolean>;
+  /** input-admission.ts's ceiling for each native model id ocx knows, null where it has none. */
+  inputCeilings: Record<string, number | null>;
 };
 
 /** Serves the turn, or returns null to hand the request (with `bodyText`) to the container. */

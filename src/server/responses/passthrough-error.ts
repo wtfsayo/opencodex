@@ -1,4 +1,4 @@
-import { formatErrorResponse } from "../../bridge";
+import { formatErrorResponse } from "../../bridge/errors";
 import { isCyberPolicyCode, isCyberPolicyMessage } from "../../lib/errors";
 import {
   applyReplayRefusalClientHeaders,

@@ -183,15 +183,19 @@ export function createNativeWsSession(link: NativeWsLink, upgradeHeaders: Header
     const no = (reason: string) => { deps.onDecline?.(`responses-ws:${reason}`); return null; };
     const previous = typeof payload.previous_response_id === "string" ? continuations.get(payload.previous_response_id) : undefined;
     let body = payload;
+    let prefixLength: number | undefined;
     if (previous) {
       const expansion = expandWithReplayEntry(payload, previous);
       if (expansion.kind === "scope-mismatch") { relay(raw); return; }
       body = expansion.body;
-      replayedInputPrefixLengths.set(body, expansion.prefixLength);
+      prefixLength = expansion.prefixLength;
     }
+    // The provenance belongs to the very object the turn parses (parser.ts reads it by identity).
+    const turnBody = { ...body, stream: true };
+    if (prefixLength !== undefined) replayedInputPrefixLengths.set(turnBody, prefixLength);
     let turn;
     try {
-      turn = await runNativeOpenAiTurn({ ...body, stream: true }, nativeHeaders, signal, deps, no, Date.now(), {
+      turn = await runNativeOpenAiTurn(turnBody, nativeHeaders, signal, deps, no, Date.now(), {
         continued: previous !== undefined,
         onCompletedResponse: rememberContinuation,
       });

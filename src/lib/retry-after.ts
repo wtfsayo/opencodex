@@ -1,4 +1,4 @@
-import { parseRetryAfterMs } from "../combos";
+import { parseRetryAfterMs } from "./retry-after-parse";
 import { classifyError, parseRetryAfterFromMessage } from "./errors";
 
 /** Small default when a retryable 429 has no upstream Retry-After (#507). */

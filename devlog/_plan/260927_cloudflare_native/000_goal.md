@@ -231,5 +231,25 @@ prompt; Scout writes tool calls as text; Mistral Small 3.1 refuses the `system` 
 Code inserts after a tool result ("Unexpected role 'system' after role 'tool'"). The last one is
 ocx's openai-chat translation, not the Worker.
 
-Still container-only: `/v1/models`, WebSocket Responses, the dashboard and management API, OAuth
-and Codex-pool providers, and effort on destinations with models.dev metadata (OpenCode Zen).
+Model lists (branch `feat/cloudflare-worker-models`, 2026-09-28): ocx's `/v1/models` reads
+upstream discovery, Codex entitlements and catalog files, and can write the initial model
+selection, so the Worker replays answers instead: ocx publishes each answer for the data token with
+the time until it would refetch any input (a stale cache entry, or a failed discovery's 30 s
+cooldown), tagged with the three document sequences read before and after answering; the object
+stamps it with the Worker version and container environment. Answers with native ChatGPT rows are
+never published. Live on `opencodex-wo2-test`: the first request reached ocx and published, the
+next five within the window came from the Worker in about 190 ms each (the container path took
+about 2 s). Workers AI has no model listing, so its lists last only the cooldown; the default
+model cache time is also shorter than the container's sleep delay, so the replay mostly saves the
+hop to a running container. Two reviews shaped this: the first version replayed for a fixed TTL
+from publish, missed deploys and secret changes, and keyed repeated parameters ambiguously.
+
+OpenCode Zen and Go (branch `feat/cloudflare-worker-zen`): the Worker adds Go's session header as
+ocx does, and maps effort for both destinations from the models.dev snapshot and learned refusals
+ocx publishes to the object (reads moved to `src/providers/reasoning-metadata-core.ts`). Verified by
+tests that run ocx and the Worker side by side (headers for five lane sources, efforts for six
+rungs on two models with a refused rung in play); not run live, as the test account has no
+OpenCode key.
+
+Still container-only: WebSocket Responses, the dashboard and management API, OAuth and Codex-pool
+providers, spend limits, and the web-search sidecar.

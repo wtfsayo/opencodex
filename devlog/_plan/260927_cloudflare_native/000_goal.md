@@ -368,3 +368,10 @@ write it, and the Worker declines when it does, when Codex accounts are stored, 
 Searching itself stays with ocx. Separately, the usage-inbox drain now books Worker turns in ocx's
 spend ledger (once per request id), so a limit configured later counts them.
 
+Dashboard and management API: decided to stay with the container. The dashboard calls 75
+management endpoints; the writes change ocx's state, and the reads compute live answers from state
+only ocx holds (usage.jsonl, quota caches, OAuth stores, lab data, remote-workspace sessions). The
+one container-free design, replaying ocx's last answers from the Durable Object as model lists are,
+has no freshness rule of ocx's own to bound it, so it would show stale usage and quotas where ocx
+shows live ones. The Worker serves the dashboard's files, and opening it wakes the container.
+

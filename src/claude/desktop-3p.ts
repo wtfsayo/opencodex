@@ -1,4 +1,5 @@
 import { readClientConnectionState } from "../client/state";
+import { registerDesktop3pLookup } from "./desktop-3p-slot";
 import { readServiceApiTokenState, readTokenBackupState } from "../lib/service-secrets";
 import { withClientLifecycleSync, type ClientLifecycleLockDeps } from "../client/lifecycle-lock";
 import { applyRemoteDesktopStore, inspectRemoteDesktopCleanup, restoreRemoteDesktopStore } from "./desktop-remote-store";
@@ -778,3 +779,9 @@ export function atomicReplaceDesktopConfig(
   writer(path, content);
   return existsSync(backupPath) ? { backupPath } : {};
 }
+
+registerDesktop3pLookup({
+  resolve: resolveDesktop3pAlias,
+  isUnresolved: isUnresolvedDesktop3pAlias,
+  isDateShaped: validDateAlias,
+});

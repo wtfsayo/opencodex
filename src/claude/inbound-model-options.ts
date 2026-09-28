@@ -1,9 +1,8 @@
 import type { OcxClaudeCodeConfig } from "../types";
 import { isAnthropicOutputSchema, satisfiesOpenAiStrictSchema } from "../adapters/anthropic-output-schema";
-import { resolveAlias } from "./alias";
-import { stripOneMillionMarker } from "./context-windows";
-import { isUnresolvedDesktop3pAlias, resolveDesktop3pAlias } from "./desktop-3p";
-import { validDateAlias } from "./desktop-profile";
+import { resolveAlias } from "./alias-codec";
+import { stripOneMillionMarker } from "./one-m-marker";
+import { desktop3pLookup } from "./desktop-3p-slot";
 import { AnthropicRequestError, DesktopModelMappingUnavailableError, isRec, type Rec } from "./inbound-records";
 
 function isClaudeClassifierModel(model: string): boolean {
@@ -45,7 +44,8 @@ export function resolveInboundModel(model: string, cc?: OcxClaudeCodeConfig): st
   const aliased = resolveAlias(model);
   if (aliased) return aliased;
   // Desktop 3P aliases: claude-opus-4-{code} → provider/model route key
-  const desktop3p = resolveDesktop3pAlias(model);
+  const desktop = desktop3pLookup();
+  const desktop3p = desktop.resolve(model);
   if (desktop3p) {
     // Native pseudo-provider returns bare slug; routed returns provider/model
     const sep = desktop3p.indexOf("/");
@@ -55,11 +55,11 @@ export function resolveInboundModel(model: string, cc?: OcxClaudeCodeConfig): st
   const map = cc?.modelMap ?? {};
   const exact = map[model];
   if (typeof exact === "string" && exact.length > 0) return exact;
-  if (isUnresolvedDesktop3pAlias(model)) {
+  if (desktop.isUnresolved(model)) {
     const base = model.endsWith("--fast") ? model.slice(0, -"--fast".length) : model;
     // A missing date-shaped ID is ambiguous even after a successful but partial
     // discovery. Never infer that a genuine native model is invalid or reroute it.
-    if (validDateAlias(base)) throw new DesktopModelMappingUnavailableError();
+    if (desktop.isDateShaped(base)) throw new DesktopModelMappingUnavailableError();
     throw new AnthropicRequestError("Unknown Claude Desktop alias; reapply the Desktop profile from the connected hub");
   }
   const stripped = model.replace(/-\d{8}$/, "");

@@ -12,6 +12,8 @@
  */
 import { aliasForNative, aliasForRoute, currentClaudeAliasSpelling, legacyAliasForNative, legacyAliasForRoute } from "./alias";
 import { desktop3pAlias } from "./desktop-3p";
+import { ONE_M_MARKER_RE, stripOneMillionMarker } from "./one-m-marker";
+export { stripOneMillionMarker };
 import { nativeOpenAiContextWindow, type CatalogModel, type NativeContextLimitsInput } from "../codex/catalog";
 import { ANTHROPIC_MODEL_CONTEXT_WINDOWS } from "../providers/registry/model-seeds";
 import type { OcxClaudeCodeConfig } from "../types";
@@ -47,12 +49,8 @@ export const AUTO_COMPACT_WINDOW_MIN = 100_000;
 export const AUTO_COMPACT_WINDOW_MAX = ONE_MILLION;
 
 /** Case-insensitive [1m] marker helpers — the CLI matches /\[1m\]/i (audit 021 #7). */
-const ONE_M_MARKER_RE = /\[1m\]$/i;
 export function hasOneMillionMarker(value: string): boolean {
   return ONE_M_MARKER_RE.test(value);
-}
-export function stripOneMillionMarker(value: string): string {
-  return value.replace(ONE_M_MARKER_RE, "");
 }
 
 export interface AutoContextMode {

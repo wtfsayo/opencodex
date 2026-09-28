@@ -38,6 +38,7 @@ import {
   prepareSameTarget429Wait,
   sleepWithAbort,
 } from "../../lib/upstream-retry";
+import { routedUpstreamErrorResponse } from "./routed-upstream-error";
 import { describeUpstreamConnectFailure } from "./upstream-error";
 import type { OpaqueBlobRecoveryGuard } from "./core-opaque-recovery";
 import type { AttemptRecoveryKind } from "../../usage/log";
@@ -1284,40 +1285,7 @@ export async function prepareAdapterExchange(
         errorType: normalized.type, code: normalized.code,
         message: "Structured upstream failure observed before client formatting",
       });
-      const message = normalized.cyberPolicy
-        ? normalized.message
-          ?? (isCyberPolicyCode(normalized.code) ? CYBER_POLICY_FALLBACK_MESSAGE : normalized.safeText)
-        : enrichOpenCodeZenUpstreamMessage(
-          `Provider error ${upstreamResponse.status}: ${normalized.safeText}`,
-          {
-            status: upstreamResponse.status,
-            providerName: route.providerName,
-            baseUrl: route.provider.baseUrl,
-            adapter: route.provider.adapter,
-            authMode: route.provider.authMode,
-            hasApiKey: Boolean(route.provider.apiKey?.trim()),
-            upstreamRetryAfter,
-            // This recovery path is the HTTP Responses wire; custom runTurn transports
-            // never reach enrichOpenCodeZenUpstreamMessage here.
-            supportsHttpSameKeyRetry: true,
-          },
-        );
-      const retryAfter = normalized.cyberPolicy
-        ? undefined
-        : resolveClientRetryAfter({
-          status: upstreamResponse.status,
-          message,
-          upstreamRetryAfter,
-        });
-      return formatErrorResponse(
-        upstreamResponse.status,
-        normalized.cyberPolicy ? (normalized.type ?? CYBER_POLICY_ERROR_CODE) : "upstream_error",
-        message,
-        {
-          ...(normalized.cyberPolicy ? { code: CYBER_POLICY_ERROR_CODE } : {}),
-          ...(retryAfter !== undefined ? { retryAfter } : {}),
-        },
-      );
+      return routedUpstreamErrorResponse(upstreamResponse.status, normalized, upstreamRetryAfter, route);
     }
   }
 

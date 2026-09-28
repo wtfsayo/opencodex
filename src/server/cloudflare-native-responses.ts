@@ -10,6 +10,12 @@ import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields
 import { createAnthropicAdapterWith, isLikelyRealAnthropicThinkingSignature, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
 import { CLAUDE_CODE_HEADERS } from "../adapters/client-fingerprint";
 import { noStoredCodexAccounts, runNativeOpenAiTurn } from "./cloudflare-native-openai";
+import { applyUpstreamRecoveryInit, fetchWithResetRetry, isNonReplayableResponse } from "../lib/upstream-retry";
+import { readDisplaySafeErrorText } from "../lib/bounded-body";
+import { formatErrorResponse } from "../bridge/errors";
+import { describeUpstreamConnectFailure } from "./responses/upstream-error";
+import { normalizeUpstreamErrorText } from "./responses/upstream-error-text";
+import { routedUpstreamErrorResponse } from "./responses/routed-upstream-error";
 import { hasShrinkableOpenAIChatImages } from "../adapters/openai-chat-image-budget";
 import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
 import { providerCodexAccountMode } from "../providers/registry";
@@ -240,6 +246,9 @@ export type NativeResponsesTurn = {
   sse: ReadableStream<Uint8Array>;
   route: NativeChatRoute;
   finish(end: "end" | "error" | "cancel"): void;
+} | {
+  /** ocx's own answer for a send that failed after it left (adapter-dispatch.ts), already recorded. */
+  failure: Response;
 };
 
 type TurnOptions = {
@@ -374,12 +383,58 @@ export async function runNativeResponsesTurn(
     cursorConversationId: parsed._cursorConversationId,
   });
   const requestedEffort = parsed.options.reasoning;
+  const failureRow = (status: number): WorkerUsageRow => ({
+    requestId: crypto.randomUUID(),
+    timestamp: startedAt,
+    ...routeUsageFields(route),
+    resolvedModel: route.modelId,
+    ...(responseModelId !== route.modelId ? { wireModel: route.modelId } : {}),
+    ...(requestedEffort ? { requestedEffort } : {}),
+    ...(conversationId ? { conversationId } : {}),
+    ...(options.surface ? { surface: options.surface } : {}),
+    inboundProtocol: options.inbound === "anthropic" ? "messages" : "responses",
+    admissionKind: "environment",
+    status,
+    durationMs: Date.now() - startedAt,
+    usageStatus: "unreported",
+  });
+  const recordFailure = (status: number) => deps.recordUsage?.(failureRow(status));
   const maxOutput = parsed.options.maxOutputTokens;
   const spendOutputCeilingTokens = typeof maxOutput === "number" && maxOutput > 0 ? Math.trunc(maxOutput) : undefined;
-  const upstream = await sendUpstream(request, upstreamSignal, deps);
-  if (!upstream.ok || !upstream.body) {
-    await upstream.body?.cancel();
+  // adapter-dispatch.ts: reset-only retries for these providers, identity encoding for a stream,
+  // and no ambiguous resend (ocx may buy one; the Worker never sends a possibly running turn twice).
+  let upstream: Response;
+  try {
+    upstream = await fetchWithResetRetry(recovery => {
+      const headers = applyUpstreamRecoveryInit({ headers: request.headers }, recovery).headers;
+      if (parsed.stream && !headers.has("accept-encoding")) headers.set("accept-encoding", "identity");
+      return sendUpstream({ ...request, headers: Object.fromEntries(headers) }, upstreamSignal, deps);
+    }, { abortSignal: upstreamSignal, label: new URL(request.url).host, claimAmbiguousResend: () => false });
+  } catch (error) {
+    commitSkills?.();
+    if (signal.aborted) {
+      recordFailure(499);
+      return { failure: formatErrorResponse(499, "client_cancelled", "Client cancelled request") };
+    }
+    recordFailure(502);
+    return { failure: formatErrorResponse(502, "upstream_error", describeUpstreamConnectFailure(error, 200_000)) };
+  }
+  // A refused create generated nothing: ocx sends it itself and runs its recovery on the answer. The
+  // retry ladder's own refusal is answered as ocx answers it.
+  if (isNonReplayableResponse(upstream)) {
+    commitSkills?.();
+    recordFailure(upstream.status);
+    return { failure: upstream };
+  }
+  if (upstream.status >= 400 && upstream.status < 500) {
+    await upstream.body?.cancel().catch(() => {});
     return no(`upstream-${upstream.status}`);
+  }
+  if (!upstream.ok || !upstream.body) {
+    commitSkills?.();
+    const errorText = await readDisplaySafeErrorText(upstream, upstreamSignal, "unknown error");
+    recordFailure(upstream.status);
+    return { failure: routedUpstreamErrorResponse(upstream.status, normalizeUpstreamErrorText(errorText, "unknown error"), upstream.headers.get("retry-after"), route) };
   }
   commitSkills?.();
 
@@ -476,6 +531,10 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   if (!turn) {
     translatorBudget.dispose();
     return null;
+  }
+  if ("failure" in turn) {
+    translatorBudget.dispose();
+    return turn.failure;
   }
   return new Response(recordAtEnd(turn.sse, end => { turn.finish(end); translatorBudget.dispose(); }), {
     headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" },

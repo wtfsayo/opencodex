@@ -15,6 +15,7 @@ import { extractOcxEffortDirective, extractOcxRouteDirective } from "../claude/i
 import { carriesMessageThread } from "../claude/message-threads";
 import { stripOneMillionMarker } from "../claude/one-m-marker";
 import { anthropicErrorResponse, collectAnthropicMessage, responsesSseToAnthropicSse } from "../claude/outbound";
+import { anthropicErrorFromResponsesError } from "../claude/responses-error";
 import { estimateClaudeRequestTokens } from "../claude/request-token-estimate";
 import { CLAUDE_NATIVE_THINKING } from "../lib/claude-request-projection";
 import { messagesToResponsesTranslation } from "../protocols/codecs/messages";
@@ -102,6 +103,11 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
     },
   });
   if (!turn) return null;
+  // claude-messages.ts re-shapes a failed Responses answer into the Anthropic envelope.
+  if ("failure" in turn) {
+    translatorBudget.dispose();
+    return anthropicErrorFromResponsesError(turn.failure);
+  }
 
   const anthropicSse = recordAtEnd(
     responsesSseToAnthropicSse(turn.sse, requestedModel, { translatorBudget, inputTokenFloor }),

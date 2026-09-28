@@ -161,6 +161,26 @@ describe("Worker-native turns on the anthropic adapter", () => {
     expect(await run(withProvider({ multiAgentGuidanceEnabled: false }))).toEqual(["responses:config-keys:multiAgentGuidanceEnabled"]);
   });
 
+  test("an upstream failure after the send gets ocx's answer, not a second send through ocx", async () => {
+    const failing = (status: number) => () => new Response(JSON.stringify({ error: { message: "boom", type: "server_error" } }), {
+      status, headers: { "content-type": "application/json" },
+    });
+    for (const [path, body] of [
+      ["/v1/responses", responsesTurn("z/m-1")],
+      ["/v1/messages", messagesTurn("ocx-claude-z--m-1")],
+    ] as const) {
+      const proxy = await throughOcx(path, body as Rec, chat, failing(503));
+      const worker = await throughWorker(path, body as Rec, chat, failing(503), proxy.base);
+      expect([path, worker.declines]).toEqual([path, []]);
+      expect([path, worker.status]).toEqual([path, proxy.status]);
+      expect([path, worker.text]).toEqual([path, proxy.text]);
+    }
+    // A 4xx generated nothing: ocx sends it itself, with its own recovery.
+    const refused = await throughWorker("/v1/responses", responsesTurn("z/m-1"), chat, failing(400), "");
+    expect(refused.sent).toBeDefined();
+    expect(refused.declines).toEqual(["responses:upstream-400"]);
+  });
+
   test("an anthropic provider with a setting the Worker does not reproduce is left to ocx", async () => {
     const worker = await throughWorker("/v1/responses", responsesTurn("z/claude-x"), { ...anthropic, apiKeyTransport: "bearer" }, anthropicText, "");
     expect(worker.declines).toEqual(["responses:provider-field:apiKeyTransport"]);

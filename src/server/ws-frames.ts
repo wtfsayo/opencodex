@@ -37,3 +37,19 @@ export function buildWsErrorFrame(
     headers: headers ? safeResponseHeaders(headers) : {},
   };
 }
+
+/** The error object of a failed response's body, as a WebSocket error frame carries it. */
+export function errorPayloadFromText(text: string): Record<string, unknown> {
+  try {
+    const json = JSON.parse(text) as { error?: unknown };
+    if (json.error && typeof json.error === "object" && !Array.isArray(json.error)) {
+      return json.error as Record<string, unknown>;
+    }
+  } catch {
+    /* fall through */
+  }
+  return {
+    type: "upstream_error",
+    message: text ? text.slice(0, 500) : "Upstream request failed",
+  };
+}

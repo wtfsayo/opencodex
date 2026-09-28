@@ -407,8 +407,8 @@ function assertCodexAccountValidationReady(accountId: string): void {
   }
 }
 
-export const CODEX_MAIN_PROFILE_MAINTENANCE_MESSAGE =
-  "OpenCodex local native-main profile maintenance is active; retry this request";
+import { CODEX_MAIN_PROFILE_MAINTENANCE_MESSAGE } from "./main-profile-maintenance";
+export { CODEX_MAIN_PROFILE_MAINTENANCE_MESSAGE };
 
 export class CodexMainProfileDrainingError extends Error {
   /**

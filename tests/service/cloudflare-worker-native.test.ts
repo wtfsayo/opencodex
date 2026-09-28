@@ -37,8 +37,9 @@ const FORBIDDEN_MODULES = [
 // passthrough client rewrites), 38 more; ocx's SSE inspector and the continuation replay a
 // WebSocket session keeps for its own native responses, three more; ocx's failure answers for that
 // turn (the passthrough error body, transport-failure text, request-log terminal status), seven more;
-// the translated Chat image budget, one more.
-const MAX_CLOSURE = 239;
+// the translated Chat image budget, one more; ocx's routed-failure and Claude-failure answers
+// (the routed error body, the Anthropic error reshaping, the error-text reader), five more.
+const MAX_CLOSURE = 244;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {

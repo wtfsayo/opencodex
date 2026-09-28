@@ -13,7 +13,7 @@ import { runNativeResponsesTurn } from "./cloudflare-native-responses";
 import { nativeSteeringUnavailableReason } from "./responses/native-steering-availability";
 import { resolveInboundBodyLimitBytes } from "./inbound-body-limit";
 import { BoundedSseFrameBuffer } from "./sse-frame-buffer";
-import { buildWarmupCompletionFrames, buildWsErrorFrame } from "./ws-frames";
+import { buildWarmupCompletionFrames, buildWsErrorFrame, errorPayloadFromText } from "./ws-frames";
 import { createTranslatorBudget } from "../lib/translator-budget";
 import { runNativeOpenAiTurn } from "./cloudflare-native-openai";
 import { expandWithReplayEntry, replayEntryFor, type ReplayEntryItems } from "../responses/state/replay-expansion";
@@ -237,13 +237,23 @@ export function createNativeWsSession(link: NativeWsLink, upgradeHeaders: Header
     }
     if (!isCurrent()) {
       translatorBudget.dispose();
-      turn?.finish("cancel");
-      await turn?.sse.cancel().catch(() => {});
+      if (turn && "failure" in turn) await turn.failure.body?.cancel().catch(() => {});
+      else if (turn) {
+        turn.finish("cancel");
+        await turn.sse.cancel().catch(() => {});
+      }
       return;
     }
     if (!turn) {
       translatorBudget.dispose();
       relay(raw);
+      return;
+    }
+    if ("failure" in turn) {
+      // ws-bridge.ts's sendResponseToWebSocket for a failed answer: one error frame.
+      translatorBudget.dispose();
+      const text = await turn.failure.text().catch(() => "");
+      if (isCurrent()) link.send(JSON.stringify(buildWsErrorFrame(turn.failure.status, errorPayloadFromText(text), turn.failure.headers)));
       return;
     }
     let end: "end" | "error" | "cancel" = "end";

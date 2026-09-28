@@ -8,7 +8,7 @@ import type { ResponsesTerminalStatus } from "../bridge";
 import type { DataPlaneAdmission } from "./auth-cors";
 import type { AdmissionLease, AdmissionReservation } from "../lib/admission";
 import { BoundedSseFrameBuffer } from "./sse-frame-buffer";
-import { buildWsErrorFrame } from "./ws-frames";
+import { buildWsErrorFrame, errorPayloadFromText } from "./ws-frames";
 import type { AudioSocketTarget } from "./audio-dictation";
 
 export { safeResponseHeaders } from "./safe-response-headers";
@@ -343,20 +343,6 @@ export function sendResponsesJsonAsEvents(
   onTerminal?.(finalStatus);
 }
 
-function errorPayloadFromText(text: string): Record<string, unknown> {
-  try {
-    const json = JSON.parse(text) as { error?: unknown };
-    if (json.error && typeof json.error === "object" && !Array.isArray(json.error)) {
-      return json.error as Record<string, unknown>;
-    }
-  } catch {
-    /* fall through */
-  }
-  return {
-    type: "upstream_error",
-    message: text ? text.slice(0, 500) : "Upstream request failed",
-  };
-}
 
 export async function sendResponseToWebSocket(
   ws: ServerWebSocket<WsData>,

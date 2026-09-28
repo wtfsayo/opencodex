@@ -15,7 +15,7 @@ import {
 } from "./admission-model-scope";
 import { jsonUtf8Bytes } from "../lib/json-byte-size";
 import { sseFieldValue } from "../lib/sse-decoder";
-import { enforceAnthropicImageLimits, sniffImageDimensions } from "../adapters/anthropic-image-guard";
+import { enforceAnthropicImageLimits } from "../adapters/anthropic-image-guard";
 import { normalizeAnthropicImages } from "../adapters/anthropic-image-normalize";
 import { createToolCallIdAllocator } from "../adapters/tool-call-id";
 import { openAIChatSerializesThinking } from "../adapters/openai-chat/messages";
@@ -46,12 +46,10 @@ import {
   responsesSseToAnthropicSse,
 } from "../claude/outbound";
 import { clearableDeadline, idleDeadline } from "../lib/abort";
-import { estimateTokens } from "../lib/token-estimate";
 import { estimateClaudeRequestTokens } from "../claude/request-token-estimate";
 export { estimateClaudeRequestTokens };
 import {
   CLAUDE_NATIVE_THINKING,
-  projectClaudeRequest,
   type ClaudeThinkingProjection,
 } from "../lib/claude-request-projection";
 import { captureRouteStaticPolicy, NoEligiblePolicyCandidateError, previewRouteModel, routedProviderConfig, UnknownRoutingPolicyError, routeModel, type RouteResult } from "../router";
@@ -1350,7 +1348,6 @@ async function handleClaudeMessagesWithBudget(
     headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" },
   });
 }
-
 
 
 /**

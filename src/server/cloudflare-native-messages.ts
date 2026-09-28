@@ -17,6 +17,9 @@ import { stripOneMillionMarker } from "../claude/one-m-marker";
 import { anthropicErrorResponse, collectAnthropicMessage, responsesSseToAnthropicSse } from "../claude/outbound";
 import { estimateClaudeRequestTokens } from "../claude/request-token-estimate";
 import { messagesToResponsesTranslation } from "../protocols/codecs/messages";
+import type { ClaudeInboundTranslation } from "../claude/inbound";
+import { conversationIdFromClaudeMetadata } from "./request-log-conversation";
+import { jsonUtf8Bytes } from "../lib/json-byte-size";
 import { createTranslatorBudget, isTranslatorBudgetExceededError } from "../lib/translator-budget";
 
 type Rec = Record<string, unknown>;
@@ -40,16 +43,28 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
   if (carriesMessageThread(body)) return no("message-thread");
 
   const translatorBudget = createTranslatorBudget();
+  const decline = (reason: string) => { translatorBudget.dispose(); return no(reason); };
   let internal: Rec;
+  let cacheKeySource: ClaudeInboundTranslation["cacheKeySource"];
   try {
     // No claudeCode section is admitted (CONFIG_KEYS), so ocx translates with none either.
-    internal = messagesToResponsesTranslation(body, undefined, translatorBudget).body;
+    ({ body: internal, cacheKeySource } = messagesToResponsesTranslation(body, undefined, translatorBudget));
+    // The charges claude-messages.ts makes for the translated body and then for its replay
+    // request, so a turn near the translation limit fails the same way (ocx answers it with 413).
+    translatorBudget.chargeRetained(jsonUtf8Bytes(internal), { kind: "request_copies" });
   } catch {
     // ocx answers with its own 400 or 413.
-    return no("translate");
+    return decline("translate");
   }
   const stream = internal.stream === true;
   internal.stream = true;
+  try {
+    const bytes = jsonUtf8Bytes(internal);
+    translatorBudget.reserveTransient(3 * bytes, { kind: "request_copies" }).release();
+    translatorBudget.chargeRetained(bytes, { kind: "request_copies" });
+  } catch {
+    return decline("translation-budget");
+  }
   // ocx also drops `reasoning` when the route's configured ladder is empty (supportedLadderFor),
   // which only noReasoningModels, reasoningEfforts or modelReasoningEfforts can make it; the
   // Worker admits none of those provider fields, so the ladder is unknown and the effort stays.
@@ -61,15 +76,24 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
     const value = headers.get(name);
     if (value) internalHeaders.set(name, value);
   }
-  const turn = await runNativeResponsesTurn(internal, internalHeaders, signal, deps, no, {
-    inbound: "anthropic", translatorBudget, requestedModel, startedAt,
+  let inputTokenFloor = 0;
+  const turn = await runNativeResponsesTurn(internal, internalHeaders, signal, deps, decline, {
+    inbound: "anthropic",
+    translatorBudget,
+    startedAt,
+    surface: "claude",
+    conversationId: conversationIdFromClaudeMetadata(isRec(body.metadata) ? body.metadata : undefined),
+    sharedCacheCohort: cacheKeySource === "system",
+    beforeSend: route => {
+      inputTokenFloor = estimateClaudeRequestTokens(body, requestedModel, openAIChatSerializesThinking(route.provider, route.modelId));
+    },
   });
   if (!turn) return null;
 
-  const anthropicSse = recordAtEnd(responsesSseToAnthropicSse(turn.sse, requestedModel, {
-    translatorBudget,
-    inputTokenFloor: estimateClaudeRequestTokens(body, requestedModel, openAIChatSerializesThinking(turn.route.provider, turn.route.modelId)),
-  }), turn.finish);
+  const anthropicSse = recordAtEnd(
+    responsesSseToAnthropicSse(turn.sse, requestedModel, { translatorBudget, inputTokenFloor }),
+    end => { turn.finish(end); translatorBudget.dispose(); },
+  );
   if (stream) {
     return new Response(anthropicSse, {
       headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
@@ -80,6 +104,9 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
   try {
     message = await collectAnthropicMessage(anthropicSse, requestedModel, translatorBudget);
   } catch (error) {
+    // The fold stopped reading without cancelling: record the turn and release the upstream.
+    turn.finish("error");
+    await anthropicSse.cancel().catch(() => {});
     if (isTranslatorBudgetExceededError(error)) return anthropicErrorResponse(413, error.message, "request_too_large", error.code);
     return anthropicErrorResponse(502, error instanceof Error ? error.message : String(error), "api_error");
   }

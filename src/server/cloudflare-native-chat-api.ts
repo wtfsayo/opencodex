@@ -35,6 +35,13 @@ export type WorkerUsageRow = {
   provider: string;
   model: string;
   requestedModel: string;
+  /** `k<hex32>`, ocx's digest of the provider and its configured key reference. */
+  accountLogLabel?: string;
+  requestedEffort?: string;
+  resolvedModel?: string;
+  /** ocx's hashed conversation id for the turn, as request-log-conversation.ts derives it. */
+  conversationId?: string;
+  surface?: "claude";
   inboundProtocol: "chat" | "responses" | "messages";
   admissionKind: "environment";
   status: number;

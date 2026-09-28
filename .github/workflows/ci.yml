@@ -346,7 +346,7 @@ jobs:
               - 'src/lib/model-record.ts'
               - 'src/lib/durable-mirror.ts'
               - 'tests/service/cloudflare-deploy.test.ts'
-              - 'tests/service/cloudflare-worker-native.test.ts'
+              - 'tests/service/cloudflare-worker-native*.test.ts'
               - '.github/workflows/ci.yml'
             # Everything that ends up inside `npm pack`, or that decides what
             # does. `src/**` belongs here because package.json ships `src` and
@@ -1240,7 +1240,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Cloudflare deploy unit test
-        run: bun test tests/service/cloudflare-deploy.test.ts tests/service/cloudflare-worker-native.test.ts
+        run: bun test tests/service/cloudflare-deploy.test.ts tests/service/cloudflare-worker-native.test.ts tests/service/cloudflare-worker-native-responses.test.ts tests/service/cloudflare-worker-native-messages.test.ts
 
   # `gates` already runs `privacy:scan` on every event it runs for, so this job
   # covers exactly the pull requests `gates` skips -- its condition is the

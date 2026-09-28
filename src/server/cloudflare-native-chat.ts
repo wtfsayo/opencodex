@@ -16,7 +16,8 @@ import { fastPolicyForModel } from "../providers/service-tier";
 import { chatCollabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { createTranslatorBudget } from "../lib/translator-budget";
 import type { OcxConfig, OcxProviderConfig, OcxUsage } from "../types";
-import { PROVIDER_REGISTRY } from "../providers/registry";
+import { PROVIDER_REGISTRY, registryEntryForProviderDestination } from "../providers/registry";
+import { apiKeyAccountLogLabel } from "../codex/key-account-label";
 
 type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
@@ -67,7 +68,14 @@ function resolveKeyReference(value: string, secrets: Readonly<Record<string, str
   return Object.prototype.hasOwnProperty.call(secrets, name) ? secrets[name] : undefined;
 }
 
-export type NativeChatRoute = { providerName: string; provider: OcxProviderConfig; modelId: string; requestedModel: string };
+export type NativeChatRoute = {
+  providerName: string;
+  provider: OcxProviderConfig;
+  modelId: string;
+  requestedModel: string;
+  /** The key as configured (a literal or a `${NAME}` reference), which ocx's usage label digests. */
+  apiKeyReference: string;
+};
 
 /**
  * The route ocx would pick for `model`, or null when this path cannot be sure it matches. Only
@@ -103,12 +111,28 @@ export function resolveNativeChatRoute(
   if (provider.adapter !== "openai-chat") return no("adapter");
   if (provider.authMode !== undefined && provider.authMode !== "key") return no("auth-mode");
   if (typeof provider.baseUrl !== "string" || !destinationAllowed(provider.baseUrl, localHosts)) return no("destination");
+  // ocx gives OpenCode Go a session header derived from the caller's session lane
+  // (opencode-go-transport.ts), recognised by destination whatever the provider is called.
+  if (registryEntryForProviderDestination({ baseUrl: provider.baseUrl, adapter: "openai-chat", authMode: provider.authMode as "key" | undefined })?.id === "opencode-go") {
+    return no("opencode-go-session");
+  }
   if (typeof provider.apiKey !== "string" || provider.apiKey.startsWith("keychain:")) return no("key-reference");
   const apiKey = resolveKeyReference(provider.apiKey, secrets);
   if (!apiKey) return no("key-reference-unset");
   const models = provider.models;
   if (!Array.isArray(models) || !models.includes(modelId) || models.includes(model)) return no("model-not-listed");
-  return { providerName, provider: { ...provider, apiKey } as unknown as OcxProviderConfig, modelId, requestedModel: model };
+  return { providerName, provider: { ...provider, apiKey } as unknown as OcxProviderConfig, modelId, requestedModel: model, apiKeyReference: provider.apiKey };
+}
+
+/** The usage-row fields ocx fills from the route (providers/label.ts labels the key). */
+export function routeUsageFields(route: NativeChatRoute): Pick<WorkerUsageRow, "provider" | "model" | "requestedModel" | "accountLogLabel"> {
+  const accountLogLabel = apiKeyAccountLogLabel(route.providerName, { reference: route.apiKeyReference });
+  return {
+    provider: route.providerName,
+    model: route.modelId,
+    requestedModel: route.requestedModel,
+    ...(accountLogLabel ? { accountLogLabel } : {}),
+  };
 }
 
 /** The request fields ocx's native Chat lane refuses or reroutes, plus anything carrying an image. */
@@ -167,9 +191,8 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   const record = (status: number) => deps.recordUsage?.({
     requestId: crypto.randomUUID(),
     timestamp: startedAt,
-    provider: route.providerName,
-    model: route.modelId,
-    requestedModel: route.requestedModel,
+    ...routeUsageFields(route),
+    ...(typeof body.reasoning_effort === "string" ? { requestedEffort: body.reasoning_effort } : {}),
     inboundProtocol: "chat",
     admissionKind: "environment",
     status,

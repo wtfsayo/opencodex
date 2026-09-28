@@ -148,13 +148,14 @@ describe("Worker-native Responses", () => {
   });
 
   test("declines destinations whose effort ladders come from models.dev, and v1 guidance turns", async () => {
-    for (const baseUrl of ["https://opencode.ai/zen/v1", "https://opencode.ai/zen/go/v1/"]) {
+    // OpenCode Go is declined at the route whatever the effort, for its session header.
+    for (const [baseUrl, declined] of [["https://opencode.ai/zen/v1", "reasoning-metadata-destination"], ["https://opencode.ai/zen/go/v1/", "opencode-go-session"]]) {
       const reasons: string[] = [];
       const config = JSON.stringify({ providers: { p: { ...provider, baseUrl } } });
       const response = await serveNativeResponses(JSON.stringify(codexTurn("p/m-1", { reasoning: { effort: "high" } })), new Headers(), new AbortController().signal, {
         readConfig: async () => config, fetch: async () => { throw new Error("unexpected"); }, onDecline: reason => reasons.push(reason),
       });
-      expect([response, reasons]).toEqual([null, ["responses:reasoning-metadata-destination"]]);
+      expect([response, reasons]).toEqual([null, [`responses:${declined}`]]);
     }
     const reasons: string[] = [];
     const v1 = codexTurn("p/m-1", { reasoning: { effort: "max" }, tools: [{ type: "namespace", name: "multi_agent_v1", tools: [fn("spawn_agent"), fn("send_input")] }] });

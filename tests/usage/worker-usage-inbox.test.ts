@@ -65,4 +65,30 @@ describe("Worker usage inbox", () => {
     expect(lines.map(line => line.requestId)).toEqual([row(1).requestId, row(3).requestId]);
     expect(lines[0]).toMatchObject({ provider: "workers-ai", status: 200, inboundProtocol: "chat" });
   });
+
+  test("keeps the surface, key label, conversation, resolved model and effort only in the shapes ocx writes", async () => {
+    process.env[DURABLE_STATE_BOOT_ID_ENV] = "c".repeat(32);
+    const good = {
+      ...row(1), surface: "claude", accountLogLabel: `k${"a".repeat(32)}`, conversationId: "b".repeat(32),
+      resolvedModel: "meta/llama", requestedEffort: "high",
+    };
+    const bad = {
+      ...row(2), surface: "mystery", accountLogLabel: "sk-live-looking", conversationId: "user@example.com",
+      resolvedModel: "x".repeat(201), requestedEffort: 3, extra: "dropped",
+    };
+    let served = false;
+    setDurableMirrorTransportForTests({
+      origin: "http://state.test",
+      fetch: async url => {
+        if (url.endsWith("/usage-inbox/ack")) return new Response(null, { status: 204 });
+        if (served) return Response.json({ rows: [] });
+        served = true;
+        return Response.json({ rows: [{ seq: 1, row: good }, { seq: 2, row: bad }] });
+      },
+    });
+    expect(await drainWorkerUsageInbox()).toBe(2);
+    const [kept, cleaned] = readFileSync(usageLogPath(), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(kept).toMatchObject({ surface: "claude", accountLogLabel: good.accountLogLabel, conversationId: good.conversationId, resolvedModel: "meta/llama", requestedEffort: "high" });
+    for (const field of ["surface", "accountLogLabel", "conversationId", "resolvedModel", "requestedEffort", "extra"]) expect(cleaned[field]).toBeUndefined();
+  });
 });

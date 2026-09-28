@@ -5,7 +5,8 @@
 // Delivery is at least once: a crash between appending a batch and acknowledging it appends that
 // batch again on the next drain.
 import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
-import { appendUsageEntry, type PersistedUsageEntry } from "./log";
+import { appendUsageEntry, isKnownUsageSurface, type PersistedUsageEntry } from "./log";
+import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
 
 const DRAIN_INTERVAL_MS = 60_000;
 const BATCH = 500;
@@ -27,6 +28,13 @@ function toEntry(row: unknown): PersistedUsageEntry | null {
   // must not depend on what the Worker happened to put in the row.
   const entry: Record<string, unknown> = {};
   for (const key of ENTRY_FIELDS) if (value[key] !== undefined) entry[key] = value[key];
+  // Checked against the shapes ocx itself writes, since usage summaries group by them.
+  if (isKnownUsageSurface(value.surface)) entry.surface = value.surface;
+  if (typeof value.accountLogLabel === "string" && KEY_ACCOUNT_LOG_LABEL_RE.test(value.accountLogLabel)) entry.accountLogLabel = value.accountLogLabel;
+  if (typeof value.conversationId === "string" && /^[0-9a-f]{32}$/.test(value.conversationId)) entry.conversationId = value.conversationId;
+  for (const key of ["resolvedModel", "requestedEffort"] as const) {
+    if (typeof value[key] === "string" && (value[key] as string).length > 0 && (value[key] as string).length <= 200) entry[key] = value[key];
+  }
   if (value.usage && typeof value.usage === "object" && !Array.isArray(value.usage)) {
     const usage: Record<string, number> = {};
     for (const [key, count] of Object.entries(value.usage as Record<string, unknown>)) {

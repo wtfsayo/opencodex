@@ -1,7 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { CodexAccount, OcxConfig } from "../types";
 import type { CodexAuthContext } from "./auth-context";
-import type { ProviderApiKeySelection } from "../types/provider";
 import { MAIN_CODEX_ACCOUNT_ID } from "./main-account";
 
 export const CODEX_ACCOUNT_LOG_LABEL_RE = /^p[a-f0-9]{6}$/;
@@ -25,13 +24,7 @@ export const OAUTH_ACCOUNT_LOG_LABEL_RE = /^o[a-f0-9]{6}$/;
 export const KEY_ACCOUNT_LOG_LABEL_RE = /^k[a-f0-9]{32}$/;
 export const ACCOUNT_LOG_LABEL_RE = /^(?:main|[po][a-f0-9]{6}|k[a-f0-9]{32})$/;
 
-/** Digest the request-owned configured selection, never serialize its key/reference. */
-export function apiKeyAccountLogLabel(provider: string, selection: ProviderApiKeySelection | undefined): `k${string}` | undefined {
-  if (!selection || typeof selection.reference !== "string" || !selection.reference.length) return undefined;
-  return `k${createHash("sha256").update(JSON.stringify([
-    "ocx-key-account-v1", provider, selection.entryId ?? null, selection.reference,
-  ])).digest("hex").slice(0, 32)}`;
-}
+export { apiKeyAccountLogLabel } from "./key-account-label";
 
 export function oauthAccountLogLabel(accountId: string, provider = ""): string {
   return `o${createHash("sha256").update(`${provider}\0${accountId}`).digest("hex").slice(0, 6)}`;

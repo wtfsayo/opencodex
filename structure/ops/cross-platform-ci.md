@@ -26,9 +26,10 @@ composite Bun setup and requires the installed runtime to equal the version `pac
 declares. A change under `native/remote-workspace-helper/` runs `remote-helper` on the same three
 runners: `cargo fmt` on Linux, then `cargo clippy -D warnings` and `cargo test` everywhere, where
 the live confinement tests compile only on macOS and Windows. A change under `deploy/` (or to
-`docker/cloudflare-supervisor.ts` or its test) runs `cloudflare-deploy` on Linux: a frozen-lockfile
-install and `tsc` inside `deploy/cloudflare`, which the root typecheck does not reach, then
-`tests/service/cloudflare-deploy.test.ts`. All three filters also list `ci.yml`, stay pull-request
+`docker/cloudflare-supervisor.ts`, the `src/` modules the Worker typechecks against, or their tests)
+runs `cloudflare-deploy` on Linux: a frozen-lockfile install and `tsc` inside `deploy/cloudflare`,
+which the root typecheck does not reach, then `tests/service/cloudflare-deploy.test.ts` and the
+`cloudflare-worker-native*` suites. All three filters also list `ci.yml`, stay pull-request
 scope like `docs` and `structure`, have their outputs validated before any job reads them, and the
 aggregate gate expects each job exactly when its filter output is `true`.
 

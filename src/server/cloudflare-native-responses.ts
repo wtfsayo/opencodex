@@ -6,11 +6,11 @@
 //
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
-import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, sendUpstream, type NativeChatRoute } from "./cloudflare-native-chat";
+import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, type NativeChatRoute } from "./cloudflare-native-chat";
 import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { buildToolBridgeMaps } from "./responses/tool-bridge-maps";
 import { replaceSkillsBlock, singleSkillsBlock } from "./responses/skills-catalog";
-import { reasoningReplayConversationIdFromResponsesRequest, sessionIdHeaderFromRequest } from "./request-log-conversation";
+import { conversationIdFromResponsesRequest, reasoningReplayConversationIdFromResponsesRequest, sessionIdHeaderFromRequest } from "./request-log-conversation";
 import { createOpenAIChatAdapterWith, type OpenAIChatAdapterDeps } from "../adapters/openai-chat/adapter";
 import { renameRoutedIdentityInContext } from "../adapters/identity";
 import { bridgeToResponsesSSE } from "../bridge/sse";
@@ -162,8 +162,17 @@ type TurnOptions = {
   /** The client's wire. ocx replays a Messages turn through its Responses pipeline as "anthropic". */
   inbound: "responses" | "anthropic";
   translatorBudget: TranslatorBudget;
-  requestedModel?: string;
   startedAt: number;
+  /** Set by claude-messages.ts's replay: the Claude surface and its metadata conversation id. */
+  surface?: "claude";
+  conversationId?: string;
+  /**
+   * claude-messages.ts passes promptCacheKeyIsSharedCohort for a cache key taken from the system
+   * prompt, and skills-snapshot.ts then keeps no snapshot for the turn.
+   */
+  sharedCacheCohort?: boolean;
+  /** Runs once the route is known and before the send, so nothing after the send can throw. */
+  beforeSend?(route: NativeChatRoute): void;
 };
 
 /**
@@ -196,7 +205,7 @@ export async function runNativeResponsesTurn(
 
   // skills-snapshot.ts: a session's first catalog block is kept and substituted on later turns,
   // before the body is parsed. The Worker keeps its own copy; see skillsSnapshot.
-  const frozen = await freezeSkillsCatalog(body, headers, deps);
+  const frozen = options.sharedCacheCohort ? undefined : await freezeSkillsCatalog(body, headers, deps);
   if (frozen === "decline") return no("skills-snapshot-unavailable");
   const commitSkills = typeof frozen === "function" ? frozen : undefined;
 
@@ -227,6 +236,15 @@ export async function runNativeResponsesTurn(
   const request = await adapter.buildRequest(parsed, { headers: new Headers(), translatorBudget, abortSignal: upstreamSignal });
   // Everything that can throw runs before the send: after it, a throw would resend via the container.
   const maps = buildToolBridgeMaps(parsed, translatorBudget);
+  options.beforeSend?.(route);
+  // request-prepare.ts: a conversation id already set (a routed Claude turn's) wins over headers.
+  const conversationId = options.conversationId ?? conversationIdFromResponsesRequest({
+    clientThreadId: parsed._clientThreadId,
+    sessionIdHeader: sessionIdHeaderFromRequest(headers),
+    threadIdHeader: headers.get("thread-id"),
+    cursorConversationId: parsed._cursorConversationId,
+  });
+  const requestedEffort = parsed.options.reasoning;
   const upstream = await sendUpstream(request, upstreamSignal, deps);
   if (!upstream.ok || !upstream.body) {
     await upstream.body?.cancel();
@@ -245,9 +263,11 @@ export async function runNativeResponsesTurn(
     deps.recordUsage?.({
       requestId: crypto.randomUUID(),
       timestamp: startedAt,
-      provider: route.providerName,
-      model: route.modelId,
-      requestedModel: options.requestedModel ?? route.requestedModel,
+      ...routeUsageFields(route),
+      resolvedModel: route.modelId,
+      ...(requestedEffort ? { requestedEffort } : {}),
+      ...(conversationId ? { conversationId } : {}),
+      ...(options.surface ? { surface: options.surface } : {}),
       inboundProtocol: options.inbound === "anthropic" ? "messages" : "responses",
       admissionKind: "environment",
       status,
@@ -287,7 +307,7 @@ export async function runNativeResponsesTurn(
       hideThinkingSummary: parsed.options.hideThinkingSummary,
       declaredToolNames: maps.declaredToolNames,
       bareCustomToolNames: maps.bareCustomToolNames,
-      // run-turn-execution.ts enforces declared tool names for Responses clients only.
+      // adapter-delivery.ts enforces declared tool names for Responses clients only.
       enforceDeclaredToolNames: options.inbound === "responses",
       toolParameterSchemas: maps.toolParameterSchemas,
       onFirstOutput: () => { firstOutputAt ??= Date.now(); },
@@ -311,9 +331,13 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   let body: unknown;
   try { body = JSON.parse(bodyText); } catch { return no("body-not-json"); }
   if (!isRec(body)) return no("body-shape");
-  const turn = await runNativeResponsesTurn(body, headers, signal, deps, no, { inbound: "responses", translatorBudget: createTranslatorBudget(), startedAt });
-  if (!turn) return null;
-  return new Response(recordAtEnd(turn.sse, turn.finish), {
+  const translatorBudget = createTranslatorBudget();
+  const turn = await runNativeResponsesTurn(body, headers, signal, deps, no, { inbound: "responses", translatorBudget, startedAt });
+  if (!turn) {
+    translatorBudget.dispose();
+    return null;
+  }
+  return new Response(recordAtEnd(turn.sse, end => { turn.finish(end); translatorBudget.dispose(); }), {
     headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" },
   });
 };

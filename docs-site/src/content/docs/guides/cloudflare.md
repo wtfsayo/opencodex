@@ -191,9 +191,10 @@ it sends, for four idle hours; the two keep separate copies (the Worker's in the
 `ocx`'s in memory, lost whenever the container sleeps), so a session whose catalog changes while its
 turns alternate between them can see both versions.
 
-And it answers `POST /v1/messages`, the API Claude Code uses, when `model` is one of the
-`ocx-claude-<provider>--<model>` aliases `ocx` lists for Claude Code and the provider qualifies as
-above. The data token may also arrive in `x-api-key`, as `ocx` accepts it there. The turn is
+And it answers `POST /v1/messages`, the API Claude Code uses, when `model` is one of the aliases
+`ocx` lists for Claude Code (`ocx-claude-<provider>--<model>`, or `ocx-claude2-…` for a model id
+with a `/`, and the older `claude-ocx-` spellings `ocx` still reads) and the provider qualifies as
+above; a provider whose `baseUrl` is OpenCode Go's goes to `ocx`, which adds Go's session header. The data token may also arrive in `x-api-key`, as `ocx` accepts it there. The turn is
 translated and answered as `ocx` does it, streamed or not, when it has text-only messages and
 `ocx` would not treat it specially: a Claude model id (which may be passthrough on your own
 Anthropic credential, or a Claude Desktop alias), a config with a `claudeCode` section, an injected

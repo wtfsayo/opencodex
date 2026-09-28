@@ -9,11 +9,12 @@ export interface Desktop3pLookup {
   isDateShaped(base: string): boolean;
 }
 
-let lookup: Desktop3pLookup = {
+const NONE: Desktop3pLookup = {
   resolve: () => null,
   isUnresolved: () => false,
   isDateShaped: () => false,
 };
+let lookup = NONE;
 
 export function registerDesktop3pLookup(next: Desktop3pLookup): void {
   lookup = next;
@@ -21,4 +22,9 @@ export function registerDesktop3pLookup(next: Desktop3pLookup): void {
 
 export function desktop3pLookup(): Desktop3pLookup {
   return lookup;
+}
+
+/** Whether desktop-3p.ts has registered; tests/claude-integration hold the server entry to it. */
+export function desktop3pLookupRegistered(): boolean {
+  return lookup !== NONE;
 }

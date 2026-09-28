@@ -122,13 +122,85 @@ describe("Worker-native Messages", () => {
     });
   }
 
-  test("the usage row is written as a Messages turn with the reported tokens", async () => {
-    const { response, rows } = await throughWorker(claudeTurn(), textReply);
-    await response!.text();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({
-      inboundProtocol: "messages", provider: "p", model: "m-1", requestedModel: ALIAS, status: 200, usageStatus: "reported",
+  test("usage rows carry the fields ocx's own rows have, for chat, Responses and Messages", async () => {
+    const chatBody = { model: "p/m-1", stream: true, reasoning_effort: "high", messages: [{ role: "user", content: "hi" }] };
+    const responsesBody = { model: "p/m-1", input: "hi", store: false, stream: true, reasoning: { effort: "low" } };
+    const responsesHeaders = { "thread-id": "t-1", "session-id": "s-1" };
+    // ocx's rows, from its usage log.
+    const upstream = Bun.serve({ port: 0, fetch: () => sse(textReply) });
+    const config = { port: 0, providers: { p: { ...provider, baseUrl: `${upstream.url.toString().replace(/\/$/, "")}/v1`, allowPrivateNetwork: true } } };
+    const { saveConfig } = await import("../../src/config");
+    const { startServer } = await import("../../src/server");
+    const { readRecentUsageEntries } = await import("../../src/usage/log");
+    saveConfig(config as unknown as OcxConfig);
+    const server = startServer(0);
+    try {
+      const post = (path: string, body: unknown, headers: Record<string, string> = {}) => fetch(`http://127.0.0.1:${server.port}${path}`, {
+        method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body),
+      }).then(response => response.text());
+      await post("/v1/chat/completions", chatBody);
+      await post("/v1/responses", responsesBody, responsesHeaders);
+      await post("/v1/messages", claudeTurn());
+      await Bun.sleep(200);
+    } finally {
+      await server.stop(true);
+      await upstream.stop(true);
+    }
+    const proxyRows = readRecentUsageEntries(10).sort((a, b) => a.timestamp - b.timestamp);
+    // The Worker's rows for the same three turns.
+    const workerRows: Rec[] = [];
+    const deps = {
+      readConfig: async () => workerConfig,
+      fetch: async () => sse(textReply),
+      recordUsage: (row: unknown) => workerRows.push(row as Rec),
+    };
+    const { serveNativeChat } = await import("../../src/server/cloudflare-native-chat");
+    const { serveNativeResponses } = await import("../../src/server/cloudflare-native-responses");
+    await (await serveNativeChat(JSON.stringify(chatBody), new Headers(), new AbortController().signal, deps))!.text();
+    await (await serveNativeResponses(JSON.stringify(responsesBody), new Headers(responsesHeaders), new AbortController().signal, deps))!.text();
+    await (await serveNativeMessages(JSON.stringify(claudeTurn()), new Headers(), new AbortController().signal, deps))!.text();
+    const fields = ["inboundProtocol", "provider", "model", "requestedModel", "resolvedModel", "requestedEffort", "accountLogLabel", "conversationId", "surface", "status", "usageStatus"];
+    const pick = (row: Rec) => Object.fromEntries(fields.filter(field => row[field] !== undefined).map(field => [field, row[field]]));
+    expect(proxyRows.map(row => row.inboundProtocol)).toEqual(["chat", "responses", "messages"]);
+    expect(workerRows.map(pick)).toEqual(proxyRows.map(row => pick(row as unknown as Rec)));
+  });
+
+  test("a cache key taken from the system prompt keeps no skills snapshot, as in ocx", async () => {
+    // claude-messages.ts marks such a key a shared cohort, and skills-snapshot.ts skips the turn.
+    const turn = (block: string) => claudeTurn({ metadata: undefined, system: `<skills_instructions>${block}</skills_instructions>`, messages: [{ role: "user", content: "hi" }] });
+    const store = new Map<string, string>();
+    const sent: string[] = [];
+    for (const block of ["ONE", "TWO"]) {
+      const response = await serveNativeMessages(JSON.stringify(turn(block)), new Headers({ session_id: "s1" }), new AbortController().signal, {
+        readConfig: async () => workerConfig,
+        fetch: async request => { sent.push(JSON.stringify(await request.json())); return sse(textReply); },
+        skills: { principal: "token", read: async scope => store.get(scope), commit: (scope, value) => { store.set(scope, value); } },
+      });
+      await response!.text();
+    }
+    expect(sent[1]).toContain("TWO");
+    expect(store.size).toBe(0);
+  });
+
+  test("declines an OpenCode Go destination under any provider name, which ocx gives a session header", async () => {
+    const declines: string[] = [];
+    const response = await serveNativeMessages(JSON.stringify(claudeTurn({ model: "ocx-claude-g--m-1" })), new Headers(), new AbortController().signal, {
+      readConfig: async () => JSON.stringify({ providers: { g: { ...provider, baseUrl: "https://opencode.ai/zen/go/v1" } } }),
+      fetch: async () => { throw new Error("must not send"); },
+      onDecline: reason => declines.push(reason),
     });
+    expect(response).toBeNull();
+    expect(declines).toEqual(["messages:opencode-go-session"]);
+  });
+
+  test("releases its translation budgets whether it serves or declines", async () => {
+    const { translatorLiveBudgetCountForTests } = await import("../../src/lib/translator-budget");
+    const before = translatorLiveBudgetCountForTests();
+    await (await throughWorker(claudeTurn(), textReply)).response!.text();
+    await (await throughWorker(claudeTurn({ stream: false }), textReply)).response!.text();
+    await throughWorker(claudeTurn({ thread: { previous_message_id: "m" } }), textReply);
+    await throughWorker(claudeTurn({ messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }] }] }), textReply);
+    expect(translatorLiveBudgetCountForTests()).toBe(before);
   });
 
   test("the message_start usage floor is ocx's own estimate", async () => {

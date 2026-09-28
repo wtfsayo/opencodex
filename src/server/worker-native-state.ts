@@ -102,13 +102,19 @@ export function publishNativeOpenAiFactsForWorker(retrySoon = false, refreshCeil
     console.warn(`[opencodex] Worker facts not published: ${error instanceof Error ? error.name : "error"}`);
     return undefined;
   }
-  publishedMainKey = facts.mainAccountIdentityKey;
   return stateRequest("/native-openai-facts", {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(facts),
   })?.then(response => { void response.body?.cancel(); return response.ok; }, () => false)
-    .then(ok => { if (!ok && retrySoon) setTimeout(() => void publishNativeOpenAiFactsForWorker(), FIRST_RETRY_MS).unref?.(); });
+    .then(ok => {
+      // Only a stored answer counts as published; a main account the Worker has not heard of yet
+      // is retried until it has, since a caller holding it would otherwise skip ocx's limits.
+      if (ok) publishedMainKey = facts.mainAccountIdentityKey;
+      else if (retrySoon || facts.mainAccountIdentityKey !== publishedMainKey) {
+        setTimeout(() => void publishNativeOpenAiFactsForWorker(retrySoon), FIRST_RETRY_MS).unref?.();
+      }
+    });
 }
 
 /** A main-credential observation: republish, after the request that caused it, only if it changed. */

@@ -170,11 +170,6 @@ export async function chatAdmitsDataToken(req: Request, env: EdgeEnv): Promise<b
   return !!presented && secretEquals(presented, token);
 }
 
-/**
- * ocx's rule for /v1/messages and /v1/models (resolveApiAuth): the first of `x-opencodex-api-key`,
- * the bearer token and `x-api-key` that is present decides, since Anthropic SDKs such as Claude Code
- * send the key in `x-api-key`.
- */
 /** Whether `value` is the hub's data or admin token (ocx's isProxyAdmissionSecret, for the Worker's keys). */
 export async function isHubSecret(value: string, env: EdgeEnv & { OPENCODEX_ADMIN_AUTH_TOKEN?: string }): Promise<boolean> {
   if (/^ocx_(?:data|admin|session)_/.test(value) || /^ocx_[0-9a-f]{40}$/.test(value)) return true;
@@ -184,6 +179,11 @@ export async function isHubSecret(value: string, env: EdgeEnv & { OPENCODEX_ADMI
   return false;
 }
 
+/**
+ * ocx's rule for /v1/messages and /v1/models (resolveApiAuth): the first of `x-opencodex-api-key`,
+ * the bearer token and `x-api-key` that is present decides, since Anthropic SDKs such as Claude Code
+ * send the key in `x-api-key`.
+ */
 export async function apiAuthAdmitsDataToken(req: Request, env: EdgeEnv): Promise<boolean> {
   const token = env.OPENCODEX_API_AUTH_TOKEN?.trim();
   if (!token) return false;

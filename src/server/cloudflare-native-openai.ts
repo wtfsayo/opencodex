@@ -37,7 +37,7 @@ import { createTranslatorBudget } from "../lib/translator-budget";
 import { formatErrorResponse } from "../bridge/errors";
 import type { ResponsesTerminalStatus } from "../bridge";
 import { readDisplaySafeErrorText } from "../lib/bounded-body";
-import { applyUpstreamRecoveryInit, fetchWithTransientRetry, isReplayRefusalResponse, TRANSIENT_RETRY_MAX_ATTEMPTS } from "../lib/upstream-retry";
+import { applyUpstreamRecoveryInit, fetchWithTransientRetry, isNonReplayableResponse, isReplayRefusalResponse, TRANSIENT_RETRY_MAX_ATTEMPTS } from "../lib/upstream-retry";
 import { classifyTransportFailureKind } from "../lib/upstream-reachability";
 import { describeUpstreamConnectFailure } from "./responses/upstream-error";
 import { formatPassthroughUpstreamError } from "./responses/passthrough-error";
@@ -384,7 +384,9 @@ export async function runNativeOpenAiTurn(
   }
   const responseHeaders = sanitizePassthroughHeaders(upstream.headers);
   // A refused create generated nothing: ocx sends it itself and runs its own recovery on the answer.
-  if (upstream.status >= 400 && upstream.status < 500) {
+  // Not so the retry ladder's own refusal to resend a turn that may already be running (a 429).
+  const replayRefusal = isReplayRefusalResponse(upstream) || isNonReplayableResponse(upstream);
+  if (upstream.status >= 400 && upstream.status < 500 && !replayRefusal) {
     await upstream.body?.cancel().catch(() => {});
     translatorBudget.dispose();
     return no(`upstream-${upstream.status}`);
@@ -400,16 +402,17 @@ export async function runNativeOpenAiTurn(
     translatorBudget.dispose();
     recordRow(upstream.status);
     return { response: formatPassthroughUpstreamError(upstream.status, errorText, {
-      statusText: upstream.statusText, headers: responseHeaders, replayRefusal: isReplayRefusalResponse(upstream),
+      statusText: upstream.statusText, headers: responseHeaders, replayRefusal,
     }) };
   }
   const servedModel = responseHeaders.get("openai-model")?.trim();
   const contentType = responseHeaders.get("content-type")?.toLowerCase();
   if (!upstream.body || !(contentType?.includes("text/event-stream") || (!contentType && parsed.stream))) {
-    // passthrough-delivery.ts relays anything but an event stream outside the SSE relay.
+    // passthrough-delivery.ts relays anything but an event stream as it came; the turn was sent,
+    // so it is answered here rather than sent again through ocx.
     translatorBudget.dispose();
-    await upstream.body?.cancel().catch(() => {});
-    return no("upstream-not-event-stream");
+    recordRow(upstream.status, servedModel ? { resolvedModel: servedModel } : {});
+    return { response: new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders }) };
   }
 
   const payloadRewrites = [

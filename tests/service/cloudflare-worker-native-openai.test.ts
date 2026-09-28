@@ -389,6 +389,33 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     }
   });
 
+  test.if(transport === "sse")("after the send, a turn that may already be running is never handed to ocx to send again", async () => {
+    const config = JSON.stringify({ ...(getDefaultConfig() as unknown as Rec), port: 0 });
+    const run = async (fetchImpl: (request: Request) => Promise<Response>) => {
+      const declines: string[] = [];
+      let sends = 0;
+      const rows: WorkerUsageRow[] = [];
+      const res = await serveNativeResponses(JSON.stringify(codexTurn()), new Headers(callerHeaders()), new AbortController().signal, {
+        readConfig: async () => config, readCodexAccounts: async () => undefined, isAdmissionSecret,
+        nativeOpenAiFacts: async () => facts(),
+        fetch: async request => { sends++; return fetchImpl(request); },
+        onDecline: reason => declines.push(reason), recordUsage: row => rows.push(row),
+      });
+      return { declines, sends, status: res?.status, text: await res?.text(), rows };
+    };
+    // A connection reset under the request: the retry ladder refuses to resend it, and so does the Worker.
+    const reset = await run(async () => { throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }); });
+    expect(reset.declines).toEqual([]);
+    expect(reset.sends).toBe(1);
+    expect(reset.status).toBe(429);
+    expect(reset.rows.map(row => row.status)).toEqual([429]);
+    // A 2xx that is not an event stream is relayed as it came, as ocx does.
+    const json = await run(async () => new Response(JSON.stringify({ id: "resp_x", status: "completed" }), { headers: { "content-type": "application/json" } }));
+    expect(json.declines).toEqual([]);
+    expect(json.status).toBe(200);
+    expect(JSON.parse(json.text!)).toEqual({ id: "resp_x", status: "completed" });
+  });
+
   test("every model ocx gates by account is declined by name", () => {
     for (const model of [...ACCOUNT_GATED_NATIVE_OPENAI_MODELS, ...CODEX_ACCOUNT_GATED_CANONICAL_WIRE_MODELS.keys()]) {
       expect([model, nativeOpenAiDeclineReason(codexTurn({ model }), new Headers(callerHeaders()))]).toEqual([model, "native-model"]);

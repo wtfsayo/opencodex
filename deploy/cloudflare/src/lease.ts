@@ -73,6 +73,10 @@ type StoredReasoningMetadata = { bootId: string; version: number; body: string }
 // under the stamp of the Worker version and container environment they were published under. Only
 // the newest is kept: a Worker version other than the hub's must not reuse an older container's.
 const CLIENT_RUNTIME_KEY = "ocx:client-runtime";
+// What a ChatGPT passthrough turn reads from ocx's process (src/server/worker-native-state.ts). It
+// describes one process, so it counts only while that boot holds the lease, and only under its stamp.
+const NATIVE_OPENAI_FACTS_KEY = "ocx:native-openai-facts";
+type StoredNativeOpenAiFacts = { bootId: string; stamp: string; facts: unknown };
 type StoredClientRuntime = { stamp: string; headers: Record<string, string> };
 
 const LEASE_KEY = "ocx:lease";
@@ -145,6 +149,7 @@ export class LeaseState {
     }
     for (const kind of REASONING_METADATA_KINDS) await this.storage.delete(REASONING_METADATA_PREFIX + kind);
     await this.storage.delete(CLIENT_RUNTIME_KEY);
+    await this.storage.delete(NATIVE_OPENAI_FACTS_KEY);
     for (;;) {
       const metas = await this.storage.list<ModelListMeta>({ prefix: MODEL_LIST_META_PREFIX, limit: 1000 });
       if (metas.size === 0) break;
@@ -299,6 +304,18 @@ export class LeaseState {
       if (typeof stored?.body === "string") out[kind] = stored.body;
     }
     return out;
+  }
+
+  async nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string): Promise<boolean> {
+    if (!(await this.holdsLease(bootId))) return false;
+    await this.storage.put<StoredNativeOpenAiFacts>(NATIVE_OPENAI_FACTS_KEY, { bootId, stamp, facts });
+    return true;
+  }
+
+  async nativeOpenAiFactsRead(stamp: string): Promise<unknown> {
+    const stored = await this.storage.get<StoredNativeOpenAiFacts>(NATIVE_OPENAI_FACTS_KEY);
+    if (!stored || stored.stamp !== stamp || !(await this.holdsLease(stored.bootId))) return undefined;
+    return stored.facts;
   }
 
   async clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string): Promise<boolean> {

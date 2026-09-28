@@ -32,7 +32,7 @@ import {
   failedTailFrame,
   refusalFailedTailFrame,
   upstreamErrorTailFrame,
-} from "./relay";
+} from "./relay-frames";
 import {
   nextSseBlock,
   payloadRewriteAsBlockRewrite,

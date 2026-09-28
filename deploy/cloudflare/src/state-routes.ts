@@ -18,6 +18,7 @@ export interface StateHub {
   modelListCommit(bootId: string, key: string, list: ModelList, seqs: DocumentSeqs, ttlMs: number, stamp: string): Promise<boolean>;
   reasoningMetadataCommit(bootId: string, kind: ReasoningMetadataKind, body: string, version: number): Promise<boolean>;
   clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string): Promise<boolean>;
+  nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string): Promise<boolean>;
 }
 
 export interface StateBucket {
@@ -48,6 +49,22 @@ export async function sweepOrphans(hub: Pick<StateHub, "currentSnapshot">, bucke
   const orphans = (await bucket.list(snapshotPrefix(namespace), SWEEP_LIMIT)).filter(key => key !== keep);
   for (const key of orphans) await bucket.delete(key);
   return orphans.length;
+}
+
+// A catalog's worth of model ids with a boolean each; far below this.
+const MAX_NATIVE_OPENAI_FACTS_BYTES = 256 * 1024;
+const FACT_FLAGS = ["mainCredentialObserved", "nativeMainTrafficBlocked", "contextRelayActive"];
+
+/** NativeOpenAiFacts (src/server/cloudflare-native-chat-api.ts), exactly. */
+export function isNativeOpenAiFacts(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const facts = value as Record<string, unknown>;
+  if (Object.keys(facts).length !== FACT_FLAGS.length + 2) return false;
+  if (!FACT_FLAGS.every(flag => typeof facts[flag] === "boolean")) return false;
+  if (!["websocket", "sse", "proxied"].includes(facts.upstreamTransport as string)) return false;
+  const support = facts.reasoningSummarySupport;
+  return !!support && typeof support === "object" && !Array.isArray(support)
+    && Object.values(support).every(answer => typeof answer === "boolean");
 }
 
 // client-fingerprint.ts's CLAUDE_CODE_RUNTIME_HEADERS, each a short header-safe value.
@@ -146,6 +163,14 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     if (!Number.isSafeInteger(parsed?.version) || !("value" in parsed)) return new Response("version and value required", { status: 400 });
     const committed = await hub.reasoningMetadataCommit(bootId, reasoningKind as ReasoningMetadataKind, JSON.stringify(parsed.value), parsed.version as number);
     return committed ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
+  }
+  if (path === "/native-openai-facts" && req.method === "PUT") {
+    const text = await req.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_NATIVE_OPENAI_FACTS_BYTES) return new Response("facts too large", { status: 413 });
+    let facts: unknown;
+    try { facts = JSON.parse(text); } catch { facts = undefined; }
+    if (!isNativeOpenAiFacts(facts)) return new Response("native OpenAI facts required", { status: 400 });
+    return (await hub.nativeOpenAiFactsCommit(bootId, facts, stamp)) ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
   }
   if (path === "/client-runtime" && req.method === "PUT") {
     let headers: unknown;

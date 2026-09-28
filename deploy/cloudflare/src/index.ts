@@ -5,7 +5,8 @@ import {
 } from "./container-env";
 import { type DocumentSeqs, type DurableDocument, LeaseState, type ModelList, type ReasoningMetadataKind } from "./lease";
 import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
-import { createNativeWsSession, modelListReplayKey, nativeConfigAdmitted, serveNativeChat, serveNativeMessages, serveNativeResponses, type NativeChatDeps } from "ocx-worker-native";
+import { createNativeWsSession, modelListReplayKey, nativeConfigAdmitted, serveNativeChat, serveNativeMessages, serveNativeResponses, type NativeChatDeps, type NativeOpenAiFacts } from "ocx-worker-native";
+import { openUpstreamWebSocket } from "./upstream-websocket";
 import { handleStateRequest } from "./state-routes";
 
 export { ContainerProxy };
@@ -176,6 +177,10 @@ export class OpencodexHub extends Container<Env> {
     return this.leases.modelListCommit(bootId, key, list, seqs, ttlMs, stamp);
   }
   clientRuntimeRead(stamp: string) { return this.leases.clientRuntimeRead(stamp); }
+  nativeOpenAiFactsRead(stamp: string) { return this.leases.nativeOpenAiFactsRead(stamp); }
+  nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string) {
+    return this.leases.nativeOpenAiFactsCommit(bootId, facts, stamp);
+  }
   clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string) {
     return this.leases.clientRuntimeCommit(bootId, headers, stamp);
   }
@@ -239,6 +244,9 @@ function nativeDeps(env: Env, ctx: ExecutionContext, hub: ReturnType<typeof getC
     readAuth: async () => (await hub.readDocument("auth"))?.body,
     reasoningMetadata: () => hub.reasoningMetadataRead(),
     clientRuntime: async () => hub.clientRuntimeRead(await modelListStamp(env)),
+    readCodexAccounts: async () => (await hub.readDocument("codex-accounts"))?.body,
+    nativeOpenAiFacts: async () => (await hub.nativeOpenAiFactsRead(await modelListStamp(env))) as NativeOpenAiFacts | undefined,
+    openUpstreamSocket: (url, headers) => openUpstreamWebSocket(url, headers),
     skills: {
       read: scope => hub.skillsSnapshotRead(scope),
       commit: (scope, block) => { ctx.waitUntil(hub.skillsSnapshotCommit(scope, block).catch(() => {})); },

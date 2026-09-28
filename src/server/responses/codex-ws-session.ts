@@ -9,9 +9,16 @@ export class CodexWsSession {
   private owner?: (reason: Error) => void;
   private readonly completedIds = new Set<string>();
 
+  /**
+   * `openSocket` dials instead of Bun's `new WebSocket(url, { headers })`, which a runtime without
+   * client-side upgrade headers (the Cloudflare Worker) cannot use.
+   */
   constructor(url: string, headers: Record<string, string>, readonly retainable = false,
-    private readonly changed: () => void = () => {}, proxy?: string) {
-    this.socket = new WebSocket(url, { headers, ...(proxy ? { proxy } : {}) } as unknown as string[]);
+    private readonly changed: () => void = () => {}, proxy?: string,
+    openSocket?: (url: string, headers: Record<string, string>) => WebSocket) {
+    this.socket = openSocket
+      ? openSocket(url, headers)
+      : new WebSocket(url, { headers, ...(proxy ? { proxy } : {}) } as unknown as string[]);
     this.socket.addEventListener("open", this.onOpen);
     this.socket.addEventListener("message", this.onIdleMessage);
     this.socket.addEventListener("close", this.onClose);

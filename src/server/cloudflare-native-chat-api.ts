@@ -28,10 +28,31 @@ export type NativeChatDeps = {
    * them (worker-native-state.ts); undefined until it has.
    */
   clientRuntime?(): Promise<Record<string, string> | undefined>;
+  /** The Durable Object's copy of codex-accounts.json, read only for a turn to the native OpenAI provider. */
+  readCodexAccounts?(): Promise<string | undefined>;
+  /** What ocx's process holds that a native OpenAI turn depends on, as published for this deployment. */
+  nativeOpenAiFacts?(): Promise<NativeOpenAiFacts | undefined>;
+  /** Dials the ChatGPT backend's WebSocket with these upgrade headers; undefined where none can be. */
+  openUpstreamSocket?(url: string, headers: Record<string, string>): WebSocket;
   /** Called once per served turn, after its last byte; the Worker queues it for ocx's usage log. */
   recordUsage?(row: WorkerUsageRow): void;
   /** Why a request went to the container. Reasons name config keys and fields, never values. */
   onDecline?(reason: string): void;
+};
+
+/**
+ * ocx's own state that decides a ChatGPT passthrough turn (server/worker-native-state.ts publishes
+ * it): whether a Codex main login is observed (its hard lock and cooldowns then apply to a caller
+ * holding it), whether native main traffic is fenced, whether the context relay records sessions,
+ * the upstream transport ocx dials, and the Codex catalog's reasoning-summary support by model id.
+ */
+export type NativeOpenAiFacts = {
+  mainCredentialObserved: boolean;
+  nativeMainTrafficBlocked: boolean;
+  contextRelayActive: boolean;
+  /** "proxied" when an egress proxy carries ocx's upstream traffic, which the Worker cannot use. */
+  upstreamTransport: "websocket" | "sse" | "proxied";
+  reasoningSummarySupport: Record<string, boolean>;
 };
 
 /** Serves the turn, or returns null to hand the request (with `bodyText`) to the container. */

@@ -32,8 +32,10 @@ const FORBIDDEN_MODULES = [
 // effort caches' pure reads and OpenCode Go's session header add three more; the WebSocket session
 // and the frame, framing and limit helpers it shares with ocx's socket, seven more; the anthropic
 // adapter and the layers every registered adapter gets, eleven more; a built-in provider's routed
-// config (model policy, registry merge) and ocx's usage labels, eight more.
-const MAX_CLOSURE = 190;
+// config (model policy, registry merge) and ocx's usage labels, eight more; a ChatGPT passthrough
+// turn (the Responses passthrough adapter, the ChatGPT WebSocket exchange, the eager relay and the
+// passthrough client rewrites), 38 more.
+const MAX_CLOSURE = 228;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {
@@ -65,6 +67,11 @@ function closure(entry: string) {
       // bundle has no node_modules of its own to fall back on.
       if (!spec.startsWith(".")) {
         if (!ALLOWED_NODE.has(spec) && !BUNDLED_PACKAGES.has(spec)) problems.push(`${spec} in ${chain(file)}`);
+        continue;
+      }
+      // A JSON module (package.json's version) is inlined by the bundler and imports nothing.
+      if (spec.endsWith(".json")) {
+        if (!existsSync(resolve(dirname(file), spec))) problems.push(`unresolved ${spec} in ${chain(file)}`);
         continue;
       }
       const base = resolve(dirname(file), spec.replace(/\.js$/, ""));

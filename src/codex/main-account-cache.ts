@@ -40,6 +40,7 @@ export function observeMainQuotaIdentity(accountId: string): void {
   mainAccountIdentityGeneration += 1;
   mainQuotaCredential = undefined;
   mainQuotaCredentialGeneration += 1;
+  mainQuotaCredentialListener?.();
 }
 
 export function captureMainQuotaWriter(accountId: string): MainQuotaWriter | undefined {
@@ -57,7 +58,20 @@ export function observeMainQuotaCredential(accessToken: string, accountId: strin
   if (!mainQuotaCredential || !isMainQuotaWriterLive(mainQuotaCredential.writer)
     || !timingSafeEqual(bearerHmac, mainQuotaCredential.bearerHmac)) mainQuotaCredentialGeneration += 1;
   mainQuotaCredential = { bearerHmac, writer };
+  mainQuotaCredentialListener?.();
   return { ...writer };
+}
+
+let mainQuotaCredentialListener: (() => void) | undefined;
+
+/** Called whenever a caller could start or stop matching the observed main credential. */
+export function onMainQuotaCredentialChange(listener: (() => void) | undefined): void {
+  mainQuotaCredentialListener = listener;
+}
+
+/** Whether any bearer could match (matchesMainQuotaCredential): a main credential is observed and live. */
+export function mainQuotaCredentialObserved(): boolean {
+  return mainQuotaCredential !== undefined && isMainQuotaWriterLive(mainQuotaCredential.writer);
 }
 
 export function matchesMainQuotaCredential(accessToken: string, effectiveAccountId: string | undefined): boolean {
@@ -102,6 +116,7 @@ export function clearMainAccountInfoCache(): void {
   mainAccountIdentityGeneration += 1;
   mainQuotaCredential = undefined;
   mainQuotaCredentialGeneration += 1;
+  mainQuotaCredentialListener?.();
 }
 
 /** Last physical credential presence observed while native-main ownership was held. */

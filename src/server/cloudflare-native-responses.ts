@@ -9,6 +9,7 @@ import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudfla
 import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, TURN_ADAPTERS, withOpenCodeGoSession, type NativeChatRoute } from "./cloudflare-native-chat";
 import { createAnthropicAdapterWith, isLikelyRealAnthropicThinkingSignature, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
 import { CLAUDE_CODE_HEADERS } from "../adapters/client-fingerprint";
+import { runNativeOpenAiTurn } from "./cloudflare-native-openai";
 import { createInputAdmission } from "./responses/input-admission-core";
 import { finishRegisteredAdapter, wrapOpenAIChatAdapter } from "../adapters/registered-adapter";
 import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
@@ -43,7 +44,7 @@ const BODY_FIELDS = new Set([
 const INPUT_ITEMS = new Set(["message", "function_call", "function_call_output", "reasoning"]);
 const TEXT_PARTS = new Set(["input_text", "output_text"]);
 // Multi-agent tools: ocx injects guidance and caps effort on these turns (collaboration.ts).
-const COLLABORATION_TOOLS = new Set([
+export const COLLABORATION_TOOLS = new Set([
   "spawn_agent", "send_input", "resume_agent", "close_agent", "send_message", "followup_task", "interrupt_agent", "list_agents",
 ]);
 const SKILLS_BLOCK = "<skills_instructions>";
@@ -69,7 +70,7 @@ async function sha256Hex(value: string): Promise<string> {
  * single-block rule, and first block wins. A frozen block is substituted at once; a new one is only
  * returned for the caller to commit once the turn has been sent, as ocx stores only after admission.
  */
-async function freezeSkillsCatalog(body: Rec, headers: Headers, deps: NativeChatDeps): Promise<"decline" | (() => void) | undefined> {
+export async function freezeSkillsCatalog(body: Rec, headers: Headers, deps: NativeChatDeps): Promise<"decline" | (() => void) | undefined> {
   const found = singleSkillsBlock(body);
   if (!found) return undefined;
   const conversation = reasoningReplayConversationIdFromResponsesRequest({
@@ -416,6 +417,10 @@ export const serveNativeResponses: ServeNativeChat = async (bodyText, headers, s
   let body: unknown;
   try { body = JSON.parse(bodyText); } catch { return no("body-not-json"); }
   if (!isRec(body)) return no("body-shape");
+  // router.ts sends a bare native model to the `openai` provider; a routed id names its provider.
+  if (typeof body.model === "string" && !body.model.includes("/")) {
+    return (await runNativeOpenAiTurn(body, headers, signal, deps, no, startedAt))?.response ?? null;
+  }
   const translatorBudget = createTranslatorBudget();
   const turn = await runNativeResponsesTurn(body, headers, signal, deps, no, { inbound: "responses", translatorBudget, startedAt });
   if (!turn) {

@@ -58,7 +58,7 @@ const CONFIG_DEFAULTS: Readonly<Record<string, unknown>> = {
   dropCodexSafetyBuffering: false,
   multiAgentGuidanceEnabled: true,
 };
-const configKeyAdmitted = (config: Record<string, unknown>, key: string) =>
+export const configKeyAdmitted = (config: Record<string, unknown>, key: string) =>
   CONFIG_KEYS.has(key) || (Object.hasOwn(CONFIG_DEFAULTS, key) && config[key] === CONFIG_DEFAULTS[key]);
 const RESERVED_NAMESPACES = new Set(["policy", "combo"]);
 // chat-native.ts: config.connectTimeoutMs ?? 200_000; a config that sets it is declined.

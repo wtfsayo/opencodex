@@ -2,8 +2,7 @@ import { createAnthropicAdapter } from "./anthropic";
 import { createAzureAdapter } from "./azure";
 import type { ProviderAdapter } from "./base";
 import { createClaudeCliAdapter } from "./claude-cli/adapter";
-import { withClinePassDeepSeekV4ToolReplayCompatibility } from "./cline-pass-deepseek-v4-tool-replay";
-import { withUniqueToolCallIds } from "./unique-tool-call-ids";
+import { finishRegisteredAdapter, wrapOpenAIChatAdapter } from "./registered-adapter";
 import { createCodeBuddyAdapter } from "./codebuddy/adapter";
 import { createQoderAdapter } from "./qoder/adapter";
 import { createCommandCodeAdapter } from "./command-code";
@@ -16,8 +15,6 @@ import { createOpenAIChatAdapter } from "./openai-chat";
 import { createOllamaNativeAdapter } from "./ollama-native";
 import { createResponsesPassthroughAdapter } from "./openai-responses";
 import type { OcxProviderConfig } from "../types";
-import { createAdapterTierMetadata } from "../providers/fastwire";
-import { withInputMediaGuard } from "./input-media-guard";
 
 export type AdapterCacheRetention = "none" | "short" | "long";
 
@@ -84,8 +81,7 @@ export const ADAPTER_REGISTRY = {
   "openai-chat": {
     wire: "openai-chat",
     mutation: "codex-owned",
-    create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) =>
-      withUniqueToolCallIds(withClinePassDeepSeekV4ToolReplayCompatibility(createOpenAIChatAdapter(provider))),
+    create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => wrapOpenAIChatAdapter(createOpenAIChatAdapter(provider)),
   },
   "ollama-native": {
     wire: "ollama-native",
@@ -189,37 +185,5 @@ export function createRegisteredAdapter(
 ): ProviderAdapter {
   const definition = getAdapterDefinition(provider.adapter);
   if (!definition) throw new Error(`Unknown adapter: ${provider.adapter}`);
-  const adapter = definition.create(provider, context);
-  const wire = effectiveAdapterContract(provider.adapter).wire;
-  if (wire !== "openai-responses") {
-    withInputMediaGuard(adapter, wire);
-  }
-  const buildRequest = adapter.buildRequest.bind(adapter);
-  adapter.buildRequest = (parsed, incoming) => {
-    const attachTierMetadata = (request: Awaited<ReturnType<ProviderAdapter["buildRequest"]>>) => {
-      // OpenAI-family adapters report the exact emitted field themselves. Other adapters
-      // still report an exact absence at this serialization boundary, which makes a routed
-      // Fast downgrade observable without asking core to infer an outbound body shape.
-      request.tierLog ??= createAdapterTierMetadata(
-        parsed.options.tierObservation,
-        parsed.options.tierDecision,
-        null,
-        null,
-      );
-      return request;
-    };
-    const request = buildRequest(parsed, incoming);
-    return request instanceof Promise
-      ? request.then(attachTierMetadata)
-      : attachTierMetadata(request);
-  };
-  if (adapter.runTurn && !adapter.tierLogForRunTurn) {
-    adapter.tierLogForRunTurn = parsed => createAdapterTierMetadata(
-      parsed.options.tierObservation,
-      parsed.options.tierDecision,
-      null,
-      null,
-    );
-  }
-  return adapter;
+  return finishRegisteredAdapter(definition.create(provider, context), effectiveAdapterContract(provider.adapter).wire);
 }

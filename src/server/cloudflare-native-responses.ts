@@ -6,7 +6,9 @@
 //
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
-import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, withOpenCodeGoSession, type NativeChatRoute } from "./cloudflare-native-chat";
+import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, TURN_ADAPTERS, withOpenCodeGoSession, type NativeChatRoute } from "./cloudflare-native-chat";
+import { createAnthropicAdapterWith, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
+import { finishRegisteredAdapter, wrapOpenAIChatAdapter } from "../adapters/registered-adapter";
 import { collabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { buildToolBridgeMaps } from "./responses/tool-bridge-maps";
 import { replaceSkillsBlock, singleSkillsBlock } from "./responses/skills-catalog";
@@ -155,6 +157,9 @@ function workerAdapterDeps(metadata: ReasoningMetadataAccess): OpenAIChatAdapter
   };
 }
 
+// Image-bearing turns are declined, and ocx's normalization returns at once without images.
+const NO_IMAGE_NORMALIZATION: AnthropicAdapterDeps = { normalizeAnthropicImages: async () => {} };
+
 /** reasoning-metadata.ts's credentialIdentity on the request path: a digest of the key sent. */
 function credentialDigest(provider: { apiKey?: string }): string | undefined {
   return typeof provider.apiKey === "string" && provider.apiKey.length > 0
@@ -225,7 +230,7 @@ export async function runNativeResponsesTurn(
   if (declined) return no(declined);
   const loaded = await loadNativeConfig(deps);
   if ("decline" in loaded) return no(loaded.decline);
-  const resolved = resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets);
+  const resolved = resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets, TURN_ADAPTERS);
   if (!resolved) return null;
   // core-normalize.ts, once the route is final.
   const route = withOpenCodeGoSession(resolved, headers, options.goSessionLane);
@@ -238,7 +243,7 @@ export async function runNativeResponsesTurn(
     if (typeof access === "string") return no(access);
     metadata = access;
   }
-  const config = loaded.config as Pick<OcxConfig, "stallTimeoutSec">;
+  const config = loaded.config as Pick<OcxConfig, "stallTimeoutSec" | "cacheRetention">;
 
   // ocx's web-search sidecar resolves through a configured OpenAI provider's accounts.
   const providers = (loaded.config as { providers: Record<string, unknown> }).providers;
@@ -262,6 +267,8 @@ export async function runNativeResponsesTurn(
   if (surface === "v1" && parsed.options.reasoning === "max") return no("collaboration-v1-guidance");
   // As core-normalize.ts: the upstream sees the routed id, and the identity sentence names it.
   if (parsed._rawBody && typeof parsed._rawBody === "object") (parsed._rawBody as { model?: string }).model = route.modelId;
+  // core-normalize.ts: an Anthropic route answers with the selector the client sent.
+  const responseModelId = route.providerName === "anthropic" || route.provider.adapter === "anthropic" ? parsed.modelId : route.modelId;
   parsed.modelId = route.modelId;
   parsed.context = renameRoutedIdentityInContext(parsed.context, route.modelId);
   // core-normalize.ts; the provider's showThinkingSummary is outside the fields this path admits.
@@ -272,7 +279,10 @@ export async function runNativeResponsesTurn(
   }
 
   const translatorBudget = options.translatorBudget;
-  const adapter = createOpenAIChatAdapterWith(route.provider, workerAdapterDeps(metadata));
+  // As createRegisteredAdapter builds them (registered-adapter.ts), with the Worker's own hooks.
+  const adapter = route.provider.adapter === "anthropic"
+    ? finishRegisteredAdapter(createAnthropicAdapterWith(route.provider, config.cacheRetention, NO_IMAGE_NORMALIZATION), "anthropic")
+    : finishRegisteredAdapter(wrapOpenAIChatAdapter(createOpenAIChatAdapterWith(route.provider, workerAdapterDeps(metadata))), "openai-chat");
   const upstreamAbort = new AbortController();
   const upstreamSignal = AbortSignal.any([signal, upstreamAbort.signal]);
   const request = await adapter.buildRequest(parsed, { headers: new Headers(), translatorBudget, abortSignal: upstreamSignal });
@@ -340,7 +350,7 @@ export async function runNativeResponsesTurn(
     }
   })();
   const sse = bridgeToResponsesSSE(
-    events, route.modelId, maps.toolNsMap, maps.freeformToolNames, maps.toolSearchToolNames,
+    events, responseModelId, maps.toolNsMap, maps.freeformToolNames, maps.toolSearchToolNames,
     () => upstreamAbort.abort(), 2_000,
     {
       translatorBudget,

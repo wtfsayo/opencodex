@@ -16,6 +16,7 @@ import { carriesMessageThread } from "../claude/message-threads";
 import { stripOneMillionMarker } from "../claude/one-m-marker";
 import { anthropicErrorResponse, collectAnthropicMessage, responsesSseToAnthropicSse } from "../claude/outbound";
 import { estimateClaudeRequestTokens } from "../claude/request-token-estimate";
+import { CLAUDE_NATIVE_THINKING } from "../lib/claude-request-projection";
 import { messagesToResponsesTranslation } from "../protocols/codecs/messages";
 import type { ClaudeInboundTranslation } from "../claude/inbound";
 import { conversationIdFromClaudeMetadata, normalizeLogConversationId, sessionLaneIdFromRequest } from "./request-log-conversation";
@@ -92,7 +93,10 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
     sharedCacheCohort: cacheKeySource === "system",
     ...(goSessionLane ? { goSessionLane } : {}),
     beforeSend: route => {
-      inputTokenFloor = estimateClaudeRequestTokens(body, requestedModel, openAIChatSerializesThinking(route.provider, route.modelId));
+      // claude-messages.ts's thinkingProjectionForRoute: only the openai-chat wire drops replayed thinking.
+      inputTokenFloor = estimateClaudeRequestTokens(body, requestedModel, route.provider.adapter === "openai-chat"
+        ? openAIChatSerializesThinking(route.provider, route.modelId)
+        : CLAUDE_NATIVE_THINKING);
     },
   });
   if (!turn) return null;

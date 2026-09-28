@@ -181,7 +181,9 @@ The Worker serves a request only when all of these hold, and otherwise passes it
 When the Worker passes a request on, it logs why once per reason (for example
 `Worker-native chat declined: config-keys:<names>`); `npx wrangler tail` shows it.
 
-It also answers `POST /v1/responses`, the API Codex uses, for the same providers when the turn is
+It also answers `POST /v1/responses`, the API Codex uses, for the same providers, and for a provider
+of your own with `adapter: "anthropic"` (key auth, `baseUrl`, `apiKey`, `models`; `cacheRetention`
+applies as in `ocx`), when the turn is
 streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
 is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only

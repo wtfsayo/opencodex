@@ -42,6 +42,8 @@ const CONFIG_KEYS = new Set([
   "appOwnedMemoryBudgetMb",
   // Only opens the Responses WebSocket transport, whose frames run as these same turns.
   "websockets",
+  // Read only by the anthropic adapter, which the turn paths build with it as ocx does.
+  "cacheRetention",
 ]);
 const RESERVED_NAMESPACES = new Set(["policy", "combo"]);
 // chat-native.ts: config.connectTimeoutMs ?? 200_000; a config that sets it is declined.
@@ -72,6 +74,9 @@ function resolveKeyReference(value: string, secrets: Readonly<Record<string, str
   return Object.prototype.hasOwnProperty.call(secrets, name) ? secrets[name] : undefined;
 }
 
+const CHAT_ADAPTERS: ReadonlySet<string> = new Set(["openai-chat"]);
+export const TURN_ADAPTERS: ReadonlySet<string> = new Set(["openai-chat", "anthropic"]);
+
 export type NativeChatRoute = {
   providerName: string;
   provider: OcxProviderConfig;
@@ -91,6 +96,8 @@ export function resolveNativeChatRoute(
   localHosts: ReadonlySet<string> = new Set(),
   why: (reason: string) => void = () => {},
   secrets: Readonly<Record<string, string>> = {},
+  // The chat lane forwards the body itself; turns run through an adapter also take anthropic.
+  adapters: ReadonlySet<string> = CHAT_ADAPTERS,
 ): NativeChatRoute | null {
   const no = (reason: string) => { why(reason); return null; };
   if (!isRec(config) || !isRec(config.providers) || typeof model !== "string") return no("config-or-model-shape");
@@ -112,7 +119,7 @@ export function resolveNativeChatRoute(
   if (!isRec(provider)) return no("provider-shape");
   const unknownField = Object.keys(provider).find(key => !PROVIDER_FIELDS.has(key));
   if (unknownField) return no(`provider-field:${unknownField}`);
-  if (provider.adapter !== "openai-chat") return no("adapter");
+  if (typeof provider.adapter !== "string" || !adapters.has(provider.adapter)) return no("adapter");
   if (provider.authMode !== undefined && provider.authMode !== "key") return no("auth-mode");
   if (typeof provider.baseUrl !== "string" || !destinationAllowed(provider.baseUrl, localHosts)) return no("destination");
   if (typeof provider.apiKey !== "string" || provider.apiKey.startsWith("keychain:")) return no("key-reference");

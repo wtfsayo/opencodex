@@ -264,7 +264,19 @@ over one socket; the Worker log shows only the upgrade, `nativeConfigSource` and
 container traffic. A frame with `previous_response_id` was declined by the Worker and answered by
 ocx over the relay (`previous_response_not_found`, 659 ms with the container warm).
 
-Still container-only: the dashboard and management API, OAuth and Codex-pool providers, spend
+Anthropic (branch `feat/cloudflare-worker-anthropic`): providers with `adapter: "anthropic"` and
+key auth, and the built-in `anthropic` provider logged in with a Claude subscription. A trace of
+ocx's path found the key-auth case stateless and the OAuth case free of side effects exactly while
+the account pool is off, one account is stored, and its token has more than REFRESH_SKEW_MS left;
+the Worker serves only then, with the token from the Durable Object's auth.json, and never
+refreshes one. Building that turned up a gap in every earlier Worker turn: ocx never uses a bare
+adapter (createRegisteredAdapter adds the input-media guard, tier metadata and, for openai-chat,
+tool-call id re-minting), so those layers moved to `src/adapters/registered-adapter.ts`, shared by
+the registry and the Worker. Verified by tests that run ocx and the Worker side by side (upstream
+body, every upstream header, client bytes, usage fields); not run live, as the test account has no
+Anthropic key or Claude login.
+
+Still container-only: the dashboard and management API, Codex-pool and other OAuth providers, spend
 limits, and the web-search sidecar. Spend limits need the reservation ledger's authority moved into
 the Durable Object (its API is synchronous at every call site today); OAuth needs token refresh
 coordinated between the Worker and ocx, since refresh tokens rotate.

@@ -10,6 +10,7 @@ import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields
 import { createAnthropicAdapterWith, isLikelyRealAnthropicThinkingSignature, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
 import { CLAUDE_CODE_HEADERS } from "../adapters/client-fingerprint";
 import { noStoredCodexAccounts, runNativeOpenAiTurn } from "./cloudflare-native-openai";
+import { hasShrinkableOpenAIChatImages } from "../adapters/openai-chat-image-budget";
 import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers";
 import { providerCodexAccountMode } from "../providers/registry";
 import { createInputAdmission } from "./responses/input-admission-core";
@@ -110,6 +111,17 @@ async function webSearchSidecarDecline(openai: unknown, deps: NativeChatDeps): P
   return facts.codexAccountsStored || facts.mainCodexLoginPresent ? "web-search-sidecar" : undefined;
 }
 
+/** An image the client sent inline: no file id or remote URL for ocx to resolve. */
+function isInlineImagePart(part: Rec): boolean {
+  return part.type === "input_image" && typeof part.image_url === "string" && /^data:image\/[\w.+-]+;base64,/.test(part.image_url)
+    && Object.keys(part).every(key => key === "type" || key === "image_url" || key === "detail");
+}
+
+function carriesImages(body: Rec): boolean {
+  return Array.isArray(body.input) && body.input.some(item => isRec(item) && Array.isArray(item.content)
+    && item.content.some(part => isRec(part) && part.type === "input_image"));
+}
+
 function hasHostedWebSearch(body: Rec): boolean {
   return Array.isArray(body.tools) && body.tools.some(tool => isRec(tool) && tool.type === "web_search");
 }
@@ -155,7 +167,7 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
       if (!isRec(item) || typeof item.type !== "string" || !INPUT_ITEMS.has(item.type)) return "input-item";
       if (item.type === "message") {
         if (typeof item.content !== "string" && !(Array.isArray(item.content)
-          && item.content.every(part => isRec(part) && typeof part.type === "string" && TEXT_PARTS.has(part.type)))) return "message-parts";
+          && item.content.every(part => isRec(part) && typeof part.type === "string" && (TEXT_PARTS.has(part.type) || isInlineImagePart(part))))) return "message-parts";
       }
       // ocx answers an unpaired tool result with its own 400.
       if ((item.type === "function_call" || item.type === "function_call_output")
@@ -173,11 +185,12 @@ export function nativeResponsesDeclineReason(body: Rec, headers: Headers): strin
 
 // Effort is mapped with ocx's caches as it published them (or none, for a destination without
 // models.dev metadata). Image-bearing turns are declined above, so the image hooks are never reached.
-function workerAdapterDeps(metadata: ReasoningMetadataAccess): OpenAIChatAdapterDeps {
+function workerAdapterDeps(metadata: ReasoningMetadataAccess, images: { normalizationNeeded: boolean }): OpenAIChatAdapterDeps {
   return {
     mapReasoningEffort: (provider, modelId, requested) => mapReasoningEffortWith(provider, modelId, requested, metadata),
-    hasShrinkableOpenAIChatImages: () => false,
-    normalizeOpenAIChatImages: async () => {},
+    // ocx re-encodes images past the budget with Bun's codec; such a turn is left to it.
+    hasShrinkableOpenAIChatImages,
+    normalizeOpenAIChatImages: async () => { images.normalizationNeeded = true; },
   };
 }
 
@@ -270,6 +283,14 @@ export async function runNativeResponsesTurn(
   if (!resolved) return null;
   // core-normalize.ts, once the route is final.
   const route = withOpenCodeGoSession(resolved, headers, options.goSessionLane);
+  // request-prepare.ts: images reach a model as sent only when ocx would neither describe nor strip
+  // them (vision/plan.ts, from catalogs only ocx reads) and the adapter would not re-encode them.
+  const images = { normalizationNeeded: false };
+  if (carriesImages(body)) {
+    if (route.provider.adapter !== "openai-chat") return no("image-adapter");
+    const published = await deps.nativeOpenAiFacts?.();
+    if (published?.visionPreprocessed[`${route.providerName}/${route.modelId}`] !== false) return no("vision-preprocessing");
+  }
   // ocx maps effort for these destinations from models.dev metadata and refusals it learned
   // (reasoning-metadata.ts); without an effort that state is never consulted.
   const effort = isRec(body.reasoning) ? body.reasoning.effort : undefined;
@@ -337,10 +358,11 @@ export async function runNativeResponsesTurn(
   }
   const adapter = route.provider.adapter === "anthropic"
     ? finishRegisteredAdapter(createAnthropicAdapterWith(route.provider, config.cacheRetention, anthropicDeps), "anthropic")
-    : finishRegisteredAdapter(wrapOpenAIChatAdapter(createOpenAIChatAdapterWith(route.provider, workerAdapterDeps(metadata))), "openai-chat");
+    : finishRegisteredAdapter(wrapOpenAIChatAdapter(createOpenAIChatAdapterWith(route.provider, workerAdapterDeps(metadata, images))), "openai-chat");
   const upstreamAbort = new AbortController();
   const upstreamSignal = AbortSignal.any([signal, upstreamAbort.signal]);
   const request = await adapter.buildRequest(parsed, { headers: new Headers(), translatorBudget, abortSignal: upstreamSignal });
+  if (images.normalizationNeeded) return no("image-normalization");
   // Everything that can throw runs before the send: after it, a throw would resend via the container.
   const maps = buildToolBridgeMaps(parsed, translatorBudget);
   options.beforeSend?.(route);

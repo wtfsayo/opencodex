@@ -16,6 +16,7 @@ import { NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS, NATIVE_OPENAI_MODELS } from "../
 import { listModelMetadata } from "../generated/model-metadata";
 import { OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { resolveInputCeiling } from "./responses/input-admission";
+import { requiresVisionPreprocessing } from "../vision/plan";
 import { contextRelayActivated } from "../codex/context-compat";
 import { getObservedMainQuotaIdentityKey, mainQuotaCredentialObserved, onMainQuotaCredentialChange } from "../codex/main-account-cache";
 import { isNativeMainTrafficBlocked } from "../codex/native-profile-startup";
@@ -75,9 +76,23 @@ function mainAccountIdentityKey(): string | null {
   return mainQuotaCredentialObserved() ? getObservedMainQuotaIdentityKey() ?? null : null;
 }
 
+/** vision/plan.ts's answer for every model a configured provider lists, as request-prepare.ts asks it. */
+function visionPreprocessed(): Record<string, boolean> {
+  const config = loadConfig();
+  const answers: Record<string, boolean> = {};
+  for (const [name, row] of Object.entries(config.providers ?? {})) {
+    if (!row || !Array.isArray(row.models)) continue;
+    for (const id of row.models) {
+      if (typeof id === "string" && id) answers[`${name}/${id}`] = requiresVisionPreprocessing(config, row, id, name);
+    }
+  }
+  return answers;
+}
+
 let factsVersion = Date.now();
 // Computed on the publish cadence, off any request: the catalog tables and config read are not free.
 let cachedCeilings: Record<string, number | null> | undefined;
+let cachedVision: Record<string, boolean> | undefined;
 let publishedMainKey: string | null | undefined;
 let publishedMainLoginPresent: boolean | undefined;
 let acknowledgedVersion = 0;
@@ -85,6 +100,7 @@ let publishScheduled = false;
 
 export function nativeOpenAiFacts(refreshCeilings = false): NativeOpenAiFacts {
   if (refreshCeilings || !cachedCeilings) cachedCeilings = inputCeilings();
+  if (refreshCeilings || !cachedVision) cachedVision = visionPreprocessed();
   return {
     version: ++factsVersion,
     mainAccountIdentityKey: mainAccountIdentityKey(),
@@ -94,6 +110,7 @@ export function nativeOpenAiFacts(refreshCeilings = false): NativeOpenAiFacts {
     contextRelayActive: contextRelayActivated(),
     upstreamTransport: upstreamTransport(),
     inputCeilings: cachedCeilings,
+    visionPreprocessed: cachedVision,
   };
 }
 

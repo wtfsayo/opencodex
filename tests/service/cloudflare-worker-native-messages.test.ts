@@ -271,7 +271,7 @@ describe("Worker-native Messages", () => {
     ["a synthetic Fast row", claudeTurn({ model: `${ALIAS}--fast` }), "messages:synthetic-row-grammar"],
     ["a message-thread continuation", claudeTurn({ thread: { previous_message_id: "msg_1" } }), "messages:message-thread"],
     ["an injected agent's route directive", claudeTurn({ system: [{ type: "text", text: "<!-- ocx-route: p/m-1 -->" }] }), "messages:route-directive"],
-    ["an image", claudeTurn({ messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }] }] }), "messages:message-parts"],
+    ["an image", claudeTurn({ messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }] }] }), "messages:vision-preprocessing"],
   ] as const) {
     test(`declines ${name}`, async () => {
       const { response, declines } = await throughWorker(structuredClone(body), textReply);

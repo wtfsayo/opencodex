@@ -198,8 +198,10 @@ Worker's. That covers the turn when it is
 streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when `ocx` would drop it:
 with no enabled `openai` provider, or with the one `ocx init` writes while the hub holds no ChatGPT
-login or Codex accounts to search with (`ocx`'s search sidecar searches with those); no code-mode `exec` or custom tools; text-only
-messages; and no `<skills_instructions>` block outside the instructions and developer messages.
+login or Codex accounts to search with (`ocx`'s search sidecar searches with those); no code-mode
+`exec` or custom tools; text messages, plus inline images to an `openai-chat` provider whose model
+`ocx` would send them to unchanged (it describes or strips them for a text-only model, which it
+tells the Worker, and re-encodes them past 3.5 MiB); and no `<skills_instructions>` block outside the instructions and developer messages.
 That covers what Codex CLI sends on an ordinary turn. For OpenCode Zen and Go, whose reasoning
 levels `ocx` reads from models.dev and from the levels a provider has refused before, a turn with a
 reasoning effort uses the copies of those two caches `ocx` keeps in the Durable Object; it goes to
@@ -252,7 +254,8 @@ And it answers `POST /v1/messages`, the API Claude Code uses, when `model` is on
 `ocx` lists for Claude Code (`ocx-claude-<provider>--<model>`, or `ocx-claude2-…` for a model id
 with a `/`, and the older `claude-ocx-` spellings `ocx` still reads) and the provider qualifies as
 above. The data token may also arrive in `x-api-key`, as `ocx` accepts it there. The turn is
-translated and answered as `ocx` does it, streamed or not, when it has text-only messages and
+translated and answered as `ocx` does it, streamed or not, when its messages hold text (or images
+the Responses path above would serve) and
 `ocx` would not treat it specially: a Claude model id (which may be passthrough on your own
 Anthropic credential, or a Claude Desktop alias), a config with a `claudeCode` section, an injected
 agent's `ocx-route` directive, or a subagent's message thread all go to `ocx`.

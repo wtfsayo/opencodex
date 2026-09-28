@@ -66,6 +66,11 @@ export type NativeOpenAiFacts = {
   upstreamTransport: "websocket" | "sse" | "proxied";
   /** input-admission.ts's ceiling for each native model id ocx knows, null where it has none. */
   inputCeilings: Record<string, number | null>;
+  /**
+   * vision/plan.ts's requiresVisionPreprocessing for each configured `provider/model`: true where ocx
+   * describes or strips a turn's images before sending, from catalogs only it reads.
+   */
+  visionPreprocessed: Record<string, boolean>;
 };
 
 /** Serves the turn, or returns null to hand the request (with `bodyText`) to the container. */

@@ -36,8 +36,9 @@ const FORBIDDEN_MODULES = [
 // turn (the Responses passthrough adapter, the ChatGPT WebSocket exchange, the eager relay and the
 // passthrough client rewrites), 38 more; ocx's SSE inspector and the continuation replay a
 // WebSocket session keeps for its own native responses, three more; ocx's failure answers for that
-// turn (the passthrough error body, transport-failure text, request-log terminal status), seven more.
-const MAX_CLOSURE = 238;
+// turn (the passthrough error body, transport-failure text, request-log terminal status), seven more;
+// the translated Chat image budget, one more.
+const MAX_CLOSURE = 239;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {

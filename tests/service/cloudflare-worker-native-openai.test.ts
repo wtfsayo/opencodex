@@ -133,6 +133,7 @@ const transport: NativeOpenAiFacts["upstreamTransport"] = bunSupportsBoundedCode
 // This process's own ceilings, as the container would publish them.
 const facts = (extra: Partial<NativeOpenAiFacts> = {}): NativeOpenAiFacts => ({
   version: 1, mainAccountIdentityKey: null, codexAccountsStored: false, mainCodexLoginPresent: false, nativeMainTrafficBlocked: false, contextRelayActive: false,
+  visionPreprocessed: {},
   upstreamTransport: transport, inputCeilings: nativeOpenAiFacts(true).inputCeilings, ...extra,
 });
 const isAdmissionSecret = async (value: string) => value === "hub-data-token";
@@ -236,6 +237,12 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
         { type: "message", role: "assistant", content: [{ type: "output_text", text: "Found it." }] },
         { type: "message", role: "user", content: [{ type: "input_text", text: "Again." }] },
       ],
+    }), textTurn],
+    ["a turn with a pasted screenshot", codexTurn({
+      input: [{ type: "message", role: "user", content: [
+        { type: "input_text", text: "What is in this?" },
+        { type: "input_image", image_url: `data:image/png;base64,${"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}`, detail: "auto" },
+      ] }],
     }), textTurn],
     ["a turn whose answer searches the web", codexTurn({ tools: [shell, { type: "web_search", external_web_access: true }] }), searchTurn],
     ["a turn replaying a custom tool call", codexTurn({
@@ -461,6 +468,61 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     expect((await run(facts({ mainCodexLoginPresent: true }))).declines).toEqual(["responses:web-search-sidecar"]);
     expect((await run(facts(), JSON.stringify({ accounts: [{ id: "a1" }] }))).declines).toEqual(["responses:web-search-sidecar"]);
     expect((await run(undefined)).declines).toEqual(["responses:web-search-facts-unpublished"]);
+  });
+
+  test("a routed turn with a pasted image: served as ocx sends it when ocx would not alter the image", async () => {
+    const chatReply = () => new Response([
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant", content: "a cat" } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 90, completion_tokens: 2 } })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join(""), { headers: { "content-type": "text/event-stream" } });
+    const pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const turnWith = (image: string) => {
+      const turn = codexTurn({ model: "z/m-1", input: [{ type: "message", role: "user", content: [
+        { type: "input_text", text: "What is this?" }, { type: "input_image", image_url: image, detail: "auto" },
+      ] }] });
+      delete turn.reasoning;
+      delete turn.include;
+      return turn;
+    };
+    const chat = { adapter: "openai-chat", apiKey: "sk-z", models: ["m-1"] };
+    let sent: Rec | undefined;
+    const upstream = Bun.serve({ port: 0, async fetch(req) { sent = await req.json() as Rec; return chatReply(); } });
+    const init = getDefaultConfig() as unknown as Rec;
+    saveConfig({ ...init, port: 0, providers: { ...(init.providers as Rec), z: { ...chat, baseUrl: `${upstream.url.toString().replace(/\/$/, "")}/v1`, allowPrivateNetwork: true } } } as never);
+    const published = facts({ visionPreprocessed: nativeOpenAiFacts(true).visionPreprocessed });
+    expect(published.visionPreprocessed["z/m-1"]).toBe(false);
+    const server = startServer(0);
+    let proxyText = "";
+    try {
+      const res = await saved.fetch(`http://127.0.0.1:${server.port}/v1/responses`, { method: "POST", headers: callerHeaders(), body: JSON.stringify(turnWith(`data:image/png;base64,${pixel}`)) });
+      proxyText = await res.text();
+    } finally {
+      await server.stop(true);
+      await upstream.stop(true);
+    }
+    const run = async (body: Rec, extra: { facts?: NativeOpenAiFacts; provider?: Rec } = {}) => {
+      let workerSent: Rec | undefined;
+      const declines: string[] = [];
+      const config = JSON.stringify({ ...init, port: 0, providers: { ...(init.providers as Rec), z: { ...(extra.provider ?? chat), baseUrl: "https://api.example.test/v1" } } });
+      const res = await serveNativeResponses(JSON.stringify(body), new Headers(callerHeaders()), new AbortController().signal, {
+        readConfig: async () => config, readCodexAccounts: async () => undefined, nativeOpenAiFacts: async () => extra.facts ?? published,
+        fetch: async request => { workerSent = await request.json() as Rec; return chatReply(); },
+        onDecline: reason => declines.push(reason),
+      });
+      return { declines, sent: workerSent, text: await res?.text() };
+    };
+    const ids = (text: string) => normalize(text).replace(/"(resp|msg|fc|rs|item)_[A-Za-z0-9_-]+"/g, "\"$1_ID\"");
+    const worker = await run(turnWith(`data:image/png;base64,${pixel}`));
+    expect(worker.declines).toEqual([]);
+    expect(worker.sent).toEqual(sent);
+    expect(JSON.stringify(sent)).toContain(pixel);
+    expect(ids(worker.text!)).toBe(ids(proxyText));
+    // A model ocx would describe or strip images for, an image ocx would re-encode, an anthropic route.
+    expect((await run(turnWith(`data:image/png;base64,${pixel}`), { facts: facts({ visionPreprocessed: { "z/m-1": true } }) })).declines).toEqual(["responses:vision-preprocessing"]);
+    expect((await run(turnWith(`data:image/png;base64,${"A".repeat(3_700_000)}`))).declines).toEqual(["responses:image-normalization"]);
+    expect((await run(turnWith(`data:image/png;base64,${pixel}`), { provider: { adapter: "anthropic", apiKey: "sk-z", models: ["m-1"] } })).declines).toEqual(["responses:image-adapter"]);
+    expect((await run(turnWith("https://example.test/cat.png"))).declines).toEqual(["responses:message-parts"]);
   });
 
   test("every model ocx gates by account is declined by name", () => {

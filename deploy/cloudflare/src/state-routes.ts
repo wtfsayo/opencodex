@@ -59,7 +59,9 @@ const FACT_FLAGS = ["codexAccountsStored", "mainCodexLoginPresent", "nativeMainT
 export function isNativeOpenAiFacts(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const facts = value as Record<string, unknown>;
-  if (Object.keys(facts).length !== FACT_FLAGS.length + 4) return false;
+  if (Object.keys(facts).length !== FACT_FLAGS.length + 5) return false;
+  const vision = facts.visionPreprocessed;
+  if (!vision || typeof vision !== "object" || Array.isArray(vision) || !Object.values(vision).every(answer => typeof answer === "boolean")) return false;
   if (!Number.isSafeInteger(facts.version)) return false;
   if (!FACT_FLAGS.every(flag => typeof facts[flag] === "boolean")) return false;
   if (facts.mainAccountIdentityKey !== null && !(typeof facts.mainAccountIdentityKey === "string" && /^[0-9a-f]{64}$/.test(facts.mainAccountIdentityKey))) return false;

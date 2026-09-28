@@ -184,8 +184,8 @@ Branch `feat/cloudflare-worker-only`, stacked on `feat/cloudflare-worker-native`
   hideThinkingSummary) and declines where it is stateful (skills snapshot, stored responses,
   effort ladders, collaboration, code mode, namespaces, images). Both guards are off for these
   turns (terminal: provider opt-in; empty completion: config opt-in).
-- Not reproduced, by design: `/v1/models` (upstream discovery and the Codex catalog template),
-  `/v1/messages`, WebSocket Responses. Those still start the container.
+- Not reproduced at first: `/v1/models` (upstream discovery and the Codex catalog template),
+  `/v1/messages`, WebSocket Responses. Those started the container.
 
 Exit criterion met (2026-09-28): a fresh deployment (`opencodex-worker-only-test`, configured only
 by secrets: data token, a bootstrap config with the Workers AI provider, `OCX_WORKER_NATIVE=1`)
@@ -210,5 +210,26 @@ Worker events and Durable Object calls (`nativeConfigSource`, `skillsSnapshot`, 
 the log. Llama 4 Scout answered Codex's full tool set with a tool call written as text, a model
 limitation. Codex CLI made no `/v1/models` request in these runs.
 
-Still container-only: `/v1/models`, `/v1/messages` (Claude Code), WebSocket Responses, the
-dashboard and management API, OAuth and Codex-pool providers, and any turn with reasoning effort.
+Messages (branch `feat/cloudflare-worker-messages`, 2026-09-28): `/v1/messages` is served by
+translating to a Responses request and running the Worker's Responses turn with the inbound wire
+set to `anthropic` (no hideThinkingSummary recompute, declared tool names not enforced, as
+run-turn-execution.ts does), then `responsesSseToAnthropicSse` with ocx's own input-token floor.
+Only `ocx-claude-*` aliases qualify: a bare Claude id can be native passthrough, a Claude Desktop
+alias, a modelMap entry or a classifier check, all resolved against state the Worker lacks. The
+translator closure had to shed Claude Desktop state first (alias-codec, one-m-marker, a Desktop
+lookup slot); the Worker's import closure went from 129 to 150 files, all translation modules.
+Tests run the same turn through `handleClaudeMessages` and the Worker and compare the upstream
+body and the client bytes.
+
+Real Claude Code (2.1.283, `claude -p` with an isolated CLAUDE_CONFIG_DIR, `ANTHROPIC_API_KEY` set
+to the data token) against `opencodex-wo2-test`: a plain turn (Llama 4 Scout, 5.0 s) and a two-turn
+Bash tool loop (`qwen/qwen3-30b-a3b-fp8`, 9.4 s, "2 lines") were served with only
+`nativeConfigSource` and `enqueueUsage` in the Durable Object log. Three model limits surfaced,
+each reproduced identically by the container after the Worker declined the upstream error:
+Llama 3.3 70B's 24k window is smaller than Claude Code's 32,000 `max_tokens` and its 16k-token
+prompt; Scout writes tool calls as text; Mistral Small 3.1 refuses the `system` message Claude
+Code inserts after a tool result ("Unexpected role 'system' after role 'tool'"). The last one is
+ocx's openai-chat translation, not the Worker.
+
+Still container-only: `/v1/models`, WebSocket Responses, the dashboard and management API, OAuth
+and Codex-pool providers, and effort on destinations with models.dev metadata (OpenCode Zen).

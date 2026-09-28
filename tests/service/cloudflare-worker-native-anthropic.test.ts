@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { saveConfig } from "../../src/config";
+import { getDefaultConfig, saveConfig } from "../../src/config";
 import { startServer } from "../../src/server";
 import { serveNativeMessages } from "../../src/server/cloudflare-native-messages";
 import { serveNativeResponses } from "../../src/server/cloudflare-native-responses";
@@ -145,6 +145,21 @@ describe("Worker-native turns on the anthropic adapter", () => {
       expect(normalize(worker.text!)).toBe(normalize(proxy.text));
     });
   }
+
+  test("a config `ocx init` wrote is served, and one changing what its defaults leave unset is not", async () => {
+    const init = getDefaultConfig() as unknown as Rec;
+    const withProvider = (extra: Rec) => ({ ...init, ...extra, providers: { ...(init.providers as Rec), z: { ...anthropic, baseUrl: "https://api.example.test/v1" } } });
+    const run = async (config: Rec) => {
+      const declines: string[] = [];
+      await serveNativeResponses(JSON.stringify(responsesTurn("z/claude-x")), new Headers(), new AbortController().signal, {
+        readConfig: async () => JSON.stringify(config), fetch: async () => anthropicText(), onDecline: reason => declines.push(reason),
+      });
+      return declines;
+    };
+    expect(await run(withProvider({}))).toEqual([]);
+    expect(await run(withProvider({ emptyCompletionRetry: true }))).toEqual(["responses:config-keys:emptyCompletionRetry"]);
+    expect(await run(withProvider({ multiAgentGuidanceEnabled: false }))).toEqual(["responses:config-keys:multiAgentGuidanceEnabled"]);
+  });
 
   test("an anthropic provider with a setting the Worker does not reproduce is left to ocx", async () => {
     const worker = await throughWorker("/v1/responses", responsesTurn("z/claude-x"), { ...anthropic, apiKeyTransport: "bearer" }, anthropicText, "");

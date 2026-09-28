@@ -4,32 +4,30 @@ import { CLAUDE_CODE_HEADERS, CLAUDE_CODE_RUNTIME_HEADERS } from "../adapters/cl
 import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 import { startWorkerUsageInbox } from "../usage/worker-usage-inbox";
 
-const PUBLISH_RETRY_MS = [1_000, 5_000, 30_000];
+// A Durable Object reset, a lease that moved, or a Worker version with a new stamp each drops what
+// was published; publishing again on this cadence restores it without anyone noticing.
+const REPUBLISH_MS = 5 * 60 * 1000;
+let republish: ReturnType<typeof setInterval> | undefined;
 
 /**
  * The Claude Code fingerprint headers that name this process's runtime. A Claude subscription turn
- * the Worker serves sends these, not the Worker runtime's, so Anthropic sees one client either way.
+ * the Worker serves sends these, not the Worker runtime's, so the upstream sees the same headers.
  */
-export function publishClientRuntimeForWorker(attempt = 0): void {
+export function publishClientRuntimeForWorker(): Promise<void> | undefined {
   // Only where the Worker serves requests (the Worker sets it; see containerEnv).
-  if (process.env.OCX_WORKER_NATIVE_STATE !== "1" || !durableMirrorEnabled()) return;
+  if (process.env.OCX_WORKER_NATIVE_STATE !== "1" || !durableMirrorEnabled()) return undefined;
   const headers = Object.fromEntries(CLAUDE_CODE_RUNTIME_HEADERS.map(name => [name, CLAUDE_CODE_HEADERS[name]!]));
-  const retry = () => {
-    if (attempt >= PUBLISH_RETRY_MS.length) return;
-    setTimeout(() => publishClientRuntimeForWorker(attempt + 1), PUBLISH_RETRY_MS[attempt]).unref?.();
-  };
-  stateRequest("/client-runtime", {
+  return stateRequest("/client-runtime", {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(headers),
-  })?.then(response => {
-    void response.body?.cancel();
-    // 409 means another process holds the lease; its own copy is the one that counts.
-    if (!response.ok && response.status !== 409) retry();
-  }, retry);
+  })?.then(response => { void response.body?.cancel(); }, () => {});
 }
 
 export function startWorkerNativeState(): void {
   startWorkerUsageInbox();
-  publishClientRuntimeForWorker();
+  if (publishClientRuntimeForWorker() && !republish) {
+    republish = setInterval(() => void publishClientRuntimeForWorker(), REPUBLISH_MS);
+    republish.unref?.();
+  }
 }

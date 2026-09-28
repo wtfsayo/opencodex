@@ -290,6 +290,31 @@ changed, a per-process memory) and accounts marked `needsReauth`. A registry-mat
 the destination check inside `routedProviderConfigWith`, so the Worker checks the final base URL
 itself and refuses its own local hosts for a route carrying an account token.
 
+A second pair of reviews corrected that account. The destination check does run on the final URL
+(`routed-provider-config.ts` calls it on both branches); what was missing was the Worker's own
+hosts, which `sendUpstream` answers locally whatever their name, so that check now refuses them.
+Rows ocx carries forward kept failing preset equality: a login before claude-sonnet-5 keeps
+`defaultModel: claude-sonnet-4-6` while the catalog lists it, and the dashboard writes picker state
+(`selectedModels`, `modelPreset`, `newModelPolicy`, `initialModelSelection`); none reach a request
+path, and an explicit `anthropic/<id>` routes past a plain `defaultModel`, so both are admitted. A
+config `ocx init` wrote declined every Worker turn on `emptyCompletionRetry`,
+`dropCodexSafetyBuffering`, `multiAgentGuidanceEnabled` and `multiAgentMode`; the first three are
+admitted at the value that behaves as unset, the last at any value (only effort caps read it on a
+request path, and no admitted config sets one). The runtime headers are republished every five
+minutes and kept per stamp (four), so a Durable Object reset, a moved lease or a gradual deployment
+recovers on its own.
+
+Known divergences, not fixed:
+- A turn the Worker serves never records its serving identity in ocx's reasoning-replay memory
+  (`commitReasoningReplayServingIdentity`). If a conversation switches model or provider between a
+  turn ocx served and one the Worker served, a later ocx turn compares against the older identity
+  and may drop signed thinking pure ocx would keep, or keep what it would drop. Exact would need
+  the Worker's identity (per-install salt, account slot) in ocx before that turn, which the
+  60-second usage-inbox drain cannot promise.
+- The Worker and ocx keep separate skills-catalog snapshots, so a session whose first turn one of
+  them served and later turns the other can send a different catalog if it changed mid-session.
+  The new declines (runtime unpublished after a deploy) make that more reachable.
+
 Still container-only: the dashboard and management API, Codex-pool and other OAuth providers, spend
 limits, and the web-search sidecar. Spend limits need the reservation ledger's authority moved into
 the Durable Object (its API is synchronous at every call site today); OAuth needs token refresh

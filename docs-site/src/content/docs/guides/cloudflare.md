@@ -187,11 +187,14 @@ applies as in `ocx`), and for the built-in `anthropic` provider logged in with a
 (`authMode: "oauth"`) when it has exactly one account whose token has more than a minute left: the
 Worker uses the token `ocx` stored and never refreshes one, so a token near expiry, an account
 waiting for a new login, a second account (which turns on `ocx`'s failover and quota tracking), or a
-setting on that provider other than what `ocx login anthropic` wrote sends the turn to `ocx`. So does
-a turn that replays Claude's signed thinking, which `ocx` checks against the account that produced
-it, and any subscription turn before `ocx` has started once under the current deployment: `ocx`
-tells the Worker which runtime to report in the Claude Code headers, so Anthropic sees the same
-client from either. That covers the turn when it is
+setting on that provider other than what the current release's `ocx login anthropic` writes (the
+model picker's choices aside) sends the turn to `ocx`. So does a turn that replays Claude's signed
+thinking, which `ocx` keeps or drops by what served the conversation before; with thinking on, that
+is every turn after the first, so the Worker mostly serves first turns and conversations without
+thinking. So does any subscription turn before `ocx` has published, under the current deployment,
+the runtime it reports in the Claude Code headers, which the Worker then sends as its own. Those
+headers match; the connection itself (address, TLS, Cloudflare's own request headers) is the
+Worker's. That covers the turn when it is
 streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
 is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only

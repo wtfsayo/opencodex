@@ -91,7 +91,7 @@ describe("the container's Claude Code runtime, as the Worker reads it", () => {
         return response;
       },
     });
-    publishClientRuntimeForWorker();
+    await publishClientRuntimeForWorker();
     await Promise.all(puts);
     return { hub, puts };
   }
@@ -102,6 +102,12 @@ describe("the container's Claude Code runtime, as the Worker reads it", () => {
     expect(await hub.clientRuntimeRead("stamp-1")).toEqual(expected);
     // A new Worker version or container environment may run another runtime.
     expect(await hub.clientRuntimeRead("stamp-2")).toBeUndefined();
+    // Both versions of a gradual deployment keep theirs; the oldest of too many goes.
+    for (const stamp of ["stamp-2", "stamp-3", "stamp-4"]) await hub.clientRuntimeCommit(BOOT_ID, expected, stamp);
+    expect(await hub.clientRuntimeRead("stamp-1")).toEqual(expected);
+    await hub.clientRuntimeCommit(BOOT_ID, expected, "stamp-5");
+    expect(await hub.clientRuntimeRead("stamp-1")).toBeUndefined();
+    expect(await hub.clientRuntimeRead("stamp-5")).toEqual(expected);
   });
 
   test("is not published where the Worker does not serve requests, and the route takes only those headers", async () => {
@@ -258,6 +264,39 @@ describe("Worker-native turns on an Anthropic OAuth login", () => {
     expect(proxy.sent).toBeUndefined();
     expect(proxy.text).toContain("\"code\":\"context_length_exceeded\"");
     expect((await throughWorker("/v1/responses", huge, authText())).declines).toEqual(["responses:input-admission"]);
+  });
+
+  test("serves a login row as ocx persists it after startup, with an older default and picker state", async () => {
+    // Logins before the claude-sonnet-5 default kept claude-sonnet-4-6, which startup leaves while it is listed.
+    saveConfig({ port: 0, providers: { anthropic: { ...row, defaultModel: "claude-sonnet-4-6", selectedModels: ["claude-opus-5-5"] } } } as unknown as OcxConfig);
+    const server = startServer(0);
+    await server.stop(true);
+    const persisted = JSON.parse(readFileSync(join(home, "config.json"), "utf8")) as Rec;
+    expect((persisted.providers as Rec).anthropic).toMatchObject({ defaultModel: "claude-sonnet-4-6" });
+    const declines: string[] = [];
+    await serveNativeResponses(JSON.stringify(responsesTurn()), new Headers(), new AbortController().signal, {
+      readConfig: async () => JSON.stringify(persisted), readAuth: async () => authText(), clientRuntime: async () => containerRuntime,
+      fetch: async () => reply(), onDecline: reason => declines.push(reason),
+    });
+    expect(declines).toEqual([]);
+  });
+
+  test("a field the login does not write is declined, whatever its name", async () => {
+    const proto = JSON.parse(`{"__proto__":{},${JSON.stringify(row).slice(1)}`) as Rec;
+    expect(Object.hasOwn(proto, "__proto__")).toBe(true);
+    expect((await throughWorker("/v1/responses", responsesTurn(), authText(), proto)).declines).toEqual(["responses:provider-field:__proto__"]);
+    // A default with a slash could name the whole selector in ocx's router.
+    expect((await throughWorker("/v1/responses", responsesTurn(), authText(), { ...row, defaultModel: "anthropic/claude-opus-5-5" })).declines).toEqual(["responses:provider-field:defaultModel"]);
+  });
+
+  test("a Claude Code turn replaying signed thinking is left to ocx too", async () => {
+    const body = messagesTurn();
+    body.messages = [
+      { role: "user", content: "List files." },
+      { role: "assistant", content: [{ type: "thinking", thinking: "Listing.", signature: "A".repeat(64) }, { type: "text", text: "Sure." }] },
+      { role: "user", content: "Again." },
+    ];
+    expect((await throughWorker("/v1/messages", body, authText())).declines).toEqual(["messages:reasoning-replay-state"]);
   });
 
   test("never sends the account's token to a host the Worker answers itself", async () => {

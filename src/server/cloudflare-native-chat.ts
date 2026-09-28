@@ -47,7 +47,19 @@ const CONFIG_KEYS = new Set([
   "websockets",
   // Read only by the anthropic adapter, which the turn paths build with it as ocx does.
   "cacheRetention",
+  // On a request path only effort-policy.ts reads it, to exempt turns from effort caps, and no
+  // config this path admits sets a cap.
+  "multiAgentMode",
 ]);
+// Keys `ocx init` writes (getDefaultConfig) at the value that behaves as if unset; any other value
+// changes the turn (a retried empty completion, no multi-agent guidance) and declines it.
+const CONFIG_DEFAULTS: Readonly<Record<string, unknown>> = {
+  emptyCompletionRetry: false,
+  dropCodexSafetyBuffering: false,
+  multiAgentGuidanceEnabled: true,
+};
+const configKeyAdmitted = (config: Record<string, unknown>, key: string) =>
+  CONFIG_KEYS.has(key) || (Object.hasOwn(CONFIG_DEFAULTS, key) && config[key] === CONFIG_DEFAULTS[key]);
 const RESERVED_NAMESPACES = new Set(["policy", "combo"]);
 // chat-native.ts: config.connectTimeoutMs ?? 200_000; a config that sets it is declined.
 const HEADER_TIMEOUT_MS = 200_000;
@@ -83,6 +95,9 @@ const CHAT_ADAPTERS: ReadonlySet<string> = new Set(["openai-chat"]);
 // routed-provider-config.ts merges the registry's own values over those anyway.
 const OAUTH_PROVIDERS = new Set(["anthropic"]);
 const OAUTH_ROW_FIELDS = new Set(["adapter", "baseUrl", "authMode"]);
+// The dashboard's model picker state, which no request path reads (ocx keeps a login's older
+// defaultModel too while the catalog still lists it).
+const OAUTH_PICKER_FIELDS = new Set(["selectedModels", "modelPreset", "newModelPolicy", "initialModelSelection"]);
 // oauth/index.ts's REFRESH_SKEW_MS: ocx refreshes a token this close to expiry before sending. The
 // Worker never refreshes (refresh tokens rotate, and only ocx may spend one), so it leaves those
 // turns to ocx.
@@ -109,8 +124,11 @@ function resolveOAuthRoute(
 ): NativeChatRoute | null {
   if (!isRec(row)) return no("provider-shape");
   const preset = deriveOAuthProviderConfig(providerName) as Record<string, unknown> | undefined;
-  const unknownField = Object.keys(row).find(key => !OAUTH_ROW_FIELDS.has(key)
-    && (preset?.[key] === undefined || canonicalJson(row[key]) !== canonicalJson(preset[key])));
+  const unknownField = Object.keys(row).find(key => !OAUTH_ROW_FIELDS.has(key) && !OAUTH_PICKER_FIELDS.has(key)
+    // An explicit `anthropic/<id>` routes past defaultModel, which only adds a known id; one with a
+    // slash could match the whole selector (router.ts), so only a plain id is left out of it.
+    && !(key === "defaultModel" && typeof row[key] === "string" && PLAIN_MODEL_ID.test(row[key]))
+    && (!preset || !Object.hasOwn(preset, key) || canonicalJson(row[key]) !== canonicalJson(preset[key])));
   if (unknownField) return no(`provider-field:${unknownField}`);
   if (row.authMode !== "oauth") return no("auth-mode");
   // An explicit namespace routes the id verbatim; anything the slug codec would decode is ocx's.
@@ -119,7 +137,8 @@ function resolveOAuthRoute(
   try {
     provider = routedProviderConfigWith(providerName, row as unknown as OcxProviderConfig, {
       resolveApiKey: () => undefined,
-      // Never a host the Worker answers itself: the route carries the account's token.
+      // Called with the final base URL. Never a host the Worker answers itself, whatever its name
+      // looks like (sendUpstream answers those locally): the route carries the account's token.
       assertDestinationAllowed: (_name, target) => {
         if (typeof target.baseUrl !== "string" || !destinationAllowed(target.baseUrl, NO_LOCAL_HOSTS)
           || localHosts.has(new URL(target.baseUrl).host)) throw new Error("destination");
@@ -129,10 +148,6 @@ function resolveOAuthRoute(
   } catch {
     return no("destination");
   }
-  // A registry-matched transport skips the check above, and the row may still override baseUrl.
-  // sendUpstream answers a host of the Worker's own itself, whatever its name looks like.
-  if (typeof provider.baseUrl !== "string" || !destinationAllowed(provider.baseUrl, NO_LOCAL_HOSTS)
-    || localHosts.has(new URL(provider.baseUrl).host)) return no("destination");
   if (provider.adapter !== "anthropic" || provider.authMode !== "oauth") return no("adapter");
   const accountSet = isRec(authStore) ? authStore[providerName] : undefined;
   if (!isRec(accountSet) || !Array.isArray(accountSet.accounts)) return no("oauth-no-login");
@@ -145,7 +160,8 @@ function resolveOAuthRoute(
   if (typeof access !== "string" || access.trim() === "" || typeof refresh !== "string" || typeof expires !== "number") {
     return no("oauth-account-shape");
   }
-  // ocx refuses an account marked for a fresh login (resolveAccessSnapshotForAccount).
+  // ocx refuses an account marked for a fresh login when it commits the selection
+  // (commitOAuthAccountSelection with requireUsableAccount, request-transport.ts).
   if (account.needsReauth === true) return no("oauth-needs-reauth");
   if (expires <= Date.now() + OAUTH_REFRESH_SKEW_MS) return no("oauth-refresh-due");
   return { providerName, provider: { ...provider, apiKey: access }, modelId, requestedModel: model, apiKeyReference: "", oauthAccountId: account.id as string };
@@ -180,7 +196,7 @@ export function resolveNativeChatRoute(
 ): NativeChatRoute | null {
   const no = (reason: string) => { why(reason); return null; };
   if (!isRec(config) || !isRec(config.providers) || typeof model !== "string") return no("config-or-model-shape");
-  const unknownKeys = Object.keys(config).filter(key => !CONFIG_KEYS.has(key)).sort();
+  const unknownKeys = Object.keys(config).filter(key => !configKeyAdmitted(config, key)).sort();
   if (unknownKeys.length > 0) return no(`config-keys:${unknownKeys.join(",")}`);
   const slash = model.indexOf("/");
   if (slash <= 0) return no("model-without-provider");
@@ -224,7 +240,7 @@ export function withOpenCodeGoSession(route: NativeChatRoute, headers: Headers, 
 
 /** Whether a config has only the keys this path reproduces; any other key declines every turn. */
 export function nativeConfigAdmitted(config: unknown): boolean {
-  return isRec(config) && isRec(config.providers) && Object.keys(config).every(key => CONFIG_KEYS.has(key));
+  return isRec(config) && isRec(config.providers) && Object.keys(config).every(key => configKeyAdmitted(config, key));
 }
 
 /** The usage-row fields ocx fills from the route (providers/label.ts labels the key). */

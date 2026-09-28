@@ -188,7 +188,7 @@ applies as in `ocx`), and for the built-in `anthropic` provider logged in with a
 Worker uses the token `ocx` stored and never refreshes one, so a token near expiry, an account
 waiting for a new login, a second account (which turns on `ocx`'s failover and quota tracking), or a
 setting on that provider other than what the current release's `ocx login anthropic` writes (the
-model picker's choices aside) sends the turn to `ocx`. So does a turn that replays Claude's signed
+model picker's choices and an older default model aside) sends the turn to `ocx`. So does a turn that replays Claude's signed
 thinking, which `ocx` keeps or drops by what served the conversation before; with thinking on, that
 is every turn after the first, so the Worker mostly serves first turns and conversations without
 thinking. So does any subscription turn before `ocx` has published, under the current deployment,

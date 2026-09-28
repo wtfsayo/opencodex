@@ -102,12 +102,10 @@ describe("the container's Claude Code runtime, as the Worker reads it", () => {
     expect(await hub.clientRuntimeRead("stamp-1")).toEqual(expected);
     // A new Worker version or container environment may run another runtime.
     expect(await hub.clientRuntimeRead("stamp-2")).toBeUndefined();
-    // Both versions of a gradual deployment keep theirs; the oldest of too many goes.
-    for (const stamp of ["stamp-2", "stamp-3", "stamp-4"]) await hub.clientRuntimeCommit(BOOT_ID, expected, stamp);
-    expect(await hub.clientRuntimeRead("stamp-1")).toEqual(expected);
-    await hub.clientRuntimeCommit(BOOT_ID, expected, "stamp-5");
+    // Only the newest publish counts: a Worker version other than the hub's finds none of its own.
+    await hub.clientRuntimeCommit(BOOT_ID, expected, "stamp-2");
     expect(await hub.clientRuntimeRead("stamp-1")).toBeUndefined();
-    expect(await hub.clientRuntimeRead("stamp-5")).toEqual(expected);
+    expect(await hub.clientRuntimeRead("stamp-2")).toEqual(expected);
   });
 
   test("is not published where the Worker does not serve requests, and the route takes only those headers", async () => {

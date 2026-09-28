@@ -70,11 +70,10 @@ export type ReasoningMetadataKind = (typeof REASONING_METADATA_KINDS)[number];
 type StoredReasoningMetadata = { bootId: string; version: number; body: string };
 
 // The Claude Code fingerprint headers naming ocx's runtime (src/server/worker-native-state.ts),
-// by the stamp of the Worker version and container environment they were published under. A few
-// stamps are kept, so both versions of a gradual deployment find theirs.
+// under the stamp of the Worker version and container environment they were published under. Only
+// the newest is kept: a Worker version other than the hub's must not reuse an older container's.
 const CLIENT_RUNTIME_KEY = "ocx:client-runtime";
-const MAX_CLIENT_RUNTIME_STAMPS = 4;
-type StoredClientRuntime = { stamp: string; headers: Record<string, string> }[];
+type StoredClientRuntime = { stamp: string; headers: Record<string, string> };
 
 const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
@@ -304,16 +303,14 @@ export class LeaseState {
 
   async clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string): Promise<boolean> {
     if (!(await this.holdsLease(bootId))) return false;
-    const stored = (await this.storage.get<StoredClientRuntime>(CLIENT_RUNTIME_KEY)) ?? [];
-    const kept = Array.isArray(stored) ? stored.filter(entry => entry.stamp !== stamp) : [];
-    await this.storage.put<StoredClientRuntime>(CLIENT_RUNTIME_KEY, [{ stamp, headers }, ...kept].slice(0, MAX_CLIENT_RUNTIME_STAMPS));
+    await this.storage.put<StoredClientRuntime>(CLIENT_RUNTIME_KEY, { stamp, headers });
     return true;
   }
 
   /** The headers as published under `stamp`; undefined before this deployment's ocx has published. */
   async clientRuntimeRead(stamp: string): Promise<Record<string, string> | undefined> {
     const stored = await this.storage.get<StoredClientRuntime>(CLIENT_RUNTIME_KEY);
-    return Array.isArray(stored) ? stored.find(entry => entry.stamp === stamp)?.headers : undefined;
+    return stored?.stamp === stamp ? stored.headers : undefined;
   }
 
   private async dropModelList(key: string): Promise<void> {

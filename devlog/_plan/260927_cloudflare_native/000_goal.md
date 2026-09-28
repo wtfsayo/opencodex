@@ -301,8 +301,9 @@ config `ocx init` wrote declined every Worker turn on `emptyCompletionRetry`,
 `dropCodexSafetyBuffering`, `multiAgentGuidanceEnabled` and `multiAgentMode`; the first three are
 admitted at the value that behaves as unset, the last at any value (only effort caps read it on a
 request path, and no admitted config sets one). The runtime headers are republished every five
-minutes and kept per stamp (four), so a Durable Object reset, a moved lease or a gradual deployment
-recovers on its own.
+minutes, so a Durable Object reset or a moved lease recovers on its own. Only the newest stamp is
+kept: the hub runs one version, so a second Worker version mid-rollout would otherwise reuse an
+older container's runtime where it should decline.
 
 Known divergences, not fixed:
 - A turn the Worker serves never records its serving identity in ocx's reasoning-replay memory

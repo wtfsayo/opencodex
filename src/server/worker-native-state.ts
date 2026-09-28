@@ -5,9 +5,11 @@ import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 import { resolveProxyRoute } from "../lib/proxy-env";
 import { startWorkerUsageInbox } from "../usage/worker-usage-inbox";
 import { loadConfig } from "../config";
-import { watch } from "node:fs";
+import { realpathSync, watch, type FSWatcher } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { listCodexAccountIds } from "../codex/account-store";
 import { getMainChatgptAccountId } from "../codex/auth-collision";
+import { isMainAccountCredentialUsable } from "../codex/main-account";
 import { resolveCodexHomeDir } from "../codex/home";
 import { NATIVE_OPENAI_CONTEXT_OVERRIDES, nativeContextLimits } from "../codex/catalog/metadata";
 import { NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS, NATIVE_OPENAI_MODELS } from "../codex/catalog/native-models";
@@ -78,6 +80,7 @@ let factsVersion = Date.now();
 let cachedCeilings: Record<string, number | null> | undefined;
 let publishedMainKey: string | null | undefined;
 let publishedMainLoginPresent: boolean | undefined;
+let acknowledgedVersion = 0;
 let publishScheduled = false;
 
 export function nativeOpenAiFacts(refreshCeilings = false): NativeOpenAiFacts {
@@ -86,7 +89,7 @@ export function nativeOpenAiFacts(refreshCeilings = false): NativeOpenAiFacts {
     version: ++factsVersion,
     mainAccountIdentityKey: mainAccountIdentityKey(),
     codexAccountsStored: listCodexAccountIds().length > 0,
-    mainCodexLoginPresent: getMainChatgptAccountId() !== null,
+    mainCodexLoginPresent: mainCodexLoginPresent(),
     nativeMainTrafficBlocked: isNativeMainTrafficBlocked(),
     contextRelayActive: contextRelayActivated(),
     upstreamTransport: upstreamTransport(),
@@ -115,7 +118,9 @@ export function publishNativeOpenAiFactsForWorker(retrySoon = false, refreshCeil
     .then(ok => {
       // Only a stored answer counts as published; a main account the Worker has not heard of yet
       // is retried until it has, since a caller holding it would otherwise skip ocx's limits.
-      if (ok) {
+      // The hub keeps only a newer version, so only a newer acknowledgement says what it holds.
+      if (ok && facts.version > acknowledgedVersion) {
+        acknowledgedVersion = facts.version;
         publishedMainKey = facts.mainAccountIdentityKey;
         publishedMainLoginPresent = facts.mainCodexLoginPresent;
       }
@@ -123,6 +128,11 @@ export function publishNativeOpenAiFactsForWorker(retrySoon = false, refreshCeil
         setTimeout(() => void publishNativeOpenAiFactsForWorker(retrySoon), FIRST_RETRY_MS).unref?.();
       }
     });
+}
+
+/** Any main login ocx could search with, a refresh token alone included (main-account.ts). */
+function mainCodexLoginPresent(): boolean {
+  return isMainAccountCredentialUsable() || getMainChatgptAccountId() !== null;
 }
 
 /** Republish once, after whatever triggered it, when `changed` still says the answer moved. */
@@ -143,16 +153,31 @@ function mainCredentialChanged(): void {
 /**
  * The main Codex login is written by several owners (login, refresh, profile switches), so its
  * file is watched rather than each writer: a login appearing must reach the Worker before it drops
- * a web search ocx would now run with it.
+ * a web search ocx would now run with it. That still leaves one publish round trip after a write.
+ * A CODEX_HOME that does not exist yet is watched once it does (armed again on the cadence), and a
+ * symlinked auth.json is watched where it lives.
  */
+let loginWatchers: FSWatcher[] = [];
 function watchMainCodexLogin(): void {
-  try {
-    const watcher = watch(resolveCodexHomeDir(), (_event, file) => {
-      if (file === "auth.json") scheduleRepublish(() => (getMainChatgptAccountId() !== null) !== publishedMainLoginPresent);
-    });
-    watcher.unref?.();
-  } catch {
-    // No CODEX_HOME to watch: the republish cadence still carries a login made later.
+  if (loginWatchers.length > 0) return;
+  const loginChanged = () => scheduleRepublish(() => mainCodexLoginPresent() !== publishedMainLoginPresent);
+  const home = resolveCodexHomeDir();
+  const directories = new Set([home]);
+  try { directories.add(dirname(realpathSync(join(home, "auth.json")))); } catch { /* no login file yet */ }
+  for (const directory of directories) {
+    try {
+      const watcher = watch(directory, (_event, file) => {
+        if (file === null || file === "auth.json" || basename(String(file)) === "auth.json") loginChanged();
+      });
+      watcher.on("error", () => {
+        watcher.close();
+        loginWatchers = loginWatchers.filter(existing => existing !== watcher);
+      });
+      watcher.unref?.();
+      loginWatchers.push(watcher);
+    } catch {
+      // Not there yet: the republish cadence arms it again.
+    }
   }
 }
 
@@ -164,6 +189,7 @@ export function startWorkerNativeState(): void {
     onMainQuotaCredentialChange(mainCredentialChanged);
     watchMainCodexLogin();
     republish = setInterval(() => {
+      watchMainCodexLogin();
       void publishClientRuntimeForWorker();
       void publishNativeOpenAiFactsForWorker(false, true);
     }, REPUBLISH_MS);

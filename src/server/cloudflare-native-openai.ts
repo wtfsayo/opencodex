@@ -350,6 +350,8 @@ export async function runNativeOpenAiTurn(
       ...(conversationId ? { conversationId } : {}),
       inboundProtocol: "responses",
       admissionKind: "environment",
+      ...(typeof parsed.options.maxOutputTokens === "number" && parsed.options.maxOutputTokens > 0
+        ? { spendOutputCeilingTokens: Math.trunc(parsed.options.maxOutputTokens) } : {}),
       status,
       durationMs: Date.now() - startedAt,
       usageStatus: "unreported",

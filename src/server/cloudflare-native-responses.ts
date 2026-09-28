@@ -244,6 +244,8 @@ type TurnOptions = {
   sharedCacheCohort?: boolean;
   /** OpenCode Go's session lane when the caller derives it (claude-messages.ts does). */
   goSessionLane?: string;
+  /** The input estimate ocx's path records for the spend ledger (claude-messages.ts's token floor). */
+  spendInputTokens?: () => number;
   /** The WebSocket transport sends every response with an empty id (websocket-handler.ts). */
   responseId?: string;
   /** Runs once the route is known and before the send, so nothing after the send can throw. */
@@ -350,6 +352,8 @@ export async function runNativeResponsesTurn(
     cursorConversationId: parsed._cursorConversationId,
   });
   const requestedEffort = parsed.options.reasoning;
+  const maxOutput = parsed.options.maxOutputTokens;
+  const spendOutputCeilingTokens = typeof maxOutput === "number" && maxOutput > 0 ? Math.trunc(maxOutput) : undefined;
   const upstream = await sendUpstream(request, upstreamSignal, deps);
   if (!upstream.ok || !upstream.body) {
     await upstream.body?.cancel();
@@ -376,6 +380,9 @@ export async function runNativeResponsesTurn(
       ...(options.surface ? { surface: options.surface } : {}),
       inboundProtocol: options.inbound === "anthropic" ? "messages" : "responses",
       admissionKind: "environment",
+      // request-prepare.ts reserves the caller's output ceiling, and the path's input estimate.
+      ...(options.spendInputTokens ? { spendInputTokens: options.spendInputTokens() } : {}),
+      ...(spendOutputCeilingTokens !== undefined ? { spendOutputCeilingTokens } : {}),
       status,
       durationMs: Date.now() - startedAt,
       ...(firstOutputAt !== undefined ? { firstOutputMs: firstOutputAt - startedAt } : {}),

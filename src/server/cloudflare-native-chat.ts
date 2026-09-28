@@ -15,6 +15,7 @@ import { redactSecretString } from "../lib/redact";
 import { fastPolicyForModel } from "../providers/service-tier";
 import { chatCollabSurface, isThreadSpawnRequest } from "./collab-surface";
 import { createTranslatorBudget } from "../lib/translator-budget";
+import { estimateTokens } from "../lib/token-estimate";
 import type { OcxConfig, OcxProviderConfig, OcxUsage } from "../types";
 import { PROVIDER_REGISTRY } from "../providers/registry";
 import { resolveOpenCodeGoTransport } from "../providers/opencode-go-transport";
@@ -316,7 +317,15 @@ export const serveNativeChat: ServeNativeChat = async (bodyText, headers, signal
   let usage: OcxUsage | undefined;
   let firstOutputAt: number | undefined;
   let terminalStatus: number | undefined;
+  // chat-completions.ts's spend reservation for a native Chat send: an estimate of the messages and
+  // tools, and the caller's output ceiling.
+  const spendParts = [JSON.stringify(body.messages ?? [])];
+  if (body.tools !== undefined) spendParts.push(JSON.stringify(body.tools));
+  const spendInputTokens = Math.max(1, estimateTokens(spendParts.join("\n"), body.model as string));
+  const outputCeiling = body.max_completion_tokens ?? body.max_tokens;
   const record = (status: number) => deps.recordUsage?.({
+    spendInputTokens,
+    ...(typeof outputCeiling === "number" && outputCeiling > 0 ? { spendOutputCeilingTokens: Math.trunc(outputCeiling) } : {}),
     requestId: crypto.randomUUID(),
     timestamp: startedAt,
     ...routeUsageFields(route),

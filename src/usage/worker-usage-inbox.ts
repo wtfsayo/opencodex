@@ -7,7 +7,8 @@
 import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 import { appendUsageEntry, isKnownUsageSurface, type PersistedUsageEntry } from "./log";
 import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
-import { sharedSpendLedger } from "../lib/spend-reservation-ledger";
+import { sharedSpendLedger, type SpendReservationLedger } from "../lib/spend-reservation-ledger";
+import { SpendLedgerOwnerError } from "../lib/spend-ledger-owner";
 
 const DRAIN_INTERVAL_MS = 60_000;
 const BATCH = 500;
@@ -55,29 +56,29 @@ const ENTRY_FIELDS = [
 /**
  * request-spend.ts books every send in the spend ledger, limits or not, so a ceiling configured
  * later counts what was already spent. A Worker turn is booked here, as one send already made:
- * settled with its usage, or unresolved without one. Keyed by the row's request id, so a batch
- * appended twice is refused as a duplicate send rather than counted twice.
+ * reserved at the estimate ocx's path would make, then settled with its usage or left unresolved
+ * without one. Keyed by the row's request id, so a batch appended twice is not counted twice.
  */
-function bookWorkerSpend(entry: PersistedUsageEntry): void {
-  try {
-    const ledger = sharedSpendLedger();
-    const sendId = `worker:${entry.requestId}`;
-    const decision = ledger.reserve({
-      sendId,
-      scopes: {
-        ...(entry.accountLogLabel !== undefined ? { identityId: entry.accountLogLabel } : {}),
-        poolId: entry.provider,
-      },
-      inputTokens: entry.usage?.inputTokens ?? 0,
-      outputCeilingTokens: 0,
-      alreadySent: true,
-    });
-    if (!decision.reserved) return;
-    ledger.markDispatched(sendId);
-    if (entry.usage) ledger.settle(sendId, { inputTokens: entry.usage.inputTokens, outputTokens: entry.usage.outputTokens });
-    else ledger.markLost(sendId);
-  } catch (error) {
-    console.warn(`[usage] Worker turn not booked in the spend ledger: ${error instanceof Error ? error.name : "error"}`);
+function bookWorkerSpend(ledger: SpendReservationLedger, entry: PersistedUsageEntry, row: Record<string, unknown>): void {
+  const tokens = (key: string) => typeof row[key] === "number" && Number.isFinite(row[key]) && (row[key] as number) > 0 ? Math.trunc(row[key] as number) : 0;
+  const sendId = `worker:${entry.requestId}`;
+  const decision = ledger.reserve({
+    sendId,
+    scopes: {
+      ...(entry.accountLogLabel !== undefined ? { identityId: entry.accountLogLabel } : {}),
+      poolId: entry.provider,
+    },
+    inputTokens: tokens("spendInputTokens"),
+    outputCeilingTokens: tokens("spendOutputCeilingTokens"),
+    alreadySent: true,
+  });
+  if (!decision.reserved) return;
+  ledger.markDispatched(sendId);
+  const usage = entry.usage;
+  if (entry.usageStatus === "reported" && (typeof usage?.inputTokens === "number" || typeof usage?.outputTokens === "number")) {
+    ledger.settle(sendId, { inputTokens: usage?.inputTokens ?? 0, outputTokens: usage?.outputTokens ?? 0 });
+  } else {
+    ledger.markLost(sendId);
   }
 }
 
@@ -90,11 +91,23 @@ export function drainWorkerUsageInbox(): Promise<number> {
       if (!response?.ok) break;
       const { rows } = await response.json() as { rows?: QueuedRow[] };
       if (!Array.isArray(rows) || rows.length === 0) break;
+      // Held by the running server; without it the batch stays queued rather than lose its spend.
+      let ledger: SpendReservationLedger;
+      try {
+        ledger = sharedSpendLedger();
+      } catch (error) {
+        if (error instanceof SpendLedgerOwnerError) break;
+        throw error;
+      }
       for (const { row } of rows) {
         const entry = toEntry(row);
         if (!entry) continue;
         appendUsageEntry(entry);
-        bookWorkerSpend(entry);
+        try {
+          bookWorkerSpend(ledger, entry, row as Record<string, unknown>);
+        } catch (error) {
+          console.warn(`[usage] Worker turn not booked in the spend ledger: ${error instanceof Error ? error.name : "error"}`);
+        }
         appended++;
       }
       const ack = await stateRequest("/usage-inbox/ack", {

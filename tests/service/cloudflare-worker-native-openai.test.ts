@@ -538,6 +538,9 @@ describe("what a ChatGPT passthrough turn reads from ocx's process", () => {
     expect(nativeOpenAiFacts().inputCeilings["gpt-5.5"]).toBeGreaterThan(0);
     // A Codex login in CODEX_HOME is what ocx's web-search sidecar would search with.
     expect(nativeOpenAiFacts().mainCodexLoginPresent).toBe(false);
+    // A refresh token alone is a login ocx refreshes and searches with.
+    writeFileSync(join(resolveCodexHomeDir(), "auth.json"), JSON.stringify({ tokens: { refresh_token: "r" } }));
+    expect(nativeOpenAiFacts().mainCodexLoginPresent).toBe(true);
     writeFileSync(join(resolveCodexHomeDir(), "auth.json"), JSON.stringify({ tokens: { access_token: CALLER_TOKEN, refresh_token: "r", account_id: "acct-main" } }));
     expect(nativeOpenAiFacts().mainCodexLoginPresent).toBe(true);
     const hub = new LeaseState(memoryStorage());

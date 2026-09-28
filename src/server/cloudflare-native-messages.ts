@@ -92,6 +92,8 @@ export const serveNativeMessages: ServeNativeChat = async (bodyText, headers, si
     conversationId: conversationIdFromClaudeMetadata(isRec(body.metadata) ? body.metadata : undefined),
     sharedCacheCohort: cacheKeySource === "system",
     ...(goSessionLane ? { goSessionLane } : {}),
+    // claude-messages.ts records its token floor as the turn's input estimate.
+    spendInputTokens: () => inputTokenFloor,
     beforeSend: route => {
       // claude-messages.ts's thinkingProjectionForRoute: only the openai-chat wire drops replayed thinking.
       inputTokenFloor = estimateClaudeRequestTokens(body, requestedModel, route.provider.adapter === "openai-chat"

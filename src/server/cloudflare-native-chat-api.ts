@@ -98,6 +98,12 @@ export type WorkerUsageRow = {
   usageStatus: "reported" | "unreported";
   usage?: { inputTokens: number; outputTokens: number } & Record<string, unknown>;
   totalTokens?: number;
+  /**
+   * What ocx reserves for this send in its spend ledger before the answer (request-spend.ts): the
+   * input estimate its path makes and the output ceiling the caller set. Booked, not logged.
+   */
+  spendInputTokens?: number;
+  spendOutputCeilingTokens?: number;
 };
 
 /** The replay key for a GET /v1/models request, or undefined when its answer cannot be replayed. */

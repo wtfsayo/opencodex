@@ -32,7 +32,7 @@ function toEntry(row: unknown): PersistedUsageEntry | null {
   if (isKnownUsageSurface(value.surface)) entry.surface = value.surface;
   if (typeof value.accountLogLabel === "string" && KEY_ACCOUNT_LOG_LABEL_RE.test(value.accountLogLabel)) entry.accountLogLabel = value.accountLogLabel;
   if (typeof value.conversationId === "string" && /^[0-9a-f]{32}$/.test(value.conversationId)) entry.conversationId = value.conversationId;
-  for (const key of ["resolvedModel", "requestedEffort"] as const) {
+  for (const key of ["resolvedModel", "wireModel", "requestedEffort"] as const) {
     if (typeof value[key] === "string" && (value[key] as string).length > 0 && (value[key] as string).length <= 200) entry[key] = value[key];
   }
   if (value.usage && typeof value.usage === "object" && !Array.isArray(value.usage)) {

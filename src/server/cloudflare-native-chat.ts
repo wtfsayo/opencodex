@@ -20,6 +20,8 @@ import { PROVIDER_REGISTRY } from "../providers/registry";
 import { resolveOpenCodeGoTransport } from "../providers/opencode-go-transport";
 import { getOrAllocateRequestSessionLane } from "./request-log-conversation";
 import { apiKeyAccountLogLabel } from "../codex/key-account-label";
+import { stampOAuthAccountLabel } from "../providers/label";
+import { routedProviderConfigWith } from "../providers/routed-provider-config";
 
 type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
@@ -75,6 +77,54 @@ function resolveKeyReference(value: string, secrets: Readonly<Record<string, str
 }
 
 const CHAT_ADAPTERS: ReadonlySet<string> = new Set(["openai-chat"]);
+// Built-in providers whose OAuth login the Worker uses, with the saved-row fields it reproduces.
+const OAUTH_PROVIDERS = new Set(["anthropic"]);
+const OAUTH_ROW_FIELDS = new Set(["adapter", "baseUrl", "authMode", "models"]);
+// oauth/index.ts's REFRESH_SKEW_MS: ocx refreshes a token this close to expiry before sending. The
+// Worker never refreshes (refresh tokens rotate, and only ocx may spend one), so it leaves those
+// turns to ocx.
+const OAUTH_REFRESH_SKEW_MS = 60_000;
+const PLAIN_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * A built-in OAuth provider's route as ocx takes it with its account pool off: the registry's
+ * transport merged over the saved row (routed-provider-config.ts), the active account's access token
+ * while it has more than a minute left, and that account's usage label. ocx turns on quota tracking
+ * and failover once two accounts can serve (hasAnthropicFailoverQuorum), so exactly one is required.
+ */
+function resolveOAuthRoute(
+  providerName: string, row: unknown, model: string, modelId: string, localHosts: ReadonlySet<string>,
+  authStore: unknown, no: (reason: string) => null,
+): NativeChatRoute | null {
+  if (!isRec(row)) return no("provider-shape");
+  const unknownField = Object.keys(row).find(key => !OAUTH_ROW_FIELDS.has(key));
+  if (unknownField) return no(`provider-field:${unknownField}`);
+  if (row.authMode !== "oauth") return no("auth-mode");
+  // An explicit namespace routes the id verbatim; anything the slug codec would decode is ocx's.
+  if (!PLAIN_MODEL_ID.test(modelId)) return no("model-id");
+  let provider: OcxProviderConfig;
+  try {
+    provider = routedProviderConfigWith(providerName, row as unknown as OcxProviderConfig, {
+      resolveApiKey: () => undefined,
+      assertDestinationAllowed: (_name, target) => {
+        if (typeof target.baseUrl !== "string" || !destinationAllowed(target.baseUrl, localHosts)) throw new Error("destination");
+      },
+      warnBaseUrlDiscarded: () => {},
+    });
+  } catch {
+    return no("destination");
+  }
+  if (provider.adapter !== "anthropic" || provider.authMode !== "oauth") return no("adapter");
+  const accountSet = isRec(authStore) ? authStore[providerName] : undefined;
+  if (!isRec(accountSet) || !Array.isArray(accountSet.accounts)) return no("oauth-no-login");
+  if (accountSet.accounts.length !== 1) return no("oauth-account-pool");
+  const account = accountSet.accounts[0];
+  if (!isRec(account) || account.id !== accountSet.activeAccountId || !isRec(account.credential)) return no("oauth-account-shape");
+  const { access, expires } = account.credential;
+  if (typeof access !== "string" || access.trim() === "" || typeof expires !== "number") return no("oauth-account-shape");
+  if (expires <= Date.now() + OAUTH_REFRESH_SKEW_MS) return no("oauth-refresh-due");
+  return { providerName, provider: { ...provider, apiKey: access }, modelId, requestedModel: model, apiKeyReference: "", oauthAccountId: account.id as string };
+}
 export const TURN_ADAPTERS: ReadonlySet<string> = new Set(["openai-chat", "anthropic"]);
 
 export type NativeChatRoute = {
@@ -84,6 +134,8 @@ export type NativeChatRoute = {
   requestedModel: string;
   /** The key as configured (a literal or a `${NAME}` reference), which ocx's usage label digests. */
   apiKeyReference: string;
+  /** Set for an OAuth login: the account whose token the route carries. */
+  oauthAccountId?: string;
 };
 
 /**
@@ -98,6 +150,8 @@ export function resolveNativeChatRoute(
   secrets: Readonly<Record<string, string>> = {},
   // The chat lane forwards the body itself; turns run through an adapter also take anthropic.
   adapters: ReadonlySet<string> = CHAT_ADAPTERS,
+  /** The Durable Object's copy of auth.json, for a provider logged in with OAuth. */
+  authStore?: unknown,
 ): NativeChatRoute | null {
   const no = (reason: string) => { why(reason); return null; };
   if (!isRec(config) || !isRec(config.providers) || typeof model !== "string") return no("config-or-model-shape");
@@ -114,7 +168,10 @@ export function resolveNativeChatRoute(
   if (!Object.prototype.hasOwnProperty.call(config.providers, providerName)) return no("unknown-provider");
   // ocx replaces a built-in provider's transport (its baseUrl among it) with the registry's, so a
   // configured URL on such a provider is not where ocx would send the key.
-  if (PROVIDER_REGISTRY.some(entry => entry.id === providerName)) return no("built-in-provider");
+  if (PROVIDER_REGISTRY.some(entry => entry.id === providerName)) {
+    if (!OAUTH_PROVIDERS.has(providerName) || !adapters.has("anthropic")) return no("built-in-provider");
+    return resolveOAuthRoute(providerName, config.providers[providerName], model, modelId, localHosts, authStore, no);
+  }
   const provider = config.providers[providerName];
   if (!isRec(provider)) return no("provider-shape");
   const unknownField = Object.keys(provider).find(key => !PROVIDER_FIELDS.has(key));
@@ -147,7 +204,15 @@ export function nativeConfigAdmitted(config: unknown): boolean {
 
 /** The usage-row fields ocx fills from the route (providers/label.ts labels the key). */
 export function routeUsageFields(route: NativeChatRoute): Pick<WorkerUsageRow, "provider" | "model" | "requestedModel" | "accountLogLabel"> {
-  const accountLogLabel = apiKeyAccountLogLabel(route.providerName, { reference: route.apiKeyReference });
+  let accountLogLabel: string | undefined;
+  if (route.oauthAccountId !== undefined) {
+    // providers/label.ts: ocx labels OAuth accounts of some providers only.
+    const stamp: { accountLogLabel?: string } = {};
+    stampOAuthAccountLabel(stamp, route.providerName, route.provider, route.oauthAccountId);
+    accountLogLabel = stamp.accountLogLabel;
+  } else {
+    accountLogLabel = apiKeyAccountLogLabel(route.providerName, { reference: route.apiKeyReference });
+  }
   return {
     provider: route.providerName,
     model: route.modelId,

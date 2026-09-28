@@ -5,6 +5,8 @@
 export type NativeChatDeps = {
   /** The hub's config.json: the Durable Object's copy, or the bootstrap config before one exists. */
   readConfig(): Promise<string | undefined>;
+  /** The Durable Object's copy of auth.json, read only for a turn to an OAuth provider. */
+  readAuth?(): Promise<string | undefined>;
   /** Upstream hosts answered inside the Worker (the Workers AI binding), by host name. */
   localHosts?: Record<string, (request: Request) => Promise<Response>>;
   fetch(request: Request): Promise<Response>;
@@ -44,6 +46,8 @@ export type WorkerUsageRow = {
   accountLogLabel?: string;
   requestedEffort?: string;
   resolvedModel?: string;
+  /** The id sent upstream, when the client is answered with another (an Anthropic route's selector). */
+  wireModel?: string;
   /** ocx's hashed conversation id for the turn, as request-log-conversation.ts derives it. */
   conversationId?: string;
   surface?: "claude";

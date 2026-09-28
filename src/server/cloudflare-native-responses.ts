@@ -157,6 +157,13 @@ function workerAdapterDeps(metadata: ReasoningMetadataAccess): OpenAIChatAdapter
   };
 }
 
+/** The auth store copy, read only when the model names a provider the Worker may use a login of. */
+async function oauthStoreFor(model: unknown, deps: NativeChatDeps): Promise<unknown> {
+  if (typeof model !== "string" || !model.startsWith("anthropic/") || !deps.readAuth) return undefined;
+  const text = await deps.readAuth();
+  try { return text ? JSON.parse(text) : undefined; } catch { return undefined; }
+}
+
 // Image-bearing turns are declined, and ocx's normalization returns at once without images.
 const NO_IMAGE_NORMALIZATION: AnthropicAdapterDeps = { normalizeAnthropicImages: async () => {} };
 
@@ -230,7 +237,8 @@ export async function runNativeResponsesTurn(
   if (declined) return no(declined);
   const loaded = await loadNativeConfig(deps);
   if ("decline" in loaded) return no(loaded.decline);
-  const resolved = resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets, TURN_ADAPTERS);
+  const authStore = await oauthStoreFor(body.model, deps);
+  const resolved = resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets, TURN_ADAPTERS, authStore);
   if (!resolved) return null;
   // core-normalize.ts, once the route is final.
   const route = withOpenCodeGoSession(resolved, headers, options.goSessionLane);
@@ -317,6 +325,7 @@ export async function runNativeResponsesTurn(
       timestamp: startedAt,
       ...routeUsageFields(route),
       resolvedModel: route.modelId,
+      ...(responseModelId !== route.modelId ? { wireModel: route.modelId } : {}),
       ...(requestedEffort ? { requestedEffort } : {}),
       ...(conversationId ? { conversationId } : {}),
       ...(options.surface ? { surface: options.surface } : {}),

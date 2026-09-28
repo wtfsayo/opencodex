@@ -183,7 +183,11 @@ When the Worker passes a request on, it logs why once per reason (for example
 
 It also answers `POST /v1/responses`, the API Codex uses, for the same providers, and for a provider
 of your own with `adapter: "anthropic"` (key auth, `baseUrl`, `apiKey`, `models`; `cacheRetention`
-applies as in `ocx`), when the turn is
+applies as in `ocx`), and for the built-in `anthropic` provider logged in with a Claude subscription
+(`authMode: "oauth"`) when it has exactly one account whose token has more than a minute left: the
+Worker uses the token `ocx` stored and never refreshes one, so a token near expiry, a second account
+(which turns on `ocx`'s failover and quota tracking), or any other setting on that provider sends the
+turn to `ocx`. That covers the turn when it is
 streamed, not stored (`"store": false`, as Codex sends it), and uses only
 `function` tools, grouped in namespaces or not, plus hosted `web_search` when no `openai` provider
 is configured (ocx's search sidecar runs through it); no code-mode `exec` or custom tools; text-only

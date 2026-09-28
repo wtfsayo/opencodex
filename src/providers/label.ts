@@ -1,4 +1,4 @@
-import { CODEX_ACCOUNT_LOG_LABEL_RE, KEY_ACCOUNT_LOG_LABEL_RE, apiKeyAccountLogLabel, oauthAccountLogLabel } from "../codex/account-label";
+import { CODEX_ACCOUNT_LOG_LABEL_RE, KEY_ACCOUNT_LOG_LABEL_RE, apiKeyAccountLogLabel, oauthAccountLogLabel } from "../codex/key-account-label";
 import type { OcxProviderConfig } from "../types";
 
 export function canonicalUsageProviderLabel(provider: string): string {

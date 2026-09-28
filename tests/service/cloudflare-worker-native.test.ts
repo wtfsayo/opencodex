@@ -31,8 +31,9 @@ const FORBIDDEN_MODULES = [
 // Messages path adds the Anthropic translators (src/claude/inbound.ts, outbound.ts), 21 files; the
 // effort caches' pure reads and OpenCode Go's session header add three more; the WebSocket session
 // and the frame, framing and limit helpers it shares with ocx's socket, seven more; the anthropic
-// adapter and the layers every registered adapter gets, eleven more.
-const MAX_CLOSURE = 180;
+// adapter and the layers every registered adapter gets, eleven more; a built-in provider's routed
+// config (model policy, registry merge) and ocx's usage labels, eight more.
+const MAX_CLOSURE = 190;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {

@@ -232,6 +232,7 @@ function nativeDeps(env: Env, ctx: ExecutionContext, hub: ReturnType<typeof getC
       return nativeConfigText(source.config, source.hasSnapshot, env);
     },
     secrets: containerEnv(env),
+    readAuth: async () => (await hub.readDocument("auth"))?.body,
     reasoningMetadata: () => hub.reasoningMetadataRead(),
     skills: {
       read: scope => hub.skillsSnapshotRead(scope),

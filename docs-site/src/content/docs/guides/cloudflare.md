@@ -317,7 +317,9 @@ requires_openai_auth = true
 env_http_headers = { "x-opencodex-api-key" = "OPENCODEX_API_AUTH_TOKEN" }
 ```
 
-The Worker can serve those turns itself; see below.
+On a deployed Worker these turns still reach the container: `chatgpt.com/backend-api` refuses
+workerd's TLS fingerprint with a 403 challenge, and outbound `connect()` sockets are blocked, so
+the Worker cannot reproduce the upstream call. The container answers them exactly as before.
 
 ## Dashboard
 

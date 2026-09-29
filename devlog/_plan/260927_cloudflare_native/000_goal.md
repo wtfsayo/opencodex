@@ -386,3 +386,31 @@ already be running; a header timeout, which never reached the upstream, keeps oc
 Routed inline images to openai-chat providers are served when ocx would send them unchanged; ocx
 publishes its vision answer per configured provider model, computed on the routed provider row.
 
+## Live-verified blocker (2026-09-29): the Worker's own route to chatgpt.com cannot work
+
+The pending "test the Worker's path to chatgpt.com live" item is now resolved — negatively, and
+structurally:
+
+- **workerd's `fetch` is fingerprint-blocked by chatgpt.com's edge.** The same authenticated POST
+  that returns 200+SSE under Bun (and under ocx in the container) returns a 403 bot-challenge HTML
+  page when issued by workerd's fetch — from deployed workers and from `wrangler dev` locally, so it
+  is the TLS ClientHello (JA4), not egress-IP reputation.
+- **Outbound `connect()` sockets are closed on deployed workers.** "proxy request failed, cannot
+  connect to the specified address" for every host:port tried (chatgpt.com:443, api.openai.com:443,
+  1.1.1.1:443/80, cloudflare.com:8443). The socket path works in local workerd only. A manual
+  HTTP/1.1-over-TLS transport was built and verified live in `wrangler dev` (200 + SSE), then
+  removed when the deployed-runtime block was confirmed — a transport that only works locally is
+  worse than none: it burns an upstream POST (booking a reservation) before declining.
+- **Provider reachability map** (deployed workerd, POST probe): api.openai.com, api.anthropic.com,
+  deepseek, groq, openrouter, mistral, x.ai, bigmodel, dashscope, moonshot, nvidia, cerebras all
+  reachable (401/400 as expected unauthenticated). Only chatgpt.com challenges the fingerprint.
+  `example.com` POST returns 405 — plain fetch egress is otherwise unrestricted.
+
+Consequences:
+- Every native Codex turn on a caller's ChatGPT login declines at `upstream-403` and lands in the
+  container after ~600 ms. The decline is safe by construction (4xx means nothing was generated, so
+  ocx replays it) but the path can never serve live. The branch's code stays correct and tested; its
+  value is limited to a future where chatgpt.com stops challenging workerd.
+- The web-search sidecar can never move to the Worker either — it dials the same host.
+- Codex's default `multi_agent_v1` turn shape (`collaboration-turn` decline) remains correct to
+  decline: the v2 guidance and the max-effort v1 injection both need disk state the Worker lacks.

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { RequestSendObserver } from "../../lib/request-execution-budget";
-import { sharedSpendLedger, type SpendReservationLedger } from "../../lib/spend-reservation-ledger";
+import { resyncSharedSpendLedger, sharedSpendLedger, type SpendReservationLedger } from "../../lib/spend-reservation-ledger";
 import { SpendLedgerOwnerError } from "../../lib/spend-ledger-owner";
 import { markLocalRequestLogRefusal, type RequestLogContext } from "../request-log";
 import { recordWorkflowRefusalEvent, workflowDenialSummary } from "../../lib/workflow-budget";
@@ -183,6 +183,12 @@ export function attachRequestSpendTracker(
   logCtx: RequestLogContext,
   ledger?: SpendReservationLedger,
 ): RequestSendObserver {
+  // On a Cloudflare deployment the ledger is a replica of the Durable Object's journal
+  // (durable-spend-ledger.ts): Worker-served sends reserve there first, so each request
+  // refreshes the replica before its own bookings read the scopes those sends moved. The
+  // resync is deliberately not awaited -- this request's own writes are already in the
+  // replica's view, and a peer's are picked up here for the NEXT request.
+  if (ledger === undefined) void resyncSharedSpendLedger().catch(() => {});
   const rootId = req.headers.get("x-codex-parent-thread-id")?.trim() || undefined;
   const tracker = ledger === undefined
     ? createRequestSpendTracker(logCtx, rootId)

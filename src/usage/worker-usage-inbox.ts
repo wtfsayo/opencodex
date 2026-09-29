@@ -7,8 +7,9 @@
 import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 import { appendUsageEntry, isKnownUsageSurface, type PersistedUsageEntry } from "./log";
 import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
-import { sharedSpendLedger, type SpendReservationLedger } from "../lib/spend-reservation-ledger";
+import { resyncSharedSpendLedger, sharedSpendLedger, type SpendReservationLedger } from "../lib/spend-reservation-ledger";
 import { SpendLedgerOwnerError } from "../lib/spend-ledger-owner";
+import { DurableSpendJournalError } from "../lib/durable-spend-ledger";
 
 const DRAIN_INTERVAL_MS = 60_000;
 const BATCH = 500;
@@ -60,6 +61,9 @@ const ENTRY_FIELDS = [
  * without one. Keyed by the row's request id, so a batch appended twice is not counted twice.
  */
 function bookWorkerSpend(ledger: SpendReservationLedger, entry: PersistedUsageEntry, row: Record<string, unknown>): void {
+  // "worker" rows were already reserved and settled against the hub ledger by the Worker's own
+  // tracker (cloudflare-native-spend.ts); booking the same turn post-hoc would count it twice.
+  if (row.spendLedger === "worker") return;
   const tokens = (key: string) => typeof row[key] === "number" && Number.isFinite(row[key]) && (row[key] as number) > 0 ? Math.trunc(row[key] as number) : 0;
   const sendId = `worker:${entry.requestId}`;
   const decision = ledger.reserve({
@@ -91,12 +95,21 @@ export function drainWorkerUsageInbox(): Promise<number> {
       if (!response?.ok) break;
       const { rows } = await response.json() as { rows?: QueuedRow[] };
       if (!Array.isArray(rows) || rows.length === 0) break;
-      // Held by the running server; without it the batch stays queued rather than lose its spend.
+      // Rows the Worker's tracker booked carry "worker"; the replica ledger must see what the
+      // Durable Object has already journaled before it decides these bookings, so a resync
+      // precedes the batch. Without the ledger the batch stays queued rather than lose its spend.
+      try {
+        await resyncSharedSpendLedger();
+      } catch {
+        // The replica could not refresh: the batch waits for the next tick rather than book
+        // against a journal this process cannot see.
+        break;
+      }
       let ledger: SpendReservationLedger;
       try {
         ledger = sharedSpendLedger();
       } catch (error) {
-        if (error instanceof SpendLedgerOwnerError) break;
+        if (error instanceof SpendLedgerOwnerError || error instanceof DurableSpendJournalError) break;
         throw error;
       }
       for (const { row } of rows) {

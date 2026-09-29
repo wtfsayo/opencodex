@@ -11,6 +11,7 @@
 //
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, NativeOpenAiFacts, WorkerUsageRow } from "./cloudflare-native-chat-api";
+import { isWorkerSpendRefusal, workerSpendTurn } from "./cloudflare-native-spend";
 import { configKeyAdmitted, loadNativeConfig } from "./cloudflare-native-chat";
 import { COLLABORATION_TOOLS, freezeSkillsCatalog } from "./cloudflare-native-responses";
 import { createResponsesPassthroughAdapterWith, type ResponsesPassthroughAdapterDeps } from "../adapters/openai-responses/passthrough-adapter";
@@ -282,6 +283,15 @@ export async function runNativeOpenAiTurn(
   if (facts.upstreamTransport === "websocket" && !deps.openUpstreamSocket) return no("upstream-websocket-unavailable");
   const ceiling = Object.hasOwn(facts.inputCeilings, body.model as string) ? facts.inputCeilings[body.model as string] : undefined;
   if (ceiling === undefined) return no("input-ceiling-unknown");
+  // request-spend.ts's tracker for this lane (cloudflare-native-spend.ts): every send in the
+  // retry ladder below reserves against the hub ledger first, and the turn's terminal usage
+  // settles the last of them. Under a configured ceiling a hub without the ledger declines
+  // rather than spend unbooked.
+  const spend = workerSpendTurn(loaded.config, deps, {
+    rootId: headers.get("x-codex-parent-thread-id")?.trim() || undefined,
+    poolId: "openai",
+  });
+  if (spend === "declined") return no("spend-ledger-unavailable");
 
   const frozen = await freezeSkillsCatalog(body, headers, deps);
   if (frozen === "decline") return no("skills-snapshot-unavailable");
@@ -294,7 +304,8 @@ export async function runNativeOpenAiTurn(
   // collaboration.ts: guidance for these surfaces reads the catalog and config on disk.
   if (collabSurface(parsed) !== null) return no("collaboration-turn");
   // request-prepare.ts answers an input far past the model's window locally (checkInputAdmission).
-  if (ceiling !== null && estimateInputTokens(parsed, parsed.modelId, provider) > ceiling * ADMISSION_TOLERANCE) return no("input-admission");
+  const estimatedInputTokens = estimateInputTokens(parsed, parsed.modelId, provider);
+  if (ceiling !== null && estimatedInputTokens > ceiling * ADMISSION_TOLERANCE) return no("input-admission");
   // core-normalize.ts: an omitted store is sent as false to this backend.
   if (isRec(parsed._rawBody) && parsed._rawBody.store === undefined) parsed._rawBody.store = false;
 
@@ -351,6 +362,7 @@ export async function runNativeOpenAiTurn(
       admissionKind: "environment",
       ...(typeof parsed.options.maxOutputTokens === "number" && parsed.options.maxOutputTokens > 0
         ? { spendOutputCeilingTokens: Math.trunc(parsed.options.maxOutputTokens) } : {}),
+      ...(spend ? { spendLedger: "worker" as const } : {}),
       status,
       durationMs: Date.now() - startedAt,
       usageStatus: "unreported",
@@ -366,11 +378,19 @@ export async function runNativeOpenAiTurn(
   const baseInit: RequestInit = { method: request.method, headers: request.headers, body: request.body };
   let upstream: Response;
   try {
-    upstream = await fetchWithTransientRetry(recovery => sendWithHeaderDeadline(init => facts.upstreamTransport === "websocket"
-      ? workerCodexWsFetch(request.url, init, deps.openUpstreamSocket!, sseFetch)
-      : sseFetch(request.url, init), applyUpstreamRecoveryInit(baseInit, recovery), upstreamSignal),
+    upstream = await fetchWithTransientRetry(recovery => sendWithHeaderDeadline(async init => {
+      // One reservation per physical send: a retry is a new send and books its own.
+      const admission = spend
+        ? await spend.charge(estimatedInputTokens, typeof parsed.options.maxOutputTokens === "number" && parsed.options.maxOutputTokens > 0 ? Math.trunc(parsed.options.maxOutputTokens) : 0)
+        : ({ ok: true } as const);
+      if (!admission.ok) return admission.refusal;
+      return facts.upstreamTransport === "websocket"
+        ? workerCodexWsFetch(request.url, init, deps.openUpstreamSocket!, sseFetch)
+        : sseFetch(request.url, init);
+    }, applyUpstreamRecoveryInit(baseInit, recovery), upstreamSignal),
     { abortSignal: upstreamSignal, label: "chatgpt.com", attempts: TRANSIENT_RETRY_MAX_ATTEMPTS, claimAmbiguousResend: () => false });
   } catch (error) {
+    spend?.resolve(undefined);
     translatorBudget.dispose();
     commitSkills?.();
     if (signal.aborted) {
@@ -386,11 +406,19 @@ export async function runNativeOpenAiTurn(
     recordRow(429);
     return { response: replayRefusalResponse() };
   }
+  // A local spend refusal inside the ladder: answered as ocx answers it, never reshaped.
+  if (isWorkerSpendRefusal(upstream)) {
+    translatorBudget.dispose();
+    commitSkills?.();
+    recordRow(429);
+    return { response: upstream };
+  }
   const responseHeaders = sanitizePassthroughHeaders(upstream.headers);
   // A refused create generated nothing: ocx sends it itself and runs its own recovery on the answer.
   // Not so the retry ladder's own refusal to resend a turn that may already be running (a 429).
   const replayRefusal = isReplayRefusalResponse(upstream) || isNonReplayableResponse(upstream);
   if (upstream.status >= 400 && upstream.status < 500 && !replayRefusal) {
+    spend?.resolve(undefined);
     await upstream.body?.cancel().catch(() => {});
     translatorBudget.dispose();
     return no(`upstream-${upstream.status}`);
@@ -398,12 +426,14 @@ export async function runNativeOpenAiTurn(
   commitSkills?.();
   if (upstream.status >= 300 && upstream.status < 400) {
     translatorBudget.dispose();
+    spend?.resolve(undefined);
     recordRow(upstream.status);
     return { response: new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders }) };
   }
   if (!upstream.ok) {
     const errorText = await readDisplaySafeErrorText(upstream, upstreamSignal, "");
     translatorBudget.dispose();
+    spend?.resolve(undefined);
     recordRow(upstream.status);
     return { response: formatPassthroughUpstreamError(upstream.status, errorText, {
       statusText: upstream.statusText, headers: responseHeaders, replayRefusal,
@@ -415,6 +445,7 @@ export async function runNativeOpenAiTurn(
     // passthrough-delivery.ts relays anything but an event stream as it came; the turn was sent,
     // so it is answered here rather than sent again through ocx.
     translatorBudget.dispose();
+    spend?.resolve(undefined);
     recordRow(upstream.status, servedModel ? { resolvedModel: servedModel } : {});
     return { response: new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders }) };
   }
@@ -441,6 +472,7 @@ export async function runNativeOpenAiTurn(
     if (recorded) return;
     recorded = true;
     const usage = inspector.usage;
+    spend?.resolve(usage ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens } : undefined);
     recordRow(status, {
       ...(servedModel ? { resolvedModel: servedModel } : {}),
       ...(inspector.firstOutputAt !== undefined ? { firstOutputMs: inspector.firstOutputAt - startedAt } : {}),

@@ -518,10 +518,18 @@ describe("Worker-native Codex turns on the caller's ChatGPT login", () => {
     expect(worker.sent).toEqual(sent);
     expect(JSON.stringify(sent)).toContain(pixel);
     expect(ids(worker.text!)).toBe(ids(proxyText));
-    // A model ocx would describe or strip images for, an image ocx would re-encode, an anthropic route.
+    // A model ocx would describe or strip images for, an image ocx would re-encode.
     expect((await run(turnWith(`data:image/png;base64,${pixel}`), { facts: facts({ visionPreprocessed: { "z/m-1": true } }) })).declines).toEqual(["responses:vision-preprocessing"]);
     expect((await run(turnWith(`data:image/png;base64,${"A".repeat(3_700_000)}`))).declines).toEqual(["responses:image-normalization"]);
-    expect((await run(turnWith(`data:image/png;base64,${pixel}`), { provider: { adapter: "anthropic", apiKey: "sk-z", models: ["m-1"] } })).declines).toEqual(["responses:image-adapter"]);
+    // An anthropic route translates an inline data-URL natively (adapter's toAnthropicContentPart),
+    // so it is served; a remote URL is not an inline image and declines on the anthropic adapter.
+    const anthropic = { adapter: "anthropic", apiKey: "sk-z", models: ["m-1"] };
+    const anthropicRun = await run(turnWith(`data:image/png;base64,${pixel}`), { provider: anthropic });
+    expect(anthropicRun.declines).toEqual([]);
+    expect(anthropicRun.sent).toBeDefined();
+    expect((await run(turnWith("https://example.test/cat.png"), { provider: anthropic })).declines).toEqual(["responses:message-parts"]);
+    // An adapter outside {openai-chat, anthropic} is refused at route resolution, before images.
+    expect((await run(turnWith(`data:image/png;base64,${pixel}`), { provider: { adapter: "codex", apiKey: "sk-z", models: ["m-1"] } })).declines).toEqual(["responses:adapter"]);
     expect((await run(turnWith("https://example.test/cat.png"))).declines).toEqual(["responses:message-parts"]);
   });
 

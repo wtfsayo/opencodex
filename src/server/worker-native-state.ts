@@ -24,6 +24,7 @@ import { isNativeMainTrafficBlocked } from "../codex/native-profile-startup";
 import { CODEX_RESPONSES_HTTP_URL, CODEX_RESPONSES_WS_URL } from "./responses/codex-ws-request";
 import { shouldUseCodexWsUpstream } from "./responses/ws-upstream";
 import type { NativeOpenAiFacts } from "./cloudflare-native-chat-api";
+import { prefetchDurableSpendJournal } from "../lib/durable-spend-ledger";
 
 // A Durable Object reset or a lease that moved drops what was published; publishing again on this
 // cadence restores it. A failed first publish is retried sooner.

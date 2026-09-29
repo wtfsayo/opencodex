@@ -125,7 +125,9 @@ describe("Worker-native Responses", () => {
     expect(reason({})).toBeUndefined();
     expect(reason({ store: true })).toBe("stored-response");
     expect(reason({ stream: false })).toBe("not-streamed");
-    expect(reason({ previous_response_id: "r" })).toBe("body-fields:previous_response_id");
+    expect(reason({ previous_response_id: "r" })).toBe("previous-response-state-unavailable");
+    expect(nativeResponsesDeclineReason(codexTurn("p/m-1", { previous_response_id: "r" }), h,
+      { readConfig: async () => undefined, fetch: async () => { throw new Error("no network"); }, responseStateRead: async () => undefined } as never)).toBeUndefined();
     expect(reason({ service_tier: "priority" })).toBe("body-fields:service_tier");
     expect(reason({ reasoning: { effort: "medium" } })).toBeUndefined();
     expect(reason({ reasoning: { summary: "auto" } })).toBeUndefined();

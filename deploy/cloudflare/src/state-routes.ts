@@ -1,4 +1,6 @@
 import { BOOT_ID_PATTERN, type DocumentCommit, type DocumentSeqs, DURABLE_DOCUMENTS, type DurableDocument, MAX_DOCUMENT_BYTES, MAX_MODEL_LIST_BYTES, type ModelList, REASONING_METADATA_KINDS, type ReasoningMetadataKind, type StoredDocument } from "./lease";
+import { MAX_RESPONSE_STATE_BYTES, normalizeResponseStateEntry } from "./response-state";
+import type { OAuthRefreshLeaseCheck } from "./oauth-refresh";
 
 // Mirrors DOCUMENT_SEQUENCE_HEADER in src/lib/durable-mirror.ts, which the Worker bundle cannot import.
 export const DOCUMENT_SEQUENCE_HEADER = "x-ocx-document-seq";
@@ -19,6 +21,14 @@ export interface StateHub {
   reasoningMetadataCommit(bootId: string, kind: ReasoningMetadataKind, body: string, version: number): Promise<boolean>;
   clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string): Promise<boolean>;
   nativeOpenAiFactsCommit(bootId: string, facts: unknown, stamp: string, version: number): Promise<boolean>;
+  /** OAuth refresh lease probe (oauth-refresh.ts): absent means a deployment predating the coordinator. */
+  oauthRefreshLeaseCheck?(provider: string, accountId: string): Promise<OAuthRefreshLeaseCheck>;
+  /** Worker-served response continuations (response-state.ts): PUT is the Worker's write, GET the container's prefetch. */
+  putResponseState(id: string, entry: unknown): Promise<boolean>;
+  getResponseState(id: string): Promise<string | undefined>;
+  /** The hub's spend journal (spend-ledger.ts): read for the container's replica, append for its pushes. */
+  spendJournal?(): Promise<{ salt: string; entries: { seq: number; line: string }[] }>;
+  spendJournalAppend?(line: string): Promise<number | null>;
 }
 
 export interface StateBucket {
@@ -31,6 +41,9 @@ export interface StateBucket {
 
 const SNAPSHOT_PREFIX = "snapshots/";
 const SWEEP_LIMIT = 1000;
+// A compaction checkpoint can carry the live reservation set; it is still one JSON line and
+// far under this.
+const MAX_SPEND_JOURNAL_LINE_BYTES = 8 * 1024 * 1024;
 
 /** Where this hub's uploads go. Keys from before namespacing (`snapshots/<bootId>/…`) sit outside it. */
 export function snapshotPrefix(namespace: string): string {
@@ -145,6 +158,54 @@ export async function handleStateRequest(req: Request, hub: StateHub, bucket: St
     try { seqs = ((await req.json()) as { seqs?: unknown }).seqs; } catch { seqs = undefined; }
     if (!Array.isArray(seqs) || seqs.length > 500 || !seqs.every(seq => Number.isSafeInteger(seq))) return new Response("seqs required", { status: 400 });
     return (await hub.ackUsage(bootId, seqs as number[])) ? new Response(null, { status: 204 }) : new Response("lease lost", { status: 409 });
+  }
+  // The container's replica journal (src/lib/durable-spend-ledger.ts) reads and reports
+  // through these, lease-gated like the documents they share a channel with.
+  if (path === "/spend-journal" && req.method === "GET") {
+    if (!(await hub.holdsLease(bootId))) return new Response("lease required", { status: 409 });
+    if (!hub.spendJournal) return new Response("not found", { status: 404 });
+    return Response.json(await hub.spendJournal());
+  }
+  if (path === "/spend-journal" && req.method === "POST") {
+    if (!(await hub.holdsLease(bootId))) return new Response("lease required", { status: 409 });
+    if (!hub.spendJournalAppend) return new Response("not found", { status: 404 });
+    if (Number(req.headers.get("content-length")) > MAX_SPEND_JOURNAL_LINE_BYTES) return new Response("journal line too large", { status: 413 });
+    let line: unknown;
+    try { line = ((await req.json()) as { line?: unknown }).line; } catch { line = undefined; }
+    if (typeof line !== "string") return new Response("line required", { status: 400 });
+    const seq = await hub.spendJournalAppend(line);
+    return seq === null ? new Response("journal record required", { status: 400 }) : Response.json({ seq });
+  }
+  const responseStateId = /^\/response-state\/([^/]+)$/.exec(path)?.[1];
+  if (responseStateId !== undefined) {
+    const id = decodeURIComponent(responseStateId);
+    if (req.method === "PUT") {
+      // The Worker's write path (enqueueUsage precedent: the wire itself is private to the
+      // deployment; a lease gate would lose the continuation the Worker just served).
+      if (Number(req.headers.get("content-length")) > MAX_RESPONSE_STATE_BYTES) return new Response("response state too large", { status: 413 });
+      let entry: unknown;
+      try { entry = await req.json(); } catch { return new Response("JSON required", { status: 400 }); }
+      if (!normalizeResponseStateEntry(entry)) return new Response("a stored response entry required", { status: 400 });
+      return (await hub.putResponseState(id, entry)) ? new Response(null, { status: 204 }) : new Response("response state too large", { status: 413 });
+    }
+    if (req.method === "GET") {
+      // The container's prefetch, lease-gated like the documents it also reads.
+      if (!(await hub.holdsLease(bootId))) return new Response("lease required", { status: 409 });
+      const body = await hub.getResponseState(id);
+      return body === undefined
+        ? new Response("no response state", { status: 404 })
+        : new Response(body, { headers: { "content-type": "application/json" } });
+    }
+  }
+  // The container's pre-spend probe, lease-gated like the documents it also reads: while a Worker
+  // holds the lease for the stored generation, spending it would be a second spend of a rotating grant.
+  if (path === "/oauth-refresh/lease-check" && req.method === "POST") {
+    if (!(await hub.holdsLease(bootId))) return new Response("lease required", { status: 409 });
+    let asked: { provider?: unknown; accountId?: unknown };
+    try { asked = (await req.json()) as typeof asked; } catch { return new Response("JSON required", { status: 400 }); }
+    if (typeof asked?.provider !== "string" || typeof asked?.accountId !== "string") return new Response("provider and accountId required", { status: 400 });
+    if (!hub.oauthRefreshLeaseCheck) return new Response("not found", { status: 404 });
+    return Response.json(await hub.oauthRefreshLeaseCheck(asked.provider, asked.accountId));
   }
   const modelListKey = /^\/model-lists\/([0-9a-f]{64})$/.exec(path)?.[1];
   if (modelListKey !== undefined && req.method === "PUT") {

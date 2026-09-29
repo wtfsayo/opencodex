@@ -32,6 +32,7 @@ export { responseAdmissionCountersForTests } from "./state/spill-failure";
 import { admissionCounters, noteSpillWriteFailure, noteSpillWriteSuccess, spillCounters, spillWriteHealth } from "./state/spill-failure";
 import { loadSnapshotEntry } from "./state/snapshot-codec";
 import { isBodyNonPersistable } from "./state/body-policy";
+import { durableMirrorEnabled, stateRequest } from "../lib/durable-mirror";
 export { isBodyNonPersistable, markBodyNonPersistable } from "./state/body-policy";
 export { flushPendingResponseSpillsForTests, awaitResponseSpillPublicationTailForTests, pendingResponseSpillMetricsForTests, setResponseSpillShutdownBudgetForTests, setResponseSpillAsyncAclAttemptBudgetForTests, setResponseSpillShutdownTerminalizationPassLimitForTests } from "./state/spill-queue";
 import {
@@ -1071,6 +1072,52 @@ export function expandPreviousResponseInput(body: unknown, clientThreadId?: stri
   if (expansion.kind === "carried") replayOverlapSkips += 1;
   replayedInputPrefixLengths.set(expansion.body, expansion.prefixLength);
   return expansion.body;
+}
+
+/**
+ * Inserts an entry fetched from the Durable Object (response-state.ts — a response the Cloudflare
+ * Worker served and committed there) as if rememberResponseState had recorded it. The local copy
+ * wins: an id already in the map — resident, spilled or tombstoned — is the container's own record
+ * of its own write and is never shadowed by the hub's. Returns true when a row was ingested.
+ */
+export function ingestRemoteResponseState(id: string, value: unknown): boolean {
+  if (typeof id !== "string" || id.length === 0 || !value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  if (!Array.isArray(entry.items)) return false;
+  if (entry.clientThreadId !== undefined && typeof entry.clientThreadId !== "string") return false;
+  if (entry.providerOutputStart !== undefined && !Number.isSafeInteger(entry.providerOutputStart)) return false;
+  const providers = entry.providers;
+  if (providers !== undefined && (!providers || typeof providers !== "object" || Array.isArray(providers))) return false;
+  ensureLoaded();
+  if (states.has(id)) return false;
+  setResidentEntry(id, {
+    createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt as number : now(),
+    ...(entry.clientThreadId ? { clientThreadId: entry.clientThreadId as string } : {}),
+    items: entry.items,
+    ...(entry.providerOutputStart !== undefined ? { providerOutputStart: entry.providerOutputStart as number } : {}),
+    ...(providers && Object.keys(providers).length > 0 ? { providers: providers as OcxProviderContinuationState } : {}),
+  });
+  schedulePersist();
+  return true;
+}
+
+/**
+ * Pulls a Worker-served continuation into the local store before expandPreviousResponseInput runs.
+ * Only deployed under the durable mirror (src/lib/durable-mirror.ts) is there a hub to ask — off
+ * Cloudflare this is a no-op. Every failure mode (no boot id, hub error, 404, malformed body) is
+ * swallowed: the expansion's own miss path decides the outcome exactly as it did without a hub.
+ */
+export async function prefetchRemoteResponseState(previousId: string): Promise<void> {
+  if (typeof previousId !== "string" || previousId.length === 0 || !durableMirrorEnabled()) return;
+  ensureLoaded();
+  if (states.has(previousId)) return;
+  try {
+    const response = await stateRequest(`/response-state/${encodeURIComponent(previousId)}`);
+    if (!response || response.status !== 200) return;
+    ingestRemoteResponseState(previousId, await response.json());
+  } catch {
+    /* the hub is a cache of continuations the Worker served; a failed prefetch expands as a miss */
+  }
 }
 
 export function previousResponseReplayFailure(body: unknown): PreviousResponseReplayFailure | undefined {

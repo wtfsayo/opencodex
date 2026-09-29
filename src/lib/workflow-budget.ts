@@ -22,6 +22,9 @@
 import {
   sharedSpendLedger,
   spendCeilingsConfigured,
+  workflowSpendDenialSummary,
+  WORKFLOW_LOCAL_REFUSAL_HEADER,
+  type SpendDenialDetail,
   type SpendReservationLedger,
   type SpendScope,
   type SpendUsage,
@@ -37,30 +40,11 @@ import {
  * deliberately not here: root ids are client thread headers and identity ids are credentials,
  * and the ledger's rule is that neither is written down in the clear.
  */
-export interface WorkflowSpendDenialDetail {
-  readonly scope: SpendScope;
-  readonly limit: number;
-  /** Tokens the refused reservation would have taken the scope to, where that is known. */
-  readonly projected?: number;
-}
-
-/** Operator-facing name for each scope. What an operator calls it, not what the type calls it. */
-const SPEND_SCOPE_LABEL: Record<SpendScope, string> = {
-  root: "task",
-  identity: "account",
-  pool: "provider pool",
-};
-
 /**
- * Thousands separators, done here rather than by `toLocaleString`.
- *
- * A ceiling is an eight- or nine-digit number and an unseparated one is genuinely hard to read
- * against the figure beside it. `toLocaleString` would do this too, but its output depends on
- * the ICU data the runtime happens to carry, and a message a test pins must not differ between
- * a developer's machine and a CI image.
+ * The denial detail type itself lives in spend-reservation-core.ts: the Cloudflare Worker
+ * formats this same refusal and cannot import this module's budget state.
  */
-const formatTokenCount = (tokens: number): string =>
-  Math.trunc(tokens).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+export type WorkflowSpendDenialDetail = SpendDenialDetail;
 
 export interface WorkflowBudgetPolicy {
   /** Children admitted concurrently under one root. */
@@ -234,24 +218,7 @@ export function workflowDenialSummary(
           + " so no provider was contacted. Slots are released as the turns holding them finish.",
       };
     case "workflow-spend-exhausted":
-      return {
-        code: "workflow_spend_exhausted",
-        // With the denial in hand the sentence names the ceiling that fired and its number,
-        // because the alternative is an operator who can see that something refused and has
-        // no way to find out what. Without one -- a caller that knows only the reason -- the
-        // original sentence is kept unchanged.
-        message: spend
-          ? "This proxy refused the request locally: the configured " + SPEND_SCOPE_LABEL[spend.scope]
-            + " token ceiling of " + formatTokenCount(spend.limit) + " is spent"
-            + (spend.projected !== undefined
-              ? " (this send would have taken it to " + formatTokenCount(spend.projected) + ")"
-              : "")
-            + ", so no provider was contacted. Spend is durable, so it does not roll forward"
-            + " with the send window: raise or remove spend." + spend.scope
-            + ".maxTokens in config.json to grant more."
-          : "This proxy refused the request locally: the task reached a configured token"
-            + " ceiling, so no provider was contacted.",
-      };
+      return workflowSpendDenialSummary(reason, spend);
     case "workflow-tracking-exhausted":
       return {
         code: "workflow_tracking_exhausted",
@@ -266,11 +233,7 @@ export function workflowDenialSummary(
           + " a repeat buys no second dispatch.",
       };
     case "workflow-spend-undurable":
-      return {
-        code: "workflow_spend_undurable",
-        message: "This proxy refused the request locally: the token reservation could not be made"
-          + " durable and a configured ceiling requires it, so no provider was contacted.",
-      };
+      return workflowSpendDenialSummary(reason);
   }
 }
 
@@ -283,7 +246,9 @@ export function workflowDenialSummary(
  * so the name goes beside the body instead. No upstream sets this header, which is precisely
  * what makes its presence conclusive.
  */
-export const WORKFLOW_LOCAL_REFUSAL_HEADER = "x-opencodex-local-refusal";
+// Re-exported: the constant lives in spend-reservation-core.ts so the Cloudflare Worker can
+// name its own refusals with the same header without importing this module.
+export { WORKFLOW_LOCAL_REFUSAL_HEADER };
 
 export type WorkflowBudgetEventKind = "refused" | "cleared";
 

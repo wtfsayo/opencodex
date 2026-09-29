@@ -42,6 +42,7 @@ import {
   expandPreviousResponseInput,
   previousResponseReplayFailure,
   previousResponseProviderState,
+  prefetchRemoteResponseState,
 } from "../../responses/state";
 import { hasUnreadableEncryptedAgentTask } from "./encrypted-payload";
 import { routeConcreteModel, comboRouteDecisionTrace } from "../../router";
@@ -285,6 +286,10 @@ export async function executeComboResponses(
   // continuation that only references prior images still fails closed when
   // imageInput is disabled (and so targets see the full replayed input).
   const inboundClientThreadId = req.headers.get("x-codex-parent-thread-id")?.trim() || undefined;
+  // A continuation the Cloudflare Worker served lives only in the hub's Durable Object; pull it
+  // into the local store before the expansion looks for it (request-prepare.ts does the same).
+  const previousId = rawBody && typeof rawBody === "object" && "previous_response_id" in rawBody ? rawBody.previous_response_id : undefined;
+  if (typeof previousId === "string") await prefetchRemoteResponseState(previousId);
   const body = expandPreviousResponseInput(rawBody, inboundClientThreadId);
   const replayFailure = previousResponseReplayFailure(body);
   if (replayFailure?.reason === "scope_mismatch") {

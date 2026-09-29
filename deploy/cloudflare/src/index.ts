@@ -8,6 +8,9 @@ import { handleWorkersAi, WORKERS_AI_HOST, type AiRunner } from "./workers-ai";
 import { createNativeWsSession, modelListReplayKey, nativeConfigAdmitted, serveNativeChat, serveNativeMessages, serveNativeResponses, type NativeChatDeps, type NativeOpenAiFacts } from "ocx-worker-native";
 import { openUpstreamWebSocket } from "./upstream-websocket";
 import { handleStateRequest } from "./state-routes";
+import { DurableSpendLedger, type SpendLedgerSqlStorage } from "./spend-ledger";
+import type { SpendReservationRequest, SpendScope, SpendUsage } from "../../../src/lib/spend-reservation-core";
+import { OAuthRefreshCoordinator, refreshOAuthTokenForProvider, type RefreshedOAuthCredential } from "./oauth-refresh";
 
 export { ContainerProxy };
 
@@ -50,6 +53,19 @@ export class OpencodexHub extends Container<Env> {
   envVars = containerEnv(this.env);
 
   private readonly leases = new LeaseState(this.ctx.storage);
+
+  // OAuth refresh arbitration (oauth-refresh.ts): synchronous storage, so a lease check, a
+  // generation compare-and-swap and the auth.json copy write land in one transaction.
+  private readonly oauthRefresh = new OAuthRefreshCoordinator(this.ctx.storage);
+
+  // The deployment's spend-reservation authority (spend-ledger.ts): the journal lives in this
+  // object's SQLite, so a turn the Worker serves and a turn the container serves book against
+  // the same ceiling rather than two ledgers that never meet.
+  // The workers-types pin predates ctx.storage.sql.transactionSync; the runtime has it.
+  private readonly spend = new DurableSpendLedger(this.ctx.storage.sql as unknown as SpendLedgerSqlStorage, async () => {
+    const source = await this.nativeConfigSource();
+    return nativeConfigText(source.config, source.hasSnapshot, this.env);
+  });
 
   private startedAt = 0;
   private resetInFlight: Promise<void> | undefined;
@@ -113,6 +129,8 @@ export class OpencodexHub extends Container<Env> {
     await this.stopAndWait();
     const discarded = await this.leases.discardSnapshot();
     if (discarded) await this.env.STATE.delete(discarded);
+    await this.leases.discardResponseStates();
+    this.oauthRefresh.discard();
     await this.ctx.storage.put(HONORED_RESET_KEY, nonce);
   }
 
@@ -166,6 +184,8 @@ export class OpencodexHub extends Container<Env> {
   peekUsage(bootId: string, limit: number) { return this.leases.peekUsage(bootId, limit); }
   ackUsage(bootId: string, seqs: readonly number[]) { return this.leases.ackUsage(bootId, seqs); }
   enqueueUsage(row: unknown) { return this.leases.enqueueUsage(row); }
+  getResponseState(id: string) { return this.leases.getResponseState(id); }
+  putResponseState(id: string, entry: unknown) { return this.leases.putResponseState(id, entry); }
   skillsSnapshotRead(scope: string) { return this.leases.skillsSnapshotRead(scope); }
   skillsSnapshotCommit(scope: string, block: string) { return this.leases.skillsSnapshotCommit(scope, block); }
   modelListRead(key: string, stamp: string) { return this.leases.modelListRead(key, stamp); }
@@ -184,9 +204,47 @@ export class OpencodexHub extends Container<Env> {
   clientRuntimeCommit(bootId: string, headers: Record<string, string>, stamp: string) {
     return this.leases.clientRuntimeCommit(bootId, headers, stamp);
   }
+  // --- Spend reservations (spend-ledger.ts) ---------------------------------------------------
+  // Single-threaded per call: reserve admits or refuses before a Worker turn's send leaves;
+  // the rest are the settlement vocabulary the reservation ends through.
+  // RPC arguments arrive untyped over the stub; the ledger validates them itself.
+  spendReserve(request: unknown) { return this.spend.spendReserve(request as SpendReservationRequest); }
+  spendAbandon(sendId: unknown) { return this.spend.spendAbandon(sendId as string); }
+  spendSettle(sendId: unknown, usage: unknown) { return this.spend.spendSettle(sendId as string, usage as SpendUsage); }
+  spendMarkLost(sendId: unknown) { return this.spend.spendMarkLost(sendId as string); }
+  spendMarkDispatched(sendId: unknown) { return this.spend.spendMarkDispatched(sendId as string); }
+  spendKnows(sendId: unknown) { return this.spend.spendKnows(sendId as string); }
+  spendSnapshot(scope: unknown, scopeId: unknown) { return this.spend.spendSnapshot(scope as SpendScope, scopeId as string); }
+  spendJournal() { return Promise.resolve(this.spend.journalSnapshot()); }
+  spendJournalAppend(line: unknown) {
+    return Promise.resolve(typeof line === "string" ? this.spend.appendJournalRecord(line) : null);
+  }
+  // --- end spend reservations ----------------------------------------------------------------
   async nativeConfigSource(): Promise<{ config: string | undefined; hasSnapshot: boolean }> {
     return { config: (await this.leases.readDocument("config"))?.body, hasSnapshot: (await this.leases.currentSnapshot()) !== undefined };
   }
+
+  // --- OAuth refresh arbitration (oauth-refresh.ts) -----------------------------------------
+  // The Worker spends a rotating refresh token only through this lease, and the container probes
+  // the same lease before it spends; the DO is the single writer that decides who owns a
+  // generation. Commit compare-and-swaps on the stored credential so a double-rotation is a
+  // conflict, never a second write.
+  oauthRefreshAcquire(provider: string, accountId: string, generation: string) {
+    return Promise.resolve(this.oauthRefresh.acquire(provider, accountId, generation));
+  }
+  oauthRefreshLeaseCheck(provider: string, accountId: string) {
+    return Promise.resolve(this.oauthRefresh.leaseCheck(provider, accountId));
+  }
+  oauthRefreshCommit(provider: string, accountId: string, credential: RefreshedOAuthCredential, expectedGeneration: string, attemptId: string) {
+    return Promise.resolve(this.oauthRefresh.commit(provider, accountId, credential, expectedGeneration, attemptId));
+  }
+  oauthRefreshRelease(provider: string, accountId: string, attemptId: string) {
+    return Promise.resolve(this.oauthRefresh.release(provider, accountId, attemptId));
+  }
+  oauthRefreshToken(provider: string, refreshToken: string) {
+    return refreshOAuthTokenForProvider(provider, refreshToken);
+  }
+  // --- end OAuth refresh arbitration ---------------------------------------------------------
 }
 
 async function handleState(req: Request, env: Env): Promise<Response> {
@@ -257,10 +315,56 @@ function nativeDeps(env: Env, ctx: ExecutionContext, hub: ReturnType<typeof getC
     },
     localHosts: { [WORKERS_AI_HOST]: request => handleWorkersAi(request, env.AI) },
     fetch: request => fetch(request),
+    // A login token inside its refresh window rotates through the hub's lease and commit CAS
+    // (oauth-refresh.ts); the provider call stays here because Worker and DO see it the same way.
+    oauthRefresh: {
+      acquire: async (provider, accountId, generation) => {
+        const result = await hub.oauthRefreshAcquire(provider, accountId, generation);
+        return "busy" in result ? null : result;
+      },
+      commit: (provider, accountId, credential, expectedGeneration, attemptId) =>
+        hub.oauthRefreshCommit(provider, accountId, credential, expectedGeneration, attemptId),
+      release: (provider, accountId, attemptId) => hub.oauthRefreshRelease(provider, accountId, attemptId),
+      refreshToken: (provider, refreshToken) => refreshOAuthTokenForProvider(provider, refreshToken),
+    },
+    // The reservation calls that decide admission are awaited; the settlement vocabulary is
+    // fire-and-forget off the response path, the same discipline recordUsage follows. A call
+    // that never lands is logged, never retried here — the replica on the container side is
+    // what keeps the books whole.
+    spendReserve: request => hub.spendReserve(request),
+    spendAbandon: sendId => ctx.waitUntil(hub.spendAbandon(sendId).catch(error =>
+      console.error(`Worker-native spend abandon not recorded: ${error instanceof Error ? error.message : String(error)}`))),
+    spendMarkDispatched: sendId => ctx.waitUntil(hub.spendMarkDispatched(sendId).catch(error =>
+      console.error(`Worker-native spend dispatch not recorded: ${error instanceof Error ? error.message : String(error)}`))),
+    spendSettle: (sendId, usage) => ctx.waitUntil(hub.spendSettle(sendId, usage).catch(error =>
+      console.error(`Worker-native spend settlement not recorded: ${error instanceof Error ? error.message : String(error)}`))),
+    spendMarkLost: sendId => ctx.waitUntil(hub.spendMarkLost(sendId).catch(error =>
+      console.error(`Worker-native spend loss not recorded: ${error instanceof Error ? error.message : String(error)}`))),
+    spendKnows: sendId => hub.spendKnows(sendId),
+    spendSnapshot: (scope, scopeId) => hub.spendSnapshot(scope, scopeId),
     onDecline: logDeclineOnce,
     // Queued off the response path; ocx appends it to usage.jsonl when it next runs.
     recordUsage: row => ctx.waitUntil(hub.enqueueUsage(row).catch(error =>
       console.error(`Worker-native usage row not queued: ${error instanceof Error ? error.message : String(error)}`))),
+    // Continuations for Responses turns this Worker served (response-state.ts). The commit runs
+    // off the response path like the usage row; the read joins a follow-up turn to one of them so
+    // the Worker can serve it without waking ocx.
+    responseStateCommit: (id, entry) => {
+      const pending = (async () => {
+        const committed = await hub.putResponseState(id, entry).catch((error: unknown) => {
+          console.error(`Worker-native response state not stored: ${error instanceof Error ? error.message : String(error)}`);
+          return false;
+        });
+        if (!committed) console.error("Worker-native response state not stored: entry rejected by the hub");
+      })();
+      ctx.waitUntil(pending);
+      return pending;
+    },
+    responseStateRead: async id => {
+      const body = await hub.getResponseState(id);
+      if (body === undefined) return undefined;
+      try { return JSON.parse(body) as Record<string, unknown>; } catch { return undefined; }
+    },
   };
 }
 

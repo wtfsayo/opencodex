@@ -31,6 +31,7 @@ import {
   type OAuthRefreshIntent,
   type OAuthRefreshIntentCleanupPending,
 } from "./store";
+import { gateDurableOAuthRefresh } from "./durable-refresh-gate";
 import { loginXai, refreshXaiToken, XAI_LOCAL_CLI_DETACH_WARNING, XaiTokenRequestError } from "./xai";
 import { ANTHROPIC_OAUTH_BETA, AnthropicTokenError, loginAnthropic, refreshAnthropicToken } from "./anthropic";
 import { loginKimi, refreshKimiToken } from "./kimi";
@@ -129,6 +130,14 @@ export class OAuthTokenRefreshStaleError extends Error {
   readonly code = "OAUTH_TOKEN_REFRESH_STALE";
   readonly retryable = true;
   constructor() { super("OAuth token refresh owner became stale"); this.name = "OAuthTokenRefreshStaleError"; }
+}
+export class OAuthDurableRefreshPendingError extends Error {
+  readonly code = "OAUTH_DURABLE_REFRESH_PENDING";
+  readonly retryable = true;
+  constructor() {
+    super("OAuth refresh owned by the hub's arbiter is still in flight");
+    this.name = "OAuthDurableRefreshPendingError";
+  }
 }
 
 /** Focused owner-identity tests only. Synthetic owners retain no account data. */
@@ -960,6 +969,16 @@ export async function refreshAnthropicAccountWithLock(
     try {
       attemptIntent = writeOAuthRefreshIntent(provider, accountId, generation, now(), deps.flight?.flightId);
       if (deps.signal?.aborted) throw deps.signal.reason;
+      // The hub's refresh arbiter (durable-refresh-gate.ts) runs between the local intent write
+      // and dispatch: a Worker's live lease on this stored generation means its spend is already
+      // in flight, so adopt the rotated document or stand down rather than double-spend.
+      const gate = await gateDurableOAuthRefresh(provider, accountId, generation);
+      if (gate.kind === "adopted") {
+        clearAnthropicRefreshIntentBestEffort(provider, accountId, attemptIntent);
+        if (gate.credential.expires > now() + REFRESH_SKEW_MS) return gate.credential.access;
+        throw new OAuthLoginRequiredError(provider);
+      }
+      if (gate.kind === "blocked") throw new OAuthDurableRefreshPendingError();
       // From this point on, even a synchronous client error is conservatively post-dispatch:
       // the provider may have received and rotated the refresh token before the caller learned
       // the outcome.
@@ -1034,6 +1053,15 @@ export async function refreshGenericAccountWithLock(
       return stored.access;
     }
     const generation = credentialGeneration(stored);
+    // The hub's refresh arbiter before the spend: a Worker's live lease on this stored
+    // generation means its rotation is already in flight, so adopt the committed document or
+    // stand down; never spend the same refresh token a second time.
+    const gate = await gateDurableOAuthRefresh(provider, accountId, generation);
+    if (gate.kind === "adopted") {
+      if (gate.credential.expires > Date.now() + REFRESH_SKEW_MS) return gate.credential.access;
+      throw new OAuthLoginRequiredError(provider);
+    }
+    if (gate.kind === "blocked") throw new OAuthDurableRefreshPendingError();
     try {
       const fresh = merged(await def.refresh(stored.refresh, deps.signal, stored), stored);
       const outcome = await mergeAccountCredential(provider, accountId, fresh, {

@@ -316,10 +316,38 @@ Known divergences, not fixed:
   them served and later turns the other can send a different catalog if it changed mid-session.
   The new declines (runtime unpublished after a deploy) make that more reachable.
 
-Still container-only: the dashboard and management API, Codex-pool and other OAuth providers, spend
-limits, and the web-search sidecar. Spend limits need the reservation ledger's authority moved into
-the Durable Object (its API is synchronous at every call site today); OAuth needs token refresh
-coordinated between the Worker and ocx, since refresh tokens rotate.
+Still container-only: the dashboard and management API, Codex-pool turns (chatgpt.com egress
+is fingerprint-blocked, unfixable in code), the web-search sidecar's pool mode (same egress),
+and compaction/collaboration/subagent turns (disk catalogs + in-process state).
+
+Phase 5 continuations (2026-09-29): three more container-only classes moved to DO authority:
+- **Spend limits.** `spend` is now an admitted config key. The DO holds a `spend-ledger` SQL
+  journal and runs `createSpendReservationLedger` (extracted to worker-safe
+  `src/lib/spend-reservation-core.ts`) as the single authority. The Worker reserves per physical
+  send inside its retry ladders and settles/marks-lost at terminal via hub RPC; refusals answer
+  with ocx's 429 wire shape. The container's `sharedSpendLedger()` becomes a write-through
+  replica of the same DO journal under `durableMirrorEnabled()` (`durable-spend-ledger.ts`),
+  resyncing worker-written rows via seq-watermark deltas on drain and per-request, so ceilings
+  hold across both paths. The local file journal is untouched off CF.
+- **OAuth refresh.** `deploy/cloudflare/src/oauth-refresh.ts` adds a refresh lease
+  (30 s TTL, generation-CAS) on the DO; the Worker refreshes expiring anthropic/chatgpt-login
+  tokens inline (both token endpoints are worker-reachable) and commits the rotated credential
+  to the mirrored auth.json copy. The container gates its own refresh on the DO
+  (`src/oauth/durable-refresh-gate.ts`): it adopts a committed newer credential, waits ≤3 s on a
+  live lease, or falls back to the local intent path — a rotated refresh token can never be
+  spent twice.
+- **Stored responses / continuations.** `store !== false` and `previous_response_id` are served:
+  the Worker writes replay entries to a `ocx:resp:` keyspace (24 h TTL, count cap, 2 MiB rows) at
+  stream-terminal, expands continuations natively via the shared `replay-expansion.ts`, and the
+  container prefetches missing entries through `GET /response-state/<id>` before its synchronous
+  expansion (`prefetchRemoteResponseState` in state.ts). Scope-mismatch still answers
+  `previous_response_not_found` 400 exactly; a DO miss declines so the container's own copy can
+  answer.
+- **Images on anthropic routes.** The `image-adapter` decline now covers only adapters that
+  re-encode; the anthropic adapter translates inline base64 natively, so image turns to
+  `anthropic/*` and routed Anthropic endpoints are served when the published vision answer is
+  not-preprocessed.
+
 
 Native OpenAI (branch `feat/cloudflare-worker-openai`): a Codex turn to a native model on Codex's
 own ChatGPT login, with the hub key in `x-opencodex-api-key`, the default `openai` row and no stored

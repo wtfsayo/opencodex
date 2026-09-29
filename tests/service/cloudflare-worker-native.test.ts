@@ -38,8 +38,10 @@ const FORBIDDEN_MODULES = [
 // WebSocket session keeps for its own native responses, three more; ocx's failure answers for that
 // turn (the passthrough error body, transport-failure text, request-log terminal status), seven more;
 // the translated Chat image budget, one more; ocx's routed-failure and Claude-failure answers
-// (the routed error body, the Anthropic error reshaping, the error-text reader), five more.
-const MAX_CLOSURE = 244;
+// (the routed error body, the Anthropic error reshaping, the error-text reader), five more; the
+// Responses lane's continuation provenance and persistability guards, two more; the hub-ledger
+// spend reservation (the tracker and the ledger core it shares with the DO), two more.
+const MAX_CLOSURE = 248;
 const IMPORT_RE = /^\s*import\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|^\s*import\s+["']([^"']+)["']|^\s*export\s+(?!type\b)[^;]*?from\s+["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/gm;
 
 function closure(entry: string) {
@@ -123,10 +125,10 @@ const config = (extra: Record<string, unknown> = {}, providerExtra: Record<strin
 });
 
 describe("Worker-native chat routing", () => {
-  test("agrees with ocx's router whenever it resolves a route", () => {
+  test("agrees with ocx's router whenever it resolves a route", async () => {
     for (const model of ["p/m-1", "p/vendor/m-2"]) {
       const cfg = config();
-      const native = resolveNativeChatRoute(cfg, model);
+      const native = await resolveNativeChatRoute(cfg, model);
       expect(native).not.toBeNull();
       const route = routeModel(cfg as unknown as OcxConfig, model);
       expect([route.providerName, route.modelId, route.provider.adapter, route.provider.baseUrl])
@@ -135,7 +137,7 @@ describe("Worker-native chat routing", () => {
     }
   });
 
-  test("declines everything outside the subset it reproduces", () => {
+  test("declines everything outside the subset it reproduces", async () => {
     const declined: [unknown, unknown][] = [
       [config(), "m-1"],
       [config(), "p/unlisted"],
@@ -145,7 +147,6 @@ describe("Worker-native chat routing", () => {
       [config({ combos: { x: { targets: [] } } }), "p/m-1"],
       [config({ routingProfiles: { x: {} } }), "p/m-1"],
       [config({ codexAccountNamespaces: { a: "b" } }), "p/m-1"],
-      [config({ spend: { root: { maxTokens: 1 } } }), "p/m-1"],
       [config({}, { headers: { "x-a": "b" } }), "p/m-1"],
       [config({}, { alias: "q" }), "p/m-1"],
       [config({}, { adapter: "anthropic" }), "p/m-1"],
@@ -175,19 +176,19 @@ describe("Worker-native chat routing", () => {
       [config({}, { baseUrl: "https://metadata.google.internal./v1" }), "p/m-1"],
       [config({}, { baseUrl: "https://2130706433/v1" }), "p/m-1"],
     ];
-    for (const [cfg, model] of declined) expect([model, resolveNativeChatRoute(cfg, model)]).toEqual([model, null]);
+    for (const [cfg, model] of declined) expect([model, await resolveNativeChatRoute(cfg, model)]).toEqual([model, null]);
   });
 
-  test("resolves ${NAME} and $NAME keys against the environment ocx would run with", () => {
+  test("resolves ${NAME} and $NAME keys against the environment ocx would run with", async () => {
     const secrets = { OPENAI_KEY: "sk-from-secret" };
     for (const apiKey of ["${OPENAI_KEY}", "$OPENAI_KEY"]) {
-      const route = resolveNativeChatRoute(config({}, { apiKey }), "p/m-1", new Set(), () => {}, secrets);
+      const route = await resolveNativeChatRoute(config({}, { apiKey }), "p/m-1", new Set(), () => {}, secrets);
       expect(route?.provider.apiKey).toBe("sk-from-secret");
     }
-    expect(resolveNativeChatRoute(config({}, { apiKey: "${OTHER}" }), "p/m-1", new Set(), () => {}, secrets)).toBeNull();
+    expect(await resolveNativeChatRoute(config({}, { apiKey: "${OTHER}" }), "p/m-1", new Set(), () => {}, secrets)).toBeNull();
     // The config object itself is not rewritten with the secret.
     const cfg = config({}, { apiKey: "${OPENAI_KEY}" });
-    resolveNativeChatRoute(cfg, "p/m-1", new Set(), () => {}, secrets);
+    await resolveNativeChatRoute(cfg, "p/m-1", new Set(), () => {}, secrets);
     expect(cfg.providers.p.apiKey).toBe("${OPENAI_KEY}");
   });
 

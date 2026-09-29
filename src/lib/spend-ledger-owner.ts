@@ -6,24 +6,16 @@ import { getConfigDir } from "../config/paths";
 import { recordOwnedConfigPath } from "./config-ownership";
 import { assertNotRealHomeUnderTest } from "./test-home-guard";
 import { hardenSecretDir, hardenSecretPath } from "./windows-secret-acl";
+// The error class lives in spend-reservation-core.ts, which every store -- file, Durable
+// Object, replica -- sees without this module's bun:sqlite edge.
+export { SpendLedgerOwnerError } from "./spend-reservation-core";
+export type { SpendLedgerOwnerErrorCode } from "./spend-reservation-core";
+import { SpendLedgerOwnerError } from "./spend-reservation-core";
 
 export const SPEND_LEDGER_OWNER_FILENAME = "spend-ledger-owner.sqlite";
 export const SPEND_LEDGER_RESTART_PARENT_ENV = "OCX_SPEND_LEDGER_RESTART_PARENT_PID";
 export const SPEND_LEDGER_RESTART_WAIT_MS = 5_000;
 const OWNER_SIDECARS = ["-journal", "-wal", "-shm"] as const;
-
-export type SpendLedgerOwnerErrorCode =
-  | "SPEND_LEDGER_OWNER_BUSY"
-  | "SPEND_LEDGER_OWNER_UNAVAILABLE"
-  | "SPEND_LEDGER_OWNER_HOME_CONFLICT"
-  | "SPEND_LEDGER_OWNER_NOT_HELD";
-
-export class SpendLedgerOwnerError extends Error {
-  constructor(readonly code: SpendLedgerOwnerErrorCode, message: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = "SpendLedgerOwnerError";
-  }
-}
 
 export interface SpendLedgerOwnerLease {
   release(): void;

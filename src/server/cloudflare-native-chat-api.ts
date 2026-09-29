@@ -1,6 +1,21 @@
 // The contract between the Cloudflare Worker (deploy/cloudflare) and the Worker-native Chat
-// Completions path in cloudflare-native-chat.ts. Import-free: the Worker package typechecks it
-// against Workers types, where the ocx modules behind the implementation do not typecheck.
+// Completions path in cloudflare-native-chat.ts. Import-free at runtime (type-only imports are
+// erased before the bundle is built): the Worker package typechecks it against Workers types,
+// where the ocx modules behind the implementation do not typecheck.
+import type {
+  ScopeSpendSnapshot,
+  SpendReservationDecision,
+  SpendScope,
+  SpendUsage,
+} from "../lib/spend-reservation-core";
+
+/** The reservation request the Worker places against the hub ledger for one physical send. */
+export type WorkerSpendReserveRequest = {
+  sendId: string;
+  scopes: { rootId?: string; identityId?: string; poolId?: string };
+  inputTokens: number;
+  outputCeilingTokens: number;
+};
 
 export type NativeChatDeps = {
   /** The hub's config.json: the Durable Object's copy, or the bootstrap config before one exists. */
@@ -38,9 +53,88 @@ export type NativeChatDeps = {
   openUpstreamSocket?(url: string, headers: Record<string, string>): WebSocket;
   /** Called once per served turn, after its last byte; the Worker queues it for ocx's usage log. */
   recordUsage?(row: WorkerUsageRow): void;
+  /**
+   * The hub's spend ledger (deploy/cloudflare/src/spend-ledger.ts) reached over RPC. `spendReserve`
+   * is awaited before a send leaves because it admits or refuses it; the settlement family is
+   * fire-and-forget — each returns void after scheduling itself on the Worker's waitUntil. A
+   * deployment whose hub predates the ledger has none of these, and a configured ceiling then
+   * declines the turn rather than spend unbooked.
+   */
+  spendReserve?(request: WorkerSpendReserveRequest): Promise<SpendReservationDecision>;
+  spendAbandon?(sendId: string): void;
+  spendMarkDispatched?(sendId: string): void;
+  spendSettle?(sendId: string, usage: SpendUsage): void;
+  spendMarkLost?(sendId: string): void;
+  spendKnows?(sendId: string): Promise<boolean>;
+  spendSnapshot?(scope: SpendScope, scopeId: string): Promise<ScopeSpendSnapshot | undefined>;
+  /**
+   * The Durable Object's continuation store (deploy/cloudflare/src/response-state.ts).
+   * `responseStateCommit` writes the replay entry a completed Worker-served response leaves for
+   * `previous_response_id` (called after the terminal event; the promise is the Worker's own
+   * waitUntil handle, not meant to be awaited); `responseStateRead` reads one back for a
+   * continuation the Worker can serve itself. Without them this path declines every stored or
+   * continued turn rather than lose the chain.
+   */
+  responseStateCommit?(id: string, entry: unknown, clientThreadId: string | undefined): Promise<void>;
+  responseStateRead?(id: string): Promise<Record<string, unknown> | undefined>;
+  /**
+   * The Durable Object's OAuth refresh arbiter (deploy/cloudflare/src/oauth-refresh.ts). When a
+   * login's access token is inside its refresh window, `acquire` takes the lease for the stored
+   * credential generation (null: another refresher owns it), `refreshToken` spends the refresh
+   * token at the provider, and `commit` writes the result through the generation CAS, which is the
+   * only place a rotated credential enters the hub's auth.json copy. `release` abandons a lease
+   * after a definitive provider rejection; every other exit leaves it to the TTL. Without this dep
+   * the Worker refreshes nothing and declines the turn to ocx.
+   */
+  oauthRefresh?: {
+    acquire(provider: string, accountId: string, generation: string): Promise<{ attemptId: string } | null>;
+    commit(
+      provider: string,
+      accountId: string,
+      credential: NativeOAuthCredential,
+      expectedGeneration: string,
+      attemptId: string,
+    ): Promise<NativeOAuthRefreshCommitResult>;
+    release(provider: string, accountId: string, attemptId: string): Promise<void>;
+    refreshToken(provider: string, refreshToken: string): Promise<NativeOAuthCredential>;
+  };
   /** Why a request went to the container. Reasons name config keys and fields, never values. */
   onDecline?(reason: string): void;
 };
+
+/** A credential as auth.json stores it; the commit merge keeps a caller's unknown fields verbatim. */
+export type NativeOAuthCredential = {
+  access: string;
+  refresh: string;
+  expires: number;
+  accountId?: string;
+  email?: string;
+  source?: string;
+  projectId?: string;
+  apiBaseUrl?: string;
+  kiro?: unknown;
+};
+
+/**
+ * The arbiter's answer to a commit. `ok` stores the credential and frees the lease; `generation`
+ * means the stored credential moved past the one that was refreshed; `committed-generation` means
+ * this very credential is already stored (a retried commit), which is a success answer; `lease`
+ * means the caller's lease expired or was lost.
+ */
+export type NativeOAuthRefreshCommitResult =
+  | { ok: true; generation: string }
+  | { conflict: "lease" | "generation" | "committed-generation"; generation?: string };
+
+/**
+ * Set on the errors refreshToken throws when the provider answered non-success: the refresh token
+ * was definitively refused, so the lease can be released. Any other failure is ambiguous — the
+ * provider may already have rotated — and the lease rides its TTL.
+ */
+export const OAUTH_REFRESH_REJECTED_MARK = "oauthRefreshRejected";
+export function isOAuthRefreshRejection(error: unknown): boolean {
+  return !!error && typeof error === "object"
+    && (error as Record<string, unknown>)[OAUTH_REFRESH_REJECTED_MARK] === true;
+}
 
 /**
  * ocx's own state that decides a ChatGPT passthrough turn (server/worker-native-state.ts publishes
@@ -109,6 +203,14 @@ export type WorkerUsageRow = {
    */
   spendInputTokens?: number;
   spendOutputCeilingTokens?: number;
+  /**
+   * "worker" when the Worker's own tracker reserved this turn's sends against the hub ledger.
+   * The usage-inbox drain then skips its post-hoc booking (bookWorkerSpend): the spend was
+   * already recorded there, and booking it again would count the turn twice. A Worker that
+   * dies mid-turn leaves its reservations open in the ledger, the same conservative residue
+   * a crashed process leaves in the file journal.
+   */
+  spendLedger?: "worker";
 };
 
 /** The replay key for a GET /v1/models request, or undefined when its answer cannot be replayed. */

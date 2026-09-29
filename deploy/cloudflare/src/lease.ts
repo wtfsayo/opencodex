@@ -1,3 +1,5 @@
+import { ResponseStateStore } from "./response-state";
+
 // Only one container may write the snapshot. A rollout stops the old instance before starting the
 // new one, but a container that dies without SIGTERM never releases, so the next waits for staleness.
 export const LEASE_STALE_MS = 120_000;
@@ -60,7 +62,6 @@ export type DocumentSeqs = Record<DurableDocument, number>;
 export type ModelList = { body: string; headers: [string, string][] };
 /** `stamp` names the Worker version and container environment the list was answered under. */
 type ModelListMeta = { expiresAt: number; seqs: DocumentSeqs; stamp: string };
-const DOCUMENT_SEQ_KEY_PREFIX = "ocx:document-seq:";
 
 // ocx's reasoning-effort caches (src/providers/reasoning-metadata.ts), as the running ocx last
 // published them, so the Worker maps effort as it would. Each kind keeps the newest version.
@@ -80,9 +81,10 @@ const NATIVE_OPENAI_FACTS_KEY = "ocx:native-openai-facts";
 type StoredNativeOpenAiFacts = { bootId: string; stamp: string; version: number; facts: unknown };
 type StoredClientRuntime = { stamp: string; headers: Record<string, string> };
 
-const LEASE_KEY = "ocx:lease";
+export const LEASE_KEY = "ocx:lease";
 const SNAPSHOT_KEY = "ocx:snapshot";
-const DOCUMENT_KEY_PREFIX = "ocx:document:";
+export const DOCUMENT_KEY_PREFIX = "ocx:document:";
+export const DOCUMENT_SEQ_KEY_PREFIX = "ocx:document-seq:";
 
 /**
  * Stores written through to the Durable Object on every commit instead of waiting for the next
@@ -95,9 +97,13 @@ export const MAX_DOCUMENT_BYTES = 1024 * 1024;
 export type StoredDocument = { body: string; seq: number };
 export type DocumentCommit = { kind: "committed" } | { kind: "lease-lost" } | { kind: "stale"; storedSeq: number };
 
-/** The Durable Object's state. Awaiting DO storage keeps the input gate closed, so these read-modify-writes need no CAS. */
 export class LeaseState {
-  constructor(private readonly storage: LeaseStorage, private readonly now: () => number = Date.now) {}
+  private readonly responseStates: ResponseStateStore;
+  constructor(private readonly storage: LeaseStorage, private readonly now: () => number = Date.now) {
+    this.responseStates = new ResponseStateStore(storage, now);
+  }
+
+
 
   async acquireLease(bootId: string): Promise<{ granted: boolean; retryAfterSeconds?: number }> {
     const decision = decideLease(await this.storage.get<Lease>(LEASE_KEY), bootId, this.now());
@@ -208,6 +214,22 @@ export class LeaseState {
     for (const seq of seqs) if (Number.isSafeInteger(seq) && seq > 0) await this.storage.delete(usageKey(seq));
     return true;
   }
+  /** The replay entry a Worker-served response left for previous_response_id, or undefined. */
+  getResponseState(id: string): Promise<string | undefined> {
+    return this.responseStates.getResponseState(id);
+  }
+
+  /** Commits a Worker-served response's replay entry; false when it does not fit a row. */
+  putResponseState(id: string, entry: unknown): Promise<boolean> {
+    return this.responseStates.putResponseState(id, entry);
+  }
+  /** Drops every continuation row (a reset discards the container's own store with its snapshot). */
+  discardResponseStates(): Promise<void> {
+    return this.responseStates.discardAll();
+  }
+
+
+
 
   /** The catalog block this session is frozen to while it is live (its expiry slides), else undefined. */
   async skillsSnapshotRead(scope: string): Promise<string | undefined> {

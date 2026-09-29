@@ -48,6 +48,7 @@ import {
   previousResponseReplayFailure,
   markBodyNonPersistable,
   previousResponseProviderState,
+  prefetchRemoteResponseState,
 } from "../../responses/state";
 import { formatErrorResponse } from "../../bridge";
 import type { OcxParsedRequest } from "../../types";
@@ -277,6 +278,10 @@ export async function prepareResponsesRequest(
   if (options.comboReplaySnapshot) {
     copyPreviousResponseReplayProvenance(options.comboReplaySnapshot.sourceBody, body);
   } else {
+    // A continuation the Cloudflare Worker served lives only in the hub's Durable Object
+    // (response-state.ts); pull it into the local store before the expansion looks for it.
+    const previousId = body && typeof body === "object" && "previous_response_id" in body ? body.previous_response_id : undefined;
+    if (typeof previousId === "string") await prefetchRemoteResponseState(previousId);
     body = expandPreviousResponseInput(body, inboundClientThreadId);
     const replayFailure = previousResponseReplayFailure(body);
     if (replayFailure?.reason === "scope_mismatch") {

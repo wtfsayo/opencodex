@@ -6,7 +6,8 @@
 //
 // The import graph is held Worker-safe by tests/service/cloudflare-worker-native.test.ts.
 import type { NativeChatDeps, ServeNativeChat, WorkerUsageRow } from "./cloudflare-native-chat-api";
-import { loadNativeConfig, recordAtEnd, resolveNativeChatRoute, routeUsageFields, sendUpstream, TURN_ADAPTERS, withOpenCodeGoSession, type NativeChatRoute } from "./cloudflare-native-chat";
+import { isWorkerSpendRefusal, workerSpendTurn } from "./cloudflare-native-spend";
+import { loadNativeConfig, oauthStoreForNativeChat, recordAtEnd, refreshNativeOAuthCredential, resolveNativeChatRoute, routeUsageFields, sendUpstream, TURN_ADAPTERS, withOpenCodeGoSession, type NativeChatRoute } from "./cloudflare-native-chat";
 import { createAnthropicAdapterWith, isLikelyRealAnthropicThinkingSignature, type AnthropicAdapterDeps } from "../adapters/anthropic/adapter";
 import { CLAUDE_CODE_HEADERS } from "../adapters/client-fingerprint";
 import { noStoredCodexAccounts, runNativeOpenAiTurn } from "./cloudflare-native-openai";
@@ -27,6 +28,9 @@ import { replaceSkillsBlock, singleSkillsBlock } from "./responses/skills-catalo
 import { conversationIdFromResponsesRequest, reasoningReplayConversationIdFromResponsesRequest, sessionIdHeaderFromRequest } from "./request-log-conversation";
 import { createOpenAIChatAdapterWith, type OpenAIChatAdapterDeps } from "../adapters/openai-chat/adapter";
 import { renameRoutedIdentityInContext } from "../adapters/identity";
+import { expandWithReplayEntry, normalizedClientThreadId, replayEntryFor, type ReplayEntryItems } from "../responses/state/replay-expansion";
+import { replayedInputPrefixLengths } from "../responses/replay-provenance";
+import { isBodyNonPersistable } from "../responses/state/body-policy";
 import { bridgeToResponsesSSE } from "../bridge/sse";
 import { hasValidatedActiveReasoningEffort, parseRequest } from "../responses/parser";
 import { mapReasoningEffortWith, NO_REASONING_METADATA, type ReasoningMetadataAccess } from "../reasoning-effort-core";
@@ -42,10 +46,12 @@ type Rec = Record<string, unknown>;
 const isRec = (value: unknown): value is Rec => !!value && typeof value === "object" && !Array.isArray(value);
 
 // Body fields whose handling this path reproduces. Anything else (service_tier, conversation,
-// background, previous_response_id, ...) is left to the container.
+// background, ...) is left to the container.
 const BODY_FIELDS = new Set([
   "model", "instructions", "input", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "store",
   "stream", "include", "prompt_cache_key", "text", "max_output_tokens", "temperature", "top_p", "metadata", "user",
+  // Continuations run against the Durable Object's response-state rows (responseStateCommit/Read).
+  "previous_response_id",
   // Codex CLI sends it on every turn. Over HTTP ocx reads it only for compaction routing, which needs
   // a compactionRouting config section and a compaction_trigger item, both declined here.
   "client_metadata",
@@ -128,6 +134,13 @@ function carriesImages(body: Rec): boolean {
     && item.content.some(part => isRec(part) && part.type === "input_image"));
 }
 
+/** Every image part on the turn is inline base64 (the only shape the anthropic adapter sends verbatim). */
+function allImagesInline(body: Rec): boolean {
+  if (!Array.isArray(body.input)) return false;
+  return body.input.every(item => !isRec(item) || !Array.isArray(item.content)
+    || item.content.every(part => !isRec(part) || part.type !== "input_image" || isInlineImagePart(part)));
+}
+
 function hasHostedWebSearch(body: Rec): boolean {
   return Array.isArray(body.tools) && body.tools.some(tool => isRec(tool) && tool.type === "web_search");
 }
@@ -140,12 +153,15 @@ function containsSkillsBlock(value: unknown): boolean {
 }
 
 /** Why this turn is not one the Worker can serve exactly as ocx would, or undefined when it is. */
-export function nativeResponsesDeclineReason(body: Rec, headers: Headers): string | undefined {
+export function nativeResponsesDeclineReason(body: Rec, headers: Headers, deps?: NativeChatDeps): string | undefined {
   const unknown = Object.keys(body).filter(key => !BODY_FIELDS.has(key)).sort();
   if (unknown.length > 0) return `body-fields:${unknown.join(",")}`;
   if (body.stream !== true) return "not-streamed";
-  // Stored responses and their continuation live in ocx's response state.
-  if (body.store !== false) return "stored-response";
+  // Continuations need the Durable Object's response-state rows: a turn that must record one is
+  // declined until the commit dep exists, and a turn that references one needs the read dep for
+  // the expansion above; both absent leave the chain to the container rather than lose it.
+  if (typeof body.previous_response_id === "string" && !deps?.responseStateRead) return "previous-response-state-unavailable";
+  if (body.store !== false && !deps?.responseStateCommit) return "stored-response";
   if (body.reasoning !== undefined) {
     if (!isRec(body.reasoning)) return "reasoning-shape";
   }
@@ -204,12 +220,6 @@ function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && error.name === "TimeoutError";
 }
 
-/** The auth store copy, read only when the model names a provider the Worker may use a login of. */
-async function oauthStoreFor(model: unknown, deps: NativeChatDeps): Promise<unknown> {
-  if (typeof model !== "string" || !model.startsWith("anthropic/") || !deps.readAuth) return undefined;
-  const text = await deps.readAuth();
-  try { return text ? JSON.parse(text) : undefined; } catch { return undefined; }
-}
 
 // The Worker never serves the native OpenAI provider, the only one these lookups answer for.
 const WORKER_INPUT_ADMISSION = createInputAdmission({ contextWindow: () => undefined, maxInputTokens: () => undefined, maxOutputTokens: () => undefined });
@@ -287,22 +297,57 @@ export async function runNativeResponsesTurn(
   no: (reason: string) => null, options: TurnOptions,
 ): Promise<NativeResponsesTurn | null> {
   const { startedAt } = options;
-  const declined = nativeResponsesDeclineReason(body, headers);
+  // request-prepare.ts expands previous_response_id before parseRequest, so the decline gates and
+  // the parser below must see the expanded input too. A miss (or an unreadable row) declines:
+  // the container's own store may still hold the response, and it owns the miss outcome — a
+  // store miss there serves the naked delta, not a refusal.
+  if (typeof body.previous_response_id === "string" && deps.responseStateRead) {
+    let entry: Record<string, unknown> | undefined;
+    try { entry = await deps.responseStateRead(body.previous_response_id); } catch { entry = undefined; }
+    const expansion = entry && Array.isArray(entry.items)
+      ? expandWithReplayEntry(body, entry as ReplayEntryItems, normalizedClientThreadId(headers.get("x-codex-parent-thread-id")))
+      : undefined;
+    if (expansion?.kind === "scope-mismatch") {
+      // ocx answers this itself (request-prepare.ts): the row exists, so only its scope fails.
+      return { failure: formatErrorResponse(400, "previous_response_not_found",
+        "Continuation state is unavailable or corrupt; resend the full conversation without previous_response_id.") };
+    }
+    if (!expansion) return no("previous-response-state-miss");
+    // The provenance WeakMap is keyed on the object parseRequest receives — expansion.body here —
+    // exactly as expandPreviousResponseInput's replayedInputPrefixLengths.set(expansion.body, ...).
+    replayedInputPrefixLengths.set(expansion.body, expansion.prefixLength);
+    body = expansion.body;
+  }
+  const declined = nativeResponsesDeclineReason(body, headers, deps);
   if (declined) return no(declined);
   const loaded = await loadNativeConfig(deps);
   if ("decline" in loaded) return no(loaded.decline);
-  const authStore = await oauthStoreFor(body.model, deps);
-  const resolved = resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets, TURN_ADAPTERS, authStore);
+  const authStore = await oauthStoreForNativeChat(body.model, deps);
+  const resolved = await resolveNativeChatRoute(loaded.config, body.model, new Set(Object.keys(deps.localHosts ?? {})), no, deps.secrets, TURN_ADAPTERS, authStore, due => refreshNativeOAuthCredential(due, deps));
   if (!resolved) return null;
   // core-normalize.ts, once the route is final.
   const route = withOpenCodeGoSession(resolved, headers, options.goSessionLane);
+  // request-spend.ts's tracker for this lane (cloudflare-native-spend.ts): each physical send
+  // reserves inside the retry callback below, and the terminal usage row settles it. Under a
+  // configured ceiling a hub without the ledger declines rather than spend unbooked.
+  const usageFields = routeUsageFields(route);
+  const spend = workerSpendTurn(loaded.config, deps, {
+    rootId: headers.get("x-codex-parent-thread-id")?.trim() || undefined,
+    identityId: usageFields.accountLogLabel,
+    poolId: usageFields.provider,
+  });
+  if (spend === "declined") return no("spend-ledger-unavailable");
   // request-prepare.ts: images reach a model as sent only when ocx would neither describe nor strip
   // them (vision/plan.ts, from catalogs only ocx reads) and the adapter would not re-encode them.
+  // The openai-chat adapter normalizes base64 past its budget with Bun's codec; the anthropic
+  // adapter translates inline base64 natively (toAnthropicContentPart), so inline images pass
+  // when the model's vision answer is already published as not-preprocessed.
   const images = { normalizationNeeded: false };
   if (carriesImages(body)) {
-    if (route.provider.adapter !== "openai-chat") return no("image-adapter");
+    if (route.provider.adapter !== "openai-chat" && route.provider.adapter !== "anthropic") return no("image-adapter");
     const published = await deps.nativeOpenAiFacts?.();
     if (published?.visionPreprocessed[`${route.providerName}/${route.modelId}`] !== false) return no("vision-preprocessing");
+    if (route.provider.adapter === "anthropic" && !allImagesInline(body)) return no("image-adapter");
   }
   // ocx maps effort for these destinations from models.dev metadata and refusals it learned
   // (reasoning-metadata.ts); without an effort that state is never consulted.
@@ -403,21 +448,32 @@ export async function runNativeResponsesTurn(
     // request-spend.ts charged the send before it left; a failed one stays unresolved at that figure.
     ...(options.spendInputTokens ? { spendInputTokens: options.spendInputTokens() } : {}),
     ...(spendOutputCeilingTokens !== undefined ? { spendOutputCeilingTokens } : {}),
+    ...(spend ? { spendLedger: "worker" as const } : {}),
     status,
     durationMs: Date.now() - startedAt,
     usageStatus: "unreported",
   });
-  const recordFailure = (status: number) => deps.recordUsage?.(failureRow(status));
+  const recordFailure = (status: number) => {
+    spend?.resolve(undefined);
+    deps.recordUsage?.(failureRow(status));
+  };
   // adapter-dispatch.ts: reset-only retries for these providers, identity encoding for a stream,
   // and no ambiguous resend (ocx may buy one; the Worker never sends a possibly running turn twice).
   let upstream: Response;
   try {
-    upstream = await fetchWithResetRetry(recovery => {
+    upstream = await fetchWithResetRetry(async recovery => {
+      // One reservation per physical send: the reset ladder's replacement books its own
+      // before it leaves, and marks the send it replaces dispatched.
+      const admission = spend
+        ? await spend.charge(options.spendInputTokens?.() ?? 0, spendOutputCeilingTokens ?? 0)
+        : ({ ok: true } as const);
+      if (!admission.ok) return admission.refusal;
       const headers = applyUpstreamRecoveryInit({ headers: request.headers }, recovery).headers;
       if (parsed.stream && !headers.has("accept-encoding")) headers.set("accept-encoding", "identity");
       return sendUpstream({ ...request, headers: Object.fromEntries(headers) }, upstreamSignal, deps);
     }, { abortSignal: upstreamSignal, label: new URL(request.url).host, claimAmbiguousResend: () => false });
   } catch (error) {
+    spend?.resolve(undefined);
     commitSkills?.();
     if (signal.aborted) {
       recordFailure(499);
@@ -435,12 +491,18 @@ export async function runNativeResponsesTurn(
   }
   // A refused create generated nothing: ocx sends it itself and runs its recovery on the answer. The
   // retry ladder's own refusal is answered as ocx answers it.
+  if (isWorkerSpendRefusal(upstream)) {
+    commitSkills?.();
+    recordFailure(upstream.status);
+    return { failure: upstream };
+  }
   if (isNonReplayableResponse(upstream)) {
     commitSkills?.();
     recordFailure(upstream.status);
     return { failure: upstream };
   }
   if (upstream.status >= 400 && upstream.status < 500) {
+    spend?.resolve(undefined);
     await upstream.body?.cancel().catch(() => {});
     return no(`upstream-${upstream.status}`);
   }
@@ -460,6 +522,7 @@ export async function runNativeResponsesTurn(
   const record = (status: number) => {
     if (recorded) return;
     recorded = true;
+    spend?.resolve(usage ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens } : undefined);
     deps.recordUsage?.({
       requestId: crypto.randomUUID(),
       timestamp: startedAt,
@@ -474,6 +537,7 @@ export async function runNativeResponsesTurn(
       // request-prepare.ts reserves the caller's output ceiling, and the path's input estimate.
       ...(options.spendInputTokens ? { spendInputTokens: options.spendInputTokens() } : {}),
       ...(spendOutputCeilingTokens !== undefined ? { spendOutputCeilingTokens } : {}),
+      ...(spend ? { spendLedger: "worker" as const } : {}),
       status,
       durationMs: Date.now() - startedAt,
       ...(firstOutputAt !== undefined ? { firstOutputMs: firstOutputAt - startedAt } : {}),
@@ -519,7 +583,30 @@ export async function runNativeResponsesTurn(
       onUsage: reported => { usage = reported; },
       // Called before onUsage for the same final event, so it only marks the outcome; the row is
       // written when the stream ends, by which time usage has arrived.
-      onCompletedResponse: () => { completed = true; },
+      onCompletedResponse: (response, providerState) => {
+        completed = true;
+        // rememberResponseState's funnel (state.ts), mirrored: a store:false or non-persistable
+        // body keeps nothing (both were declined or are impossible here, but the guards stay so a
+        // relaxed gate cannot leak one), and replayEntryFor drops non-completed answers.
+        const commit = deps.responseStateCommit;
+        if (!commit || body.store === false || isBodyNonPersistable(body)) return;
+        const clientThreadId = normalizedClientThreadId(headers.get("x-codex-parent-thread-id"));
+        const entry = replayEntryFor(body, response, clientThreadId);
+        if (!entry || entry.id.length === 0) return;
+        // state.ts's providers field: the continuation state the adapter emitted (cursor/kiro —
+        // adapters this path never routes emit none), cloned and checkpoint-marked as ocx does.
+        const providers = structuredClone(providerState ?? {});
+        if (providers.cursor?.conversationId) {
+          providers.cursor.checkpointUsable = !(response.output as unknown[]).some((item: unknown) => isRec(item) && item.type === "function_call");
+        }
+        void commit(entry.id, {
+          createdAt: Date.now(),
+          ...(entry.clientThreadId ? { clientThreadId: entry.clientThreadId } : {}),
+          items: entry.items,
+          ...(entry.providerOutputStart !== undefined ? { providerOutputStart: entry.providerOutputStart } : {}),
+          ...(providers && Object.keys(providers).length > 0 ? { providers } : {}),
+        }, clientThreadId);
+      },
     },
   );
   return {

@@ -6,6 +6,7 @@ import { DURABLE_STATE_BOOT_ID_ENV, setDurableMirrorTransportForTests } from "..
 import { drainWorkerUsageInbox } from "../../src/usage/worker-usage-inbox";
 import { usageLogPath } from "../../src/usage/log";
 import { resetSharedSpendLedgerForTest, sharedSpendLedger } from "../../src/lib/spend-reservation-ledger";
+import { resetDurableSpendJournalForTest, setDurableSpendJournalTransportForTests, type SpendJournalTransport } from "../../src/lib/durable-spend-ledger";
 import { acquireSpendLedgerOwner } from "../../src/lib/spend-ledger-owner";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
@@ -25,14 +26,30 @@ describe("Worker usage inbox", () => {
     previousBootId = process.env[DURABLE_STATE_BOOT_ID_ENV];
     home = mkdtempSync(join(tmpdir(), "ocx-usage-inbox-"));
     process.env.OPENCODEX_HOME = home;
-    // The running server holds the spend ledger the drain books into.
+    // The running server holds the spend ledger the drain books into; on this deployment that
+    // ledger is the Durable Object replica, which gets the in-memory journal below.
     resetSharedSpendLedgerForTest();
+    resetDurableSpendJournalForTest();
+    // The hub Durable Object's journal, faked in memory: appends dedupe on content like the
+    // DO's INSERT, and resync reads only rows the container has not already seen.
+    const rows: { seq: number; line: string }[] = [];
+    let nextSeq = 1;
+    const durableTransport: SpendJournalTransport = {
+      read: async () => ({ salt: "0".repeat(64), entries: rows.map(row => ({ ...row })) }),
+      append: async line => {
+        const stored = rows.find(row => row.line === line) ?? rows[rows.push({ seq: nextSeq++, line }) - 1]!;
+        return stored.seq;
+      },
+    };
+    setDurableSpendJournalTransportForTests(durableTransport);
     owner = acquireSpendLedgerOwner(home);
   });
 
   afterEach(() => {
     setDurableMirrorTransportForTests(null);
+    setDurableSpendJournalTransportForTests(null);
     resetSharedSpendLedgerForTest();
+    resetDurableSpendJournalForTest();
     owner?.release();
     owner = undefined;
     if (previousHome === undefined) delete process.env.OPENCODEX_HOME;

@@ -401,6 +401,9 @@ structurally:
   HTTP/1.1-over-TLS transport was built and verified live in `wrangler dev` (200 + SSE), then
   removed when the deployed-runtime block was confirmed — a transport that only works locally is
   worse than none: it burns an upstream POST (booking a reservation) before declining.
+- **Browser Rendering is not a bypass.** `page.goto("https://chatgpt.com")` in Cloudflare's managed
+  Chromium is itself answered 403 (UA "Cloudflare-Workers", only `__cf_bm` set, no clearance), and a
+  same-origin `page.evaluate` fetch gets the same challenge. 2026-09-29, browser-probe worker.
 - **Provider reachability map** (deployed workerd, POST probe): api.openai.com, api.anthropic.com,
   deepseek, groq, openrouter, mistral, x.ai, bigmodel, dashscope, moonshot, nvidia, cerebras all
   reachable (401/400 as expected unauthenticated). Only chatgpt.com challenges the fingerprint.
